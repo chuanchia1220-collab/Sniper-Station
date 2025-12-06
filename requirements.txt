@@ -4,3 +4,4 @@ numpy
 fugle-marketdata
 twstock
 yfinance
+lxml
