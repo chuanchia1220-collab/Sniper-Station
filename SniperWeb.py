@@ -45,7 +45,7 @@ STOCK_CATS = {
 }
 
 # 頁面設定
-st.set_page_config(page_title="Sniper 戰情室 (v17.1)", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Sniper 戰情室 (v18.0)", page_icon="🎯", layout="wide")
 
 # 資料庫路徑
 DB_FILE = "sniper_db.json"
@@ -119,7 +119,7 @@ class GlobalState:
         
 state = GlobalState()
 
-# === 背景工作執行緒 ===
+# === 背景工作執行緒 (指揮官) ===
 def background_worker(targets):
     client = RestClient(api_key=FUGLE_API_KEY)
     
@@ -226,7 +226,7 @@ def background_worker(targets):
 # === 主介面 ===
 
 taiwan_time = datetime.utcnow() + timedelta(hours=8)
-st.title("🎯 Sniper 戰情室 (v17.1)")
+st.title("🎯 Sniper 戰情室 (v18.0)")
 st.caption(f"系統時間: {taiwan_time.strftime('%H:%M:%S')} | 核心: {'🟢 運作中' if state.is_running else '⚪ 待機'}")
 
 # 側邊欄
@@ -234,6 +234,7 @@ with st.sidebar:
     st.header("⚙️ 控制台")
     mode = st.radio("身分模式", ["👀 戰情官 (讀取數據)", "👨‍✈️ 指揮官 (執行運算)"])
     
+    # 指揮官專屬按鈕
     if mode == "👨‍✈️ 指揮官 (執行運算)":
         raw_input = st.text_area("監控代碼", DEFAULT_POOL, height=150)
         
@@ -315,9 +316,29 @@ with st.sidebar:
         else:
             state.is_running = False
 
+    # 戰情官專屬：訊號邏輯說明
+    st.markdown("---")
+    st.subheader("🚥 訊號規則")
+    st.markdown("""
+    **🔥 攻擊 (Attack)**
+    - 漲幅/量能達標 + 大戶(日)紅 + 股價>均價
+    
+    **👀 量增 (Accumulation)**
+    - 股價未噴 + 有量 + 均價上 + 1H大戶買 > 200
+    
+    **💀 出貨 (Dump)**
+    - 跌破均價 1% + 爆量 + 1H大戶賣
+    
+    **❌ 誘多 (Bull Trap)**
+    - 漲幅 > 2% + 1H大戶賣 (小心假突破)
+    
+    **⚠️ 價強 (Strong)**
+    - 漲幅達標，但量能未跟上
+    """)
+
 # === 資料顯示區 ===
 
-# 載入數據
+# 載入數據 (快取機制：如果 DB 讀不到，就用上一次的 state.snapshot)
 if mode == "👀 戰情官 (讀取數據)":
     db_data = load_db()
     if db_data:
@@ -364,6 +385,6 @@ with tab2:
     else:
         st.write("尚無訊號紀錄...")
 
-# 自動刷新
+# 自動刷新 (每 3 秒)
 time.sleep(3)
 st.rerun()
