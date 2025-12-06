@@ -13,9 +13,9 @@ from collections import deque
 import shutil
 
 # ==========================================
-# 1. 基礎設定 (Config)
+# 1. 基礎設定
 # ==========================================
-st.set_page_config(page_title="Sniper 戰情室 (v21.1)", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Sniper 戰情室 (v22.0)", page_icon="⚡", layout="wide")
 
 try:
     FUGLE_API_KEY = st.secrets["Fugle_API_Key"]
@@ -24,7 +24,7 @@ except:
 
 DB_FILE = "sniper_db.json"
 
-# 預設核心股池
+# 核心股池
 DEFAULT_POOL = (
     "3706 2449 6442 3017 6139 4977 3163 3037 2359 1519 "
     "2330 2317 2382 3231 2356 2454 2303 3711 3081 4979 3363 3450 2345 "
@@ -34,7 +34,6 @@ DEFAULT_POOL = (
     "1513 2609 2615 8033 2634 2201 4763 5284 3264"
 )
 
-# 類別表
 STOCK_CATS = {
     '2330': '半導體', '2303': '半導體', '2454': '半導體', '3711': '半導體',
     '2317': 'AI組裝', '2382': 'AI組裝', '3231': 'AI組裝', '2356': 'AI組裝', '3706': 'AI組裝',
@@ -49,11 +48,10 @@ STOCK_CATS = {
 }
 
 # ==========================================
-# 2. 核心函式 (Functions)
+# 2. 核心函式
 # ==========================================
 
 def load_db_file():
-    """讀取資料庫檔案 (全域函式)"""
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, 'r', encoding='utf-8') as f:
@@ -62,7 +60,6 @@ def load_db_file():
     return {}
 
 def save_db_file(data):
-    """寫入資料庫檔案 (全域函式)"""
     try:
         temp = f"{DB_FILE}.tmp"
         with open(temp, 'w', encoding='utf-8') as f:
@@ -77,6 +74,12 @@ def get_yahoo_ticker(raw_code):
     return f"{code}.TW"
 
 def get_stock_name(symbol):
+    # 強制更新代碼庫以防漏抓
+    if symbol not in twstock.codes:
+        try:
+            twstock.__update_codes()
+        except: pass
+    
     try:
         if symbol in twstock.codes: return twstock.codes[symbol].name
         return symbol
@@ -96,7 +99,6 @@ def get_big_order_threshold(price):
     return max(1, threshold)
 
 def _calc_est_vol(current_vol):
-    # 修正時區為台灣時間 UTC+8
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     open_t = now.replace(hour=9, minute=0, second=0, microsecond=0)
     elapsed = (now - open_t).seconds / 60
@@ -105,7 +107,7 @@ def _calc_est_vol(current_vol):
     if elapsed >= total: return current_vol
     return int(current_vol * (total / elapsed))
 
-# 訊號判定邏輯
+# 訊號邏輯
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown):
     if pct >= 9.5: return "👑漲停"
     if is_bullish and net_day > 200 and pct >= tgt_pct and ratio >= tgt_ratio: return "🔥攻擊"
@@ -116,7 +118,7 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is
     return "盤整"
 
 # ==========================================
-# 3. 全局狀態與後端 (Backend)
+# 3. 全局狀態與後端
 # ==========================================
 @st.cache_resource
 class SniperCore:
@@ -124,36 +126,33 @@ class SniperCore:
         self.is_running = False
         self.targets = []
         
-        # === 靜態數據 ===
+        # 數據結構
         self.static_data = {} 
-        
-        # === 動態數據 ===
         self.realtime_data = {}
-        
-        # === 輔助數據 ===
-        self.data_store = {} # 大戶累計
+        self.data_store = {} 
         self.prev_data = {}
         self.history_vol = {}
         self.last_update = 0
         
-        # 啟動時嘗試讀檔
         self.load_from_db()
 
     def load_from_db(self):
-        data = load_db_file() # 呼叫全域函式
+        data = load_db_file()
         if data:
             self.static_data = data.get("static_data", {})
             self.realtime_data = data.get("realtime_data", {})
             self.history_vol = data.get("history_vol", {})
             self.last_update = data.get("last_update", 0)
             
+            # 優先使用 DB 中的 targets 順序
             if self.static_data:
-                self.targets = sorted(
-                    self.static_data.keys(), 
-                    key=lambda k: self.static_data[k].get('ret', -999), 
-                    reverse=True
-                )
-            
+                # 簡單邏輯：如果有保存順序則用，否則從 keys 拿
+                saved_targets = data.get("targets_order", [])
+                if saved_targets:
+                    self.targets = saved_targets
+                else:
+                    self.targets = list(self.static_data.keys())
+
             # 恢復 deque
             raw_store = data.get("data_store", {})
             for k, v in raw_store.items():
@@ -163,7 +162,6 @@ class SniperCore:
                 }
 
     def save_to_db(self):
-        # 序列化 deque
         serializable_store = {}
         for k, v in self.data_store.items():
             serializable_store[k] = {
@@ -176,11 +174,11 @@ class SniperCore:
             "realtime_data": self.realtime_data,
             "history_vol": self.history_vol,
             "data_store": serializable_store,
-            "last_update": self.last_update
+            "last_update": self.last_update,
+            "targets_order": self.targets # 保存順序
         }
-        save_db_file(data) # 呼叫全域函式
+        save_db_file(data)
 
-    # --- 背景工作 ---
     def start_worker(self):
         if self.is_running: return
         self.is_running = True
@@ -199,7 +197,10 @@ class SniperCore:
                 time.sleep(1)
                 continue
             
-            delay = max(0.6, 60.0 / (len(self.targets) + 5))
+            # === 極速設定 ===
+            # 每檔間隔僅 0.1 秒，53檔約 5-6 秒更新一輪
+            # 若 Fugle 報錯，會自動忽略該次並繼續
+            delay = 0.1 
             
             for code in self.targets:
                 try:
@@ -211,8 +212,15 @@ class SniperCore:
                     
                     pct = q.get('changePercent', 0)
                     vol = q.get('total', {}).get('tradeVolume', 0) * 1000
-                    name = get_stock_name(code)
-                    # 修正 VWAP 計算，避免除以 0
+                    
+                    # 強制修復名稱顯示：如果靜態資料沒有，就即時抓
+                    name = self.static_data.get(code, {}).get('name', code)
+                    if name == code: # 還是代碼? 再試一次
+                        name = get_stock_name(code)
+                        # 更新回靜態資料
+                        if code not in self.static_data: self.static_data[code] = {}
+                        self.static_data[code]['name'] = name
+
                     total_val = q.get('total', {}).get('tradeValue', 0)
                     vwap = total_val / vol if vol > 0 else price
                     
@@ -273,18 +281,17 @@ class SniperCore:
 core = SniperCore()
 
 # ==========================================
-# 4. 前端顯示 (Frontend)
+# 4. 前端顯示 (UI)
 # ==========================================
 
 with st.sidebar:
     st.title("⚙️ 指揮中心")
-    
     mode = st.radio("模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     
     if mode == "👨‍✈️ 指揮官":
-        raw_input = st.text_area("監控清單", DEFAULT_POOL, height=120)
+        raw_input = st.text_area("監控清單", DEFAULT_POOL, height=150)
         
-        if st.button("1. 執行回測與定版 (初始化)", type="primary"):
+        if st.button("1. 執行回測與初始化", type="primary"):
             if not FUGLE_API_KEY:
                 st.error("缺 API Key")
             else:
@@ -303,7 +310,7 @@ with st.sidebar:
                 
                 for i, code in enumerate(targets):
                     ticker = get_yahoo_ticker(code)
-                    name = get_stock_name(code)
+                    name = get_stock_name(code) # 在這裡就強制抓一次名稱
                     cat = get_category(code)
                     
                     win, ret = 0, 0
@@ -316,7 +323,7 @@ with st.sidebar:
                         if not df.empty and len(df) > 20:
                             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
                             df['ret'] = df['Close'].pct_change()
-                            win = 60 
+                            win = 60 # 模擬勝率，加快速度
                             ret = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0] * 100
                     except: pass
                     
@@ -325,7 +332,7 @@ with st.sidebar:
                     }
                 
                 # 2. 抓歷史量
-                status.write("抓取歷史量...")
+                status.write("抓取歷史成交量...")
                 client = RestClient(api_key=FUGLE_API_KEY)
                 history_vol = {}
                 for code in targets:
@@ -337,6 +344,7 @@ with st.sidebar:
                     except: history_vol[code] = 1000
                     time.sleep(0.1)
                 
+                # 更新 Core
                 core.static_data = static_data
                 core.history_vol = history_vol
                 core.targets = sorted(targets, key=lambda x: static_data.get(x, {}).get('ret', -999), reverse=True)
@@ -352,20 +360,10 @@ with st.sidebar:
         else:
             core.is_running = False
 
-    st.markdown("---")
-    st.subheader("🚥 訊號邏輯")
-    st.info("""
-    **🔥 攻擊**：漲+量+價穩+大戶買
-    **👀 量增**：價未噴+量增+1H大戶吸
-    **💀 出貨**：破均價1%+爆量+1H大戶賣
-    **❌ 誘多**：漲>2% + 1H大戶賣
-    **⚠️ 價強**：漲幅夠但量不足
-    """)
-
-# === 主畫面 (Dashboard) ===
+# === 主畫面 ===
 
 now_time = datetime.now(timezone.utc) + timedelta(hours=8)
-st.title(f"🎯 Sniper 戰情室")
+st.title(f"⚡ Sniper 戰情室 (v22.0 極速版)")
 st.caption(f"最後刷新: {now_time.strftime('%H:%M:%S')} (每3秒)")
 
 # 載入資料 (戰情官模式)
@@ -374,7 +372,10 @@ if mode == "👀 戰情官":
     if data:
         core.static_data = data.get("static_data", {})
         core.realtime_data = data.get("realtime_data", {})
-        if core.static_data:
+        # 嘗試恢復排序後的 targets
+        if "targets_order" in data:
+            core.targets = data["targets_order"]
+        elif core.static_data:
             core.targets = sorted(core.static_data.keys(), key=lambda k: core.static_data[k].get('ret', -999), reverse=True)
 
 # 組合表格
@@ -382,7 +383,9 @@ if core.targets:
     display_rows = []
     
     for code in core.targets:
+        # 靜態資料
         static = core.static_data.get(code, {'name': code, 'cat': '-', 'win': 0, 'ret': 0})
+        # 動態資料
         real = core.realtime_data.get(code, {})
         
         price = real.get('price', '-')
