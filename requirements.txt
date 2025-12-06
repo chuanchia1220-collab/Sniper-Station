@@ -1,7 +1,7 @@
 streamlit
 pandas
 numpy
+yfinance
 fugle-marketdata
 twstock
-yfinance
 lxml
