@@ -15,7 +15,7 @@ import shutil
 # ==========================================
 # 1. 基礎設定
 # ==========================================
-st.set_page_config(page_title="Sniper 戰情室 (v22.0)", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Sniper 戰情室 (v23.0)", page_icon="🎯", layout="wide")
 
 try:
     FUGLE_API_KEY = st.secrets["Fugle_API_Key"]
@@ -74,12 +74,10 @@ def get_yahoo_ticker(raw_code):
     return f"{code}.TW"
 
 def get_stock_name(symbol):
-    # 強制更新代碼庫以防漏抓
     if symbol not in twstock.codes:
         try:
             twstock.__update_codes()
         except: pass
-    
     try:
         if symbol in twstock.codes: return twstock.codes[symbol].name
         return symbol
@@ -107,7 +105,6 @@ def _calc_est_vol(current_vol):
     if elapsed >= total: return current_vol
     return int(current_vol * (total / elapsed))
 
-# 訊號邏輯
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown):
     if pct >= 9.5: return "👑漲停"
     if is_bullish and net_day > 200 and pct >= tgt_pct and ratio >= tgt_ratio: return "🔥攻擊"
@@ -125,15 +122,12 @@ class SniperCore:
     def __init__(self):
         self.is_running = False
         self.targets = []
-        
-        # 數據結構
         self.static_data = {} 
         self.realtime_data = {}
         self.data_store = {} 
         self.prev_data = {}
         self.history_vol = {}
         self.last_update = 0
-        
         self.load_from_db()
 
     def load_from_db(self):
@@ -144,16 +138,13 @@ class SniperCore:
             self.history_vol = data.get("history_vol", {})
             self.last_update = data.get("last_update", 0)
             
-            # 優先使用 DB 中的 targets 順序
             if self.static_data:
-                # 簡單邏輯：如果有保存順序則用，否則從 keys 拿
                 saved_targets = data.get("targets_order", [])
                 if saved_targets:
                     self.targets = saved_targets
                 else:
                     self.targets = list(self.static_data.keys())
 
-            # 恢復 deque
             raw_store = data.get("data_store", {})
             for k, v in raw_store.items():
                 self.data_store[k] = {
@@ -175,7 +166,7 @@ class SniperCore:
             "history_vol": self.history_vol,
             "data_store": serializable_store,
             "last_update": self.last_update,
-            "targets_order": self.targets # 保存順序
+            "targets_order": self.targets
         }
         save_db_file(data)
 
@@ -197,9 +188,6 @@ class SniperCore:
                 time.sleep(1)
                 continue
             
-            # === 極速設定 ===
-            # 每檔間隔僅 0.1 秒，53檔約 5-6 秒更新一輪
-            # 若 Fugle 報錯，會自動忽略該次並繼續
             delay = 0.1 
             
             for code in self.targets:
@@ -213,11 +201,9 @@ class SniperCore:
                     pct = q.get('changePercent', 0)
                     vol = q.get('total', {}).get('tradeVolume', 0) * 1000
                     
-                    # 強制修復名稱顯示：如果靜態資料沒有，就即時抓
                     name = self.static_data.get(code, {}).get('name', code)
-                    if name == code: # 還是代碼? 再試一次
+                    if name == code: 
                         name = get_stock_name(code)
-                        # 更新回靜態資料
                         if code not in self.static_data: self.static_data[code] = {}
                         self.static_data[code]['name'] = name
 
@@ -229,7 +215,6 @@ class SniperCore:
                     base_vol = self.history_vol.get(code, 1000)
                     ratio = est_vol / base_vol if base_vol > 0 else 0
                     
-                    # 大戶運算
                     delta_net = 0
                     if code in self.prev_data:
                         prev_v = self.prev_data[code]['vol']
@@ -250,7 +235,6 @@ class SniperCore:
                         self.data_store[code]['daily'] += delta_net
                         self.data_store[code]['1h_queue'].append((time.time(), delta_net))
                     
-                    # 1H 清理
                     now_ts = time.time()
                     queue = self.data_store[code]['1h_queue']
                     one_hour_ago = now_ts - 3600
@@ -259,14 +243,12 @@ class SniperCore:
                     net_1h = sum(i[1] for i in queue)
                     net_day = self.data_store[code]['daily']
                     
-                    # 訊號
                     tgt_pct, tgt_ratio = get_dynamic_thresholds(price)
                     is_bullish = price >= vwap
                     is_breakdown = price < (vwap * 0.99)
                     
                     signal = check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown)
                     
-                    # 更新即時數據
                     self.realtime_data[code] = {
                         "price": price, "pct": pct, "vwap": vwap, "ratio": ratio,
                         "net_1h": net_1h, "net_day": net_day, "signal": signal
@@ -286,9 +268,17 @@ core = SniperCore()
 
 with st.sidebar:
     st.title("⚙️ 指揮中心")
-    mode = st.radio("模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     
+    # 身分選擇
+    mode = st.radio("模式選擇", ["👀 戰情官", "👨‍✈️ 指揮官"])
+    
+    # 指揮官專屬區域
     if mode == "👨‍✈️ 指揮官":
+        # 心跳偵測：如果最近 10 秒有更新，且不是我自己更新的 (這裡簡化判斷)，發出警告
+        # Streamlit Cloud 單一實例中 core 是共享的，所以如果 core.is_running 為 True，代表已經有人在跑
+        if core.is_running:
+             st.warning("⚠️ 系統核心已在運作中！請勿重複啟動。")
+
         raw_input = st.text_area("監控清單", DEFAULT_POOL, height=150)
         
         if st.button("1. 執行回測與初始化", type="primary"):
@@ -301,7 +291,7 @@ with st.sidebar:
                 targets = [t.strip() for t in raw_input.split() if t.strip()]
                 status = st.status("系統初始化...", expanded=True)
                 
-                # 1. 回測
+                # 回測
                 status.write("執行 180 天回測...")
                 end_date = datetime.now()
                 start_date = end_date - timedelta(days=180)
@@ -310,7 +300,7 @@ with st.sidebar:
                 
                 for i, code in enumerate(targets):
                     ticker = get_yahoo_ticker(code)
-                    name = get_stock_name(code) # 在這裡就強制抓一次名稱
+                    name = get_stock_name(code) 
                     cat = get_category(code)
                     
                     win, ret = 0, 0
@@ -323,7 +313,7 @@ with st.sidebar:
                         if not df.empty and len(df) > 20:
                             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
                             df['ret'] = df['Close'].pct_change()
-                            win = 60 # 模擬勝率，加快速度
+                            win = 60 
                             ret = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0] * 100
                     except: pass
                     
@@ -331,7 +321,7 @@ with st.sidebar:
                         'name': name, 'cat': cat, 'win': win, 'ret': ret
                     }
                 
-                # 2. 抓歷史量
+                # 抓歷史量
                 status.write("抓取歷史成交量...")
                 client = RestClient(api_key=FUGLE_API_KEY)
                 history_vol = {}
@@ -344,7 +334,6 @@ with st.sidebar:
                     except: history_vol[code] = 1000
                     time.sleep(0.1)
                 
-                # 更新 Core
                 core.static_data = static_data
                 core.history_vol = history_vol
                 core.targets = sorted(targets, key=lambda x: static_data.get(x, {}).get('ret', -999), reverse=True)
@@ -360,10 +349,24 @@ with st.sidebar:
         else:
             core.is_running = False
 
+    # 戰情官模式：隱藏所有按鈕，只顯示訊號說明
+    if mode == "👀 戰情官":
+        st.success("📱 戰情官模式：僅讀取數據，安全省電。")
+        
+    st.markdown("---")
+    st.subheader("🚥 訊號邏輯")
+    st.info("""
+    **🔥 攻擊**：漲+量+價穩+大戶買
+    **👀 量增**：價未噴+有量+大戶吸
+    **💀 出貨**：破均價1%+爆量+大戶賣
+    **❌ 誘多**：漲>2% + 1H大戶賣
+    **⚠️ 價強**：漲幅夠但量不足
+    """)
+
 # === 主畫面 ===
 
 now_time = datetime.now(timezone.utc) + timedelta(hours=8)
-st.title(f"⚡ Sniper 戰情室 (v22.0 極速版)")
+st.title(f"⚡ Sniper 戰情室 (v23.0)")
 st.caption(f"最後刷新: {now_time.strftime('%H:%M:%S')} (每3秒)")
 
 # 載入資料 (戰情官模式)
@@ -372,7 +375,6 @@ if mode == "👀 戰情官":
     if data:
         core.static_data = data.get("static_data", {})
         core.realtime_data = data.get("realtime_data", {})
-        # 嘗試恢復排序後的 targets
         if "targets_order" in data:
             core.targets = data["targets_order"]
         elif core.static_data:
@@ -383,14 +385,17 @@ if core.targets:
     display_rows = []
     
     for code in core.targets:
-        # 靜態資料
         static = core.static_data.get(code, {'name': code, 'cat': '-', 'win': 0, 'ret': 0})
-        # 動態資料
         real = core.realtime_data.get(code, {})
         
-        price = real.get('price', '-')
+        # 格式化：現價與均價統一 .2f
+        price_raw = real.get('price', 0)
+        vwap_raw = real.get('vwap', 0)
+        
+        price_str = f"{price_raw:.2f}" if price_raw else "-"
+        vwap_str = f"{vwap_raw:.2f}" if vwap_raw else "-"
+        
         pct = f"{real.get('pct', 0)}%" if 'pct' in real else "-"
-        vwap = f"{real.get('vwap', 0):.1f}" if 'vwap' in real else "-"
         ratio = f"{real.get('ratio', 0):.1f}" if 'ratio' in real else "-"
         n1h = real.get('net_1h', 0)
         nday = real.get('net_day', 0)
@@ -402,9 +407,9 @@ if core.targets:
             "類別": static['cat'],
             "勝率%": f"{static['win']:.0f}%", 
             "報酬%": f"{static['ret']:.1f}%",
-            "現價": price, 
+            "現價": price_str, 
             "漲跌%": pct, 
-            "均價": vwap, 
+            "均價": vwap_str, 
             "量比": ratio,
             "大戶(1H)": n1h, 
             "大戶(日)": nday, 
