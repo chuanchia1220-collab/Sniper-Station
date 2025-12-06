@@ -7,25 +7,18 @@ from datetime import datetime, timedelta
 import time
 import os
 import twstock
-import json
-import threading
 from collections import deque
-import shutil
 
 # ==========================================
-# 1. 基礎配置 (Configuration)
+# 🔑 設定區
 # ==========================================
-st.set_page_config(page_title="Sniper 戰情室 (Reborn v21.0)", page_icon="🎯", layout="wide")
-
-# 嘗試讀取 API Key
+# 嘗試從 Streamlit Secrets 或 環境變數 讀取 Key
 try:
     FUGLE_API_KEY = st.secrets["Fugle_API_Key"]
 except:
     FUGLE_API_KEY = os.getenv("Fugle_API_Key")
 
-DB_FILE = "sniper_db.json"
-
-# 預設核心股池 (53檔)
+# 核心股池 (53檔)
 DEFAULT_POOL = (
     "3706 2449 6442 3017 6139 4977 3163 3037 2359 1519 "
     "2330 2317 2382 3231 2356 2454 2303 3711 3081 4979 3363 3450 2345 "
@@ -35,6 +28,7 @@ DEFAULT_POOL = (
     "1513 2609 2615 8033 2634 2201 4763 5284 3264"
 )
 
+# 類別表
 STOCK_CATS = {
     '2330': '半導體', '2303': '半導體', '2454': '半導體', '3711': '半導體',
     '2317': 'AI組裝', '2382': 'AI組裝', '3231': 'AI組裝', '2356': 'AI組裝', '3706': 'AI組裝',
@@ -48,9 +42,11 @@ STOCK_CATS = {
     '2449': '封測', '3264': '封測'
 }
 
-# ==========================================
-# 2. 數學運算與邏輯函式 (Logic)
-# ==========================================
+# 頁面設定
+st.set_page_config(page_title="Sniper 戰情室 (v14.1)", page_icon="🎯", layout="wide")
+
+# === 核心邏輯函式庫 ===
+
 def get_yahoo_ticker(raw_code):
     code = raw_code.strip().upper()
     if code in twstock.codes:
@@ -73,356 +69,264 @@ def get_dynamic_thresholds(price):
 
 def get_big_order_threshold(price):
     if price <= 0: return 5
-    threshold = int(400 / price) # 40萬台幣
+    threshold = int(400 / price)
     return max(1, threshold)
 
 def _calc_est_vol(current_vol):
-    # 修正時區為台灣時間 UTC+8
-    now = datetime.utcnow() + timedelta(hours=8)
-    open_t = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    now = datetime.now()
+    open_t = now.replace(hour=9, minute=0, second=0)
     elapsed = (now - open_t).seconds / 60
     if elapsed <= 0: return current_vol
-    total = 270 # 交易分鐘數 (09:00~13:30)
+    total = 270
     if elapsed >= total: return current_vol
     return int(current_vol * (total / elapsed))
 
-# === 訊號判定邏輯 (您的核心戰法) ===
-def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown):
-    # 1. 漲停
-    if pct >= 9.5: return "👑漲停"
-    
-    # 2. 攻擊：多頭排列 + 大戶買 + 漲幅量能達標
-    if is_bullish and net_day > 200 and pct >= tgt_pct and ratio >= tgt_ratio:
-        return "🔥攻擊"
-    
-    # 3. 量增 (吸籌)：沒噴 + 有量 + 均價上 + 1H大戶吸
-    if ratio >= tgt_ratio and pct < tgt_pct and is_bullish and net_1h > 200:
-        return "👀量增"
-        
-    # 4. 出貨 (Dump)：破均價1% + 爆量 + 1H大戶賣
-    if is_breakdown and ratio >= tgt_ratio and net_1h < 0:
-        return "💀出貨"
-        
-    # 5. 誘多 (Trap)：漲 > 2% 但大戶1H在賣
-    if pct > 2.0 and net_1h < 0:
-        return "❌誘多"
+# === 初始化 Session State (數據持久化) ===
+if 'data_store' not in st.session_state:
+    st.session_state.data_store = {}
+if 'prev_data' not in st.session_state:
+    st.session_state.prev_data = {}
+if 'history_vol' not in st.session_state:
+    st.session_state.history_vol = {}
+if 'backtest_results' not in st.session_state:
+    st.session_state.backtest_results = {}
+if 'sorted_targets' not in st.session_state:
+    st.session_state.sorted_targets = []
+if 'client' not in st.session_state:
+    try:
+        if not FUGLE_API_KEY: raise ValueError("API Key is missing.")
+        st.session_state.client = RestClient(api_key=FUGLE_API_KEY)
+    except:
+        st.error("⚠️ API 連線初始化失敗！請檢查 Secrets 設定。")
 
-    # 6. 價強
-    if is_bullish and pct >= tgt_pct:
-        return "⚠️價強"
-        
-    return "盤整"
+# === 標題區 ===
+st.title("🎯 股市狙擊手 (v14.1 雲端版)")
+st.caption(f"最後更新: {datetime.now().strftime('%H:%M:%S')} | 狀態: {'監控中 🟢' if 'run_monitor' in st.session_state and st.session_state.run_monitor else '待機 ⚪'}")
 
-# ==========================================
-# 3. 全局狀態與後端核心 (State & Backend)
-# ==========================================
-
-# 使用 singleton 模式確保全域只有一個「數據中心」
-@st.cache_resource
-class SniperCore:
-    def __init__(self):
-        self.is_running = False
-        self.targets = []
-        
-        # 數據容器
-        self.data_store = {}       # 存大戶累計 (deque)
-        self.prev_data = {}        # 存上一筆 tick (算大單用)
-        self.history_vol = {}      # 歷史均量
-        self.backtest_results = {} # 回測數據
-        self.snapshot_df = pd.DataFrame() # 即時報表 (給前端顯示)
-        self.logs = []             # 訊號 Log
-        self.last_update_time = "初始化中"
-        
-        # 嘗試讀檔恢復數據 (斷點續傳)
-        self.load_db()
-
-    def load_db(self):
-        if os.path.exists(DB_FILE):
-            try:
-                with open(DB_FILE, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    # 恢復 deque 結構
-                    raw_store = data.get("data_store", {})
-                    for k, v in raw_store.items():
-                        self.data_store[k] = {
-                            'daily': v['daily'],
-                            '1h_queue': deque(v['1h_queue'], maxlen=5000)
-                        }
-                    # 恢復其他
-                    self.backtest_results = data.get("backtest_results", {})
-                    self.history_vol = data.get("history_vol", {})
-                    self.logs = data.get("logs", [])
-            except: pass
-
-    def save_db(self):
-        # 將 deque 轉 list 存檔
-        serializable_store = {}
-        for k, v in self.data_store.items():
-            serializable_store[k] = {
-                'daily': v['daily'],
-                '1h_queue': list(v['1h_queue'])
-            }
-        data = {
-            "data_store": serializable_store,
-            "backtest_results": self.backtest_results,
-            "history_vol": self.history_vol,
-            "logs": self.logs
-        }
-        try:
-            temp = f"{DB_FILE}.tmp"
-            with open(temp, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False)
-            shutil.move(temp, DB_FILE)
-        except: pass
-
-    # --- 背景執行緒：負責打 API 與運算 ---
-    def start_worker(self, targets):
-        if self.is_running: return # 避免重複啟動
-        self.targets = targets
-        self.is_running = True
-        
-        t = threading.Thread(target=self._worker_loop, daemon=True)
-        t.start()
-
-    def _worker_loop(self):
-        # 1. 初始化 Fugle Client
-        try:
-            client = RestClient(api_key=FUGLE_API_KEY)
-        except:
-            self.is_running = False
-            return
-
-        # 2. 如果沒有歷史量，先抓一次 (初始化)
-        if not self.history_vol:
-            for code in self.targets:
-                if not self.is_running: break
-                try:
-                    candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=2)
-                    if candles and 'data' in candles and len(candles['data']) >= 2:
-                        self.history_vol[code] = int(candles['data'][-2]['volume']) // 1000
-                    else: self.history_vol[code] = 1000
-                except: self.history_vol[code] = 1000
-                time.sleep(0.1)
-            self.save_db()
-
-        # 3. 進入無限監控迴圈
-        while self.is_running:
-            rows = []
-            
-            # 智慧節流：每檔間隔 0.3 秒，避免 53 檔瞬間爆 API
-            delay = 0.3 
-            
-            for code in self.targets:
-                try:
-                    if not self.is_running: break
-                    
-                    # API 請求
-                    q = client.stock.intraday.quote(symbol=code)
-                    price = q.get('lastPrice', q.get('previousClose', 0))
-                    if price == 0 or price is None: price = q.get('previousClose', 0)
-                    
-                    pct = q.get('changePercent', 0)
-                    vol = q.get('total', {}).get('tradeVolume', 0) * 1000
-                    name = get_stock_name(code)
-                    total_val = q.get('total', {}).get('tradeValue', 0)
-                    vwap = total_val / vol if vol > 0 else price
-                    
-                    est_vol = _calc_est_vol(q.get('total', {}).get('tradeVolume', 0))
-                    base_vol = self.history_vol.get(code, 1000)
-                    ratio = est_vol / base_vol if base_vol > 0 else 0
-                    
-                    # 大戶籌碼核心運算
-                    delta_net = 0
-                    if code in self.prev_data:
-                        prev_v = self.prev_data[code]['vol']
-                        prev_p = self.prev_data[code]['price']
-                        delta_v = (vol - prev_v) / 1000
-                        
-                        threshold = get_big_order_threshold(price)
-                        if delta_v >= threshold:
-                            if price >= prev_p: delta_net = int(delta_v)
-                            elif price < prev_p: delta_net = -int(delta_v)
-                    
-                    self.prev_data[code] = {'vol': vol, 'price': price}
-                    
-                    # 存入 Data Store
-                    if code not in self.data_store:
-                        self.data_store[code] = {'daily': 0, '1h_queue': deque()}
-                    
-                    if delta_net != 0:
-                        self.data_store[code]['daily'] += delta_net
-                        self.data_store[code]['1h_queue'].append((time.time(), delta_net))
-                    
-                    # 1H 滾動清理
-                    now_ts = time.time()
-                    one_hour_ago = now_ts - 3600
-                    queue = self.data_store[code]['1h_queue']
-                    while len(queue) > 0 and queue[0][0] < one_hour_ago: queue.popleft()
-                    
-                    net_1h = sum(i[1] for i in queue)
-                    net_day = self.data_store[code]['daily']
-                    
-                    # 訊號判定
-                    tgt_pct, tgt_ratio = get_dynamic_thresholds(price)
-                    is_bullish = price >= vwap
-                    is_breakdown = price < (vwap * 0.99)
-                    
-                    signal = check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown)
-                    
-                    # 寫 Log (去重)
-                    if signal != "盤整":
-                        tw_time = (datetime.utcnow() + timedelta(hours=8)).strftime('%H:%M:%S')
-                        new_log = {"time": tw_time, "code": code, "name": name, "signal": signal}
-                        if not self.logs or (self.logs[0]['code'] != code or self.logs[0]['signal'] != signal):
-                            self.logs.insert(0, new_log)
-                            self.logs = self.logs[:100]
-                    
-                    # 準備顯示資料
-                    bt = self.backtest_results.get(code, {'win':0, 'ret':0})
-                    
-                    rows.append({
-                        "代碼": code, "名稱": name, "類別": get_category(code),
-                        "勝率%": f"{bt['win']:.0f}", "報酬%": f"{bt['ret']:.1f}", 
-                        "現價": price, "漲跌%": f"{pct}%", "均價": f"{vwap:.1f}", 
-                        "量比": f"{ratio:.1f}", "大戶(1H)": net_1h, "大戶(日)": net_day, 
-                        "訊號": signal
-                    })
-
-                except: pass
-                time.sleep(delay) # 每一檔中間休息
-            
-            # 一輪結束，更新快照 (UI 只讀這裡，絕對不會沒資料)
-            if rows:
-                self.snapshot_df = pd.DataFrame(rows)
-                self.last_update_time = (datetime.utcnow() + timedelta(hours=8)).strftime('%H:%M:%S')
-                self.save_db()
-                
-            time.sleep(1) # 輪與輪之間休息
-
-# 實例化核心
-core = SniperCore()
-
-# ==========================================
-# 4. 前端顯示層 (UI)
-# ==========================================
-
-# 側邊欄：設定與規則 (只顯示一次)
+# === 側邊欄：控制台 ===
 with st.sidebar:
-    st.header("⚙️ 戰情室控制台")
+    st.header("⚙️ 戰情室設定")
     
-    # 指揮官控制
-    with st.expander("👨‍✈️ 指揮官操作 (運算核心)", expanded=True):
-        raw_input = st.text_area("監控清單", DEFAULT_POOL, height=100)
+    raw_input = st.text_area("監控代碼 (Top 10)", DEFAULT_POOL, height=150)
+    
+    # 按鈕 1: 初始化與回測
+    if st.button("1. 執行回測與初始化", type="primary"):
         targets = [t.strip() for t in raw_input.split() if t.strip()]
         
-        # 1. 回測按鈕
-        if st.button("1. 執行回測與重置", type="primary"):
-            if not FUGLE_API_KEY:
-                st.error("請先設定 API Key")
-            else:
-                core.is_running = False # 先停
-                time.sleep(1)
-                
-                st.info("正在執行回測...")
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=180)
-                bt_res = {}
-                
-                bar = st.progress(0)
-                for i, code in enumerate(targets):
-                    bar.progress((i+1)/len(targets))
-                    tk = get_yahoo_ticker(code)
-                    try:
-                        df = yf.download(tk, start=start_date, end=end_date, progress=False)
-                        # 簡易回測邏輯
-                        if not df.empty and len(df) > 20:
-                            # Flatten multi-index
-                            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-                            ret = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0] * 100
-                            win = 60 # 模擬值，避免 yfinance 卡太久
-                            bt_res[code] = {'win': win, 'ret': ret}
-                        else:
-                            bt_res[code] = {'win': 0, 'ret': 0}
-                    except: bt_res[code] = {'win': 0, 'ret': 0}
-                
-                core.backtest_results = bt_res
-                # 排序
-                sorted_targets = sorted(targets, key=lambda x: bt_res.get(x, {'ret':-999})['ret'], reverse=True)
-                core.save_db()
-                
-                # 啟動背景程式
-                core.start_worker(sorted_targets)
-                st.success("系統已重置並啟動！")
-                time.sleep(1)
-                st.rerun()
-
-        # 2. 狀態顯示
-        if core.is_running:
-            st.success("🟢 核心運算中")
-            if st.button("停止運算"):
-                core.is_running = False
-                st.rerun()
-        else:
-            st.warning("⚪ 核心待機中")
-            if st.button("恢復運算"):
-                core.start_worker(targets)
-                st.rerun()
-
-    # 訊號規則說明
-    st.markdown("---")
-    st.subheader("🚥 訊號規則")
-    st.info("""
-    **🔥 攻擊**：漲+量+價穩+大戶買
-    **👀 量增**：價未噴+有量+大戶吸 (埋伏)
-    **💀 出貨**：破均價1%+爆量+大戶賣
-    **❌ 誘多**：漲>2% 但大戶在賣
-    """)
-
-# 主畫面
-st.title("🎯 Sniper 戰情室 (v20.0)")
-st.caption(f"最後更新: {core.last_update_time} (台灣時間)")
-
-# 分頁
-tab1, tab2 = st.tabs(["📊 即時戰情列表", "📡 歷史訊號紀錄"])
-
-with tab1:
-    # 這裡只讀取 snapshot，絕不進行運算
-    if not core.snapshot_df.empty:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
-        # 樣式函式
-        def style_df(val):
-            s = str(val)
-            if '攻擊' in s or '漲停' in s: return 'background-color: #FFDDDD; color: red; font-weight: bold'
-            if '出貨' in s or '誘多' in s: return 'background-color: #DDFFDD; color: green; font-weight: bold'
-            if '量增' in s: return 'background-color: #FFFFDD; color: #888800; font-weight: bold'
-            return ''
+        # 1. 執行回測
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=180)
+        bt_results = {}
         
-        def style_net(val):
+        status_text.text("正在執行 180 天回測排序...")
+        
+        # 為了速度，這裡做一個簡化版的回測 (只測最近 3 個月) 或完整版
+        # 這裡示範完整版
+        for i, code in enumerate(targets):
+            progress_bar.progress((i + 1) / len(targets))
+            ticker = get_yahoo_ticker(code)
             try:
-                if int(val) > 0: return 'color: red; font-weight: bold'
-                if int(val) < 0: return 'color: green; font-weight: bold'
+                df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                if df.empty: 
+                    alt = ticker.replace('.TW', '.TWO') if '.TW' in ticker else ticker.replace('.TWO', '.TW')
+                    df = yf.download(alt, start=start_date, end=end_date, progress=False)
+                
+                if not df.empty and len(df) > 20:
+                    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+                    df['Prev_Close'] = df['Close'].shift(1)
+                    df['Change_Pct'] = (df['Close'] - df['Prev_Close']) / df['Prev_Close']
+                    df['Vol_MA5'] = df['Volume'].rolling(5).mean().shift(1)
+                    
+                    trades = []
+                    for date, row in df.iterrows():
+                        close = row['Close']
+                        if pd.isna(close): continue
+                        tgt_pct, tgt_ratio = get_dynamic_thresholds(close)
+                        d_pct = row['Change_Pct'] * 100
+                        vol_r = row['Volume'] / row['Vol_MA5'] if row['Vol_MA5'] > 0 else 0
+                        
+                        if d_pct > tgt_pct and d_pct < 9.5 and vol_r > tgt_ratio:
+                            nxt_idx = df.index.get_loc(date) + 1
+                            if nxt_idx < len(df):
+                                ret = (df.iloc[nxt_idx]['Open'] - close) / close - 0.006
+                                trades.append(ret)
+                    
+                    win = len([x for x in trades if x > 0]) / len(trades) * 100 if trades else 0
+                    ret = sum(trades) * 100
+                    bt_results[code] = {'win': win, 'ret': ret}
             except: pass
-            return ''
+        
+        st.session_state.backtest_results = bt_results
+        
+        # 2. 排序
+        ranked = sorted(targets, key=lambda x: bt_results.get(x, {'ret': -999})['ret'], reverse=True)
+        st.session_state.sorted_targets = ranked
+        
+        # 3. 抓取歷史量
+        status_text.text("正在抓取歷史成交量...")
+        client = st.session_state.client
+        h_vols = {}
+        for code in ranked:
+            try:
+                candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=2)
+                if candles and 'data' in candles and len(candles['data']) >= 2:
+                    h_vols[code] = int(candles['data'][-2]['volume']) // 1000
+                else: h_vols[code] = 1000
+            except: h_vols[code] = 1000
+            time.sleep(0.1)
+            
+        st.session_state.history_vol = h_vols
+        st.success(f"初始化完成！共 {len(ranked)} 檔")
+        progress_bar.empty()
+        status_text.empty()
 
-        st.dataframe(
-            core.snapshot_df.style
-              .map(style_df, subset=['訊號'])
-              .map(style_net, subset=['大戶(1H)', '大戶(日)']),
-            use_container_width=True,
-            height=800,
-            hide_index=True
-        )
+    # 開關 2: 啟動監控
+    # 使用 session_state 來控制開關狀態
+    if 'run_monitor' not in st.session_state:
+        st.session_state.run_monitor = False
+
+    def toggle_run():
+        st.session_state.run_monitor = not st.session_state.run_monitor
+
+    st.checkbox("2. 啟動即時監控 (自動刷新)", value=st.session_state.run_monitor, on_change=toggle_run)
+
+
+# === 主畫面監控邏輯 ===
+
+if st.session_state.run_monitor and st.session_state.sorted_targets:
+    
+    client = st.session_state.client
+    targets = st.session_state.sorted_targets
+    display_list = []
+    
+    # 批次掃描 (模擬 Real-time)
+    for code in targets:
+        try:
+            # 取得報價
+            q = client.stock.intraday.quote(symbol=code)
+            price = q.get('lastPrice', q.get('previousClose', 0))
+            
+            # 處理休市或無數據
+            if price == 0 or price is None:
+                display_list.append({
+                    "代碼": code, "名稱": get_stock_name(code), "類別": get_category(code),
+                    "勝率%": "-", "報酬%": "-", "現價": "-", "漲跌%": "-", 
+                    "均價": "-", "量比": "-", "大戶(1H)": 0, "大戶(日)": 0, "訊號": "休市"
+                })
+                continue
+
+            pct = q.get('changePercent', 0)
+            vol = q.get('total', {}).get('tradeVolume', 0) * 1000
+            name = get_stock_name(code)
+            total_val = q.get('total', {}).get('tradeValue', 0)
+            vwap = total_val / vol if vol > 0 else price
+            est_vol = _calc_est_vol(q.get('total', {}).get('tradeVolume', 0))
+            base_vol = st.session_state.history_vol.get(code, 1000)
+            ratio = est_vol / base_vol if base_vol > 0 else 0
+            
+            # 大戶運算
+            delta_net = 0
+            if code in st.session_state.prev_data:
+                prev_v = st.session_state.prev_data[code]['vol']
+                prev_p = st.session_state.prev_data[code]['price']
+                delta_v = (vol - prev_v) / 1000
+                
+                threshold = get_big_order_threshold(price)
+                if delta_v >= threshold:
+                    if price >= prev_p: delta_net = int(delta_v)
+                    elif price < prev_p: delta_net = -int(delta_v)
+            
+            st.session_state.prev_data[code] = {'vol': vol, 'price': price}
+            
+            # 數據儲存
+            if code not in st.session_state.data_store:
+                st.session_state.data_store[code] = {'daily': 0, '1h_queue': deque()}
+            
+            if delta_net != 0:
+                st.session_state.data_store[code]['daily'] += delta_net
+                st.session_state.data_store[code]['1h_queue'].append((time.time(), delta_net))
+            
+            # 1H 清理
+            now_ts = time.time()
+            queue = st.session_state.data_store[code]['1h_queue']
+            one_hour_ago = now_ts - 3600
+            while len(queue) > 0 and queue[0][0] < one_hour_ago: queue.popleft()
+            
+            net_1h = sum(i[1] for i in queue)
+            net_day = st.session_state.data_store[code]['daily']
+            
+            # 訊號判定
+            tgt_pct, tgt_ratio = get_dynamic_thresholds(price)
+            is_bullish = price >= vwap
+            
+            signal = "-"
+            if pct >= 9.5: signal = "👑漲停"
+            elif is_bullish and net_day > 200:
+                if pct >= tgt_pct and ratio >= tgt_ratio: signal = "🔥攻擊"
+                elif pct >= tgt_pct: signal = "⚠️價強"
+            elif not is_bullish and ratio >= tgt_ratio:
+                signal = "💀出貨"
+            
+            # 回測數據
+            bt = st.session_state.backtest_results.get(code, {'win':0, 'ret':0})
+            
+            display_list.append({
+                "代碼": code,
+                "名稱": name,
+                "類別": get_category(code),
+                "勝率%": f"{bt['win']:.0f}%",
+                "報酬%": f"{bt['ret']:.1f}%",
+                "現價": price,
+                "漲跌%": f"{pct}%",
+                "均價": f"{vwap:.1f}",
+                "量比": f"{ratio:.1f}",
+                "大戶(1H)": net_1h,
+                "大戶(日)": net_day,
+                "訊號": signal
+            })
+            
+        except: pass
+
+    # 顯示表格 (如果有資料)
+    if display_list:
+        df = pd.DataFrame(display_list)
+        st.session_state.last_display_df = df # 更新快取
+        
+        # 樣式設定 (防呆：先檢查欄位是否存在)
+        if '訊號' in df.columns:
+            def style_df(val):
+                if '攻擊' in str(val) or '漲停' in str(val): return 'background-color: #FFDDDD; color: red; font-weight: bold'
+                if '出貨' in str(val): return 'background-color: #DDFFDD; color: green; font-weight: bold'
+                return ''
+            
+            def style_net(val):
+                try:
+                    v = int(val)
+                    if v > 0: return 'color: red; font-weight: bold'
+                    if v < 0: return 'color: green; font-weight: bold'
+                except: pass
+                return ''
+
+            st.dataframe(
+                df.style
+                  .map(style_df, subset=['訊號'])
+                  .map(style_net, subset=['大戶(1H)', '大戶(日)']),
+                use_container_width=True,
+                height=800,
+                hide_index=True
+            )
+            
+            # 自動刷新機制 (3秒後重跑一次 script)
+            time.sleep(3)
+            st.rerun()
+            
     else:
-        st.info("數據載入中... (若為戰情官，請確認指揮官已啟動)")
+        st.warning("尚無數據，請稍候或檢查市場是否開盤...")
+        time.sleep(3)
+        st.rerun()
 
-with tab2:
-    if core.logs:
-        for log in core.logs:
-            c = "red" if "攻擊" in log['signal'] else "green" if "出貨" in log['signal'] else "blue"
-            st.markdown(f"`{log['time']}` **{log['code']} {log['name']}** : :{c}[{log['signal']}]")
-    else:
-        st.write("尚無訊號...")
-
-# 自動刷新 (每 3 秒)
-time.sleep(3)
-st.rerun()
+else:
+    st.info("👈 請在左側點擊「1. 執行回測」來初始化數據，完成後勾選「2. 啟動監控」。")
