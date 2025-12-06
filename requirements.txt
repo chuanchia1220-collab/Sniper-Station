@@ -1,0 +1,6 @@
+streamlit
+pandas
+numpy
+fugle-marketdata
+twstock
+yfinance
