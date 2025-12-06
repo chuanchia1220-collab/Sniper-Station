@@ -45,7 +45,7 @@ STOCK_CATS = {
 }
 
 # 頁面設定
-st.set_page_config(page_title="Sniper 戰情室 (v17.0)", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Sniper 戰情室 (v17.1)", page_icon="🎯", layout="wide")
 
 # 資料庫路徑
 DB_FILE = "sniper_db.json"
@@ -86,7 +86,7 @@ def _calc_est_vol(current_vol):
     if elapsed >= total: return current_vol
     return int(current_vol * (total / elapsed))
 
-# === 資料庫存取 (原子寫入，防止衝突) ===
+# === 資料庫存取 ===
 def load_db():
     if os.path.exists(DB_FILE):
         try:
@@ -97,30 +97,29 @@ def load_db():
 
 def save_db(data):
     try:
-        # 先寫入暫存檔，再改名，確保寫入過程不會被讀取
         temp_file = f"{DB_FILE}.tmp"
         with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False)
         shutil.move(temp_file, DB_FILE)
     except: pass
 
-# === 全局狀態管理 (使用 cache_resource 實現跨 Session 共享) ===
+# === 全局狀態管理 ===
 @st.cache_resource
 class GlobalState:
     def __init__(self):
-        self.data_store = {} # 存大戶累計
+        self.data_store = {}
         self.prev_data = {}
         self.history_vol = {}
         self.backtest_results = {}
         self.sorted_targets = []
-        self.snapshot = [] # 即時盤面快照
+        self.snapshot = []
         self.last_update = 0
         self.is_running = False
-        self.logs = [] # 存訊號紀錄
+        self.logs = []
         
 state = GlobalState()
 
-# === 背景工作執行緒 (指揮官專用) ===
+# === 背景工作執行緒 ===
 def background_worker(targets):
     client = RestClient(api_key=FUGLE_API_KEY)
     
@@ -195,10 +194,9 @@ def background_worker(targets):
                         "time": (datetime.utcnow() + timedelta(hours=8)).strftime('%H:%M:%S'),
                         "code": code, "name": name, "signal": signal
                     }
-                    # 簡單去重，避免重複刷屏
                     if not state.logs or state.logs[0]['time'] != log_entry['time'] or state.logs[0]['code'] != code:
                         state.logs.insert(0, log_entry)
-                        state.logs = state.logs[:50] # 只留最新50筆
+                        state.logs = state.logs[:50] 
 
                 bt = state.backtest_results.get(code, {'win':0, 'ret':0})
                 
@@ -211,13 +209,11 @@ def background_worker(targets):
                 })
                 
             except: pass
-            time.sleep(0.2) # 每個股票間隔，避免被鎖 IP
+            time.sleep(0.2)
         
-        # 更新全域狀態與 DB
         state.snapshot = snapshot_list
         state.last_update = time.time()
         
-        # 存檔供戰情官使用
         db_data = {
             "snapshot": snapshot_list,
             "last_update": state.last_update,
@@ -225,14 +221,13 @@ def background_worker(targets):
         }
         save_db(db_data)
         
-        # 休息一下再跑下一輪 (動態調整，股票越多休越久，避免卡死)
         time.sleep(1) 
 
 # === 主介面 ===
 
 taiwan_time = datetime.utcnow() + timedelta(hours=8)
-st.title("🎯 Sniper 戰情室 (v17.0)")
-st.caption(f"系統時間: {taiwan_time.strftime('%H:%M:%S')} | 核心狀態: {'運作中 🟢' if state.is_running else '待機 ⚪'}")
+st.title("🎯 Sniper 戰情室 (v17.1)")
+st.caption(f"系統時間: {taiwan_time.strftime('%H:%M:%S')} | 核心: {'🟢 運作中' if state.is_running else '⚪ 待機'}")
 
 # 側邊欄
 with st.sidebar:
@@ -244,10 +239,9 @@ with st.sidebar:
         
         if st.button("1. 初始化與回測", type="primary"):
             targets = [t.strip() for t in raw_input.split() if t.strip()]
-            state.is_running = False # 先停止舊線程
+            state.is_running = False
             time.sleep(1)
             
-            # 回測
             status = st.status("正在初始化...", expanded=True)
             status.write("執行 180 天回測...")
             
@@ -315,70 +309,61 @@ with st.sidebar:
         if st.checkbox("2. 啟動運算核心", value=state.is_running):
             if not state.is_running:
                 state.is_running = True
-                # 啟動背景執行緒
                 t = threading.Thread(target=background_worker, args=(state.sorted_targets,), daemon=True)
                 t.start()
                 st.toast("運算核心已啟動！")
         else:
             state.is_running = False
 
-# === 資料顯示區 (戰情官/指揮官共用) ===
+# === 資料顯示區 ===
 
-# 自動載入 DB 數據 (如果是戰情官)
+# 載入數據
 if mode == "👀 戰情官 (讀取數據)":
     db_data = load_db()
     if db_data:
-        snapshot = db_data.get("snapshot", [])
-        last_update = db_data.get("last_update", 0)
-        logs = db_data.get("logs", [])
+        state.snapshot = db_data.get("snapshot", [])
+        state.logs = db_data.get("logs", [])
+        state.last_update = db_data.get("last_update", 0)
+
+# 分頁顯示
+tab1, tab2 = st.tabs(["📊 戰情監控", "📡 訊號中心"])
+
+with tab1:
+    if state.snapshot:
+        df = pd.DataFrame(state.snapshot)
         
-        # 檢查數據新鮮度
-        time_diff = time.time() - last_update
-        if time_diff > 60:
-            st.warning(f"⚠️ 數據延遲：{int(time_diff)} 秒前更新 (指揮官可能已離線)")
-        else:
-            st.success(f"🟢 數據即時：{int(time_diff)} 秒前更新")
-            
-        state.snapshot = snapshot
-        state.logs = logs
+        def style_df(val):
+            if '攻擊' in str(val) or '漲停' in str(val): return 'background-color: #FFDDDD; color: red; font-weight: bold'
+            if '出貨' in str(val) or '誘多' in str(val): return 'background-color: #DDFFDD; color: green; font-weight: bold'
+            if '量增' in str(val): return 'background-color: #FFFFDD; color: #888800; font-weight: bold'
+            return ''
+        
+        def style_net(val):
+            try:
+                if val > 0: return 'color: red; font-weight: bold'
+                if val < 0: return 'color: green; font-weight: bold'
+            except: pass
+            return ''
+        
+        st.dataframe(
+            df.style
+              .map(style_df, subset=['訊號'])
+              .map(style_net, subset=['大戶(1H)', '大戶(日)']),
+            use_container_width=True,
+            height=800,
+            hide_index=True
+        )
     else:
-        st.info("等待指揮官啟動...")
+        st.info("等待數據更新...")
 
-# 顯示主表格
-if state.snapshot:
-    df = pd.DataFrame(state.snapshot)
-    
-    def style_df(val):
-        if '攻擊' in str(val) or '漲停' in str(val): return 'background-color: #FFDDDD; color: red; font-weight: bold'
-        if '出貨' in str(val) or '誘多' in str(val): return 'background-color: #DDFFDD; color: green; font-weight: bold'
-        if '量增' in str(val): return 'background-color: #FFFFDD; color: #888800; font-weight: bold'
-        return ''
-    
-    def style_net(val):
-        try:
-            if val > 0: return 'color: red; font-weight: bold'
-            if val < 0: return 'color: green; font-weight: bold'
-        except: pass
-        return ''
-    
-    st.dataframe(
-        df.style
-          .map(style_df, subset=['訊號'])
-          .map(style_net, subset=['大戶(1H)', '大戶(日)']),
-        use_container_width=True,
-        height=800,
-        hide_index=True
-    )
-
-# 顯示訊號快訊 (Log) - 放在側邊或下方
-with st.expander("📡 訊號中心 (最新 50 筆)", expanded=True):
+with tab2:
     if state.logs:
         for log in state.logs:
             color = "red" if "攻擊" in log['signal'] else "green" if "出貨" in log['signal'] else "orange"
             st.markdown(f"**{log['time']}** | {log['code']} {log['name']} : :{color}[{log['signal']}]")
     else:
-        st.write("尚無訊號...")
+        st.write("尚無訊號紀錄...")
 
-# 自動刷新 (每 3 秒)
+# 自動刷新
 time.sleep(3)
 st.rerun()
