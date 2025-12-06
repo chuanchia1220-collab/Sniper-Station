@@ -15,7 +15,7 @@ import shutil
 # ==========================================
 # 1. 基礎設定
 # ==========================================
-st.set_page_config(page_title="Sniper 戰情室 (Fix v22.0)", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Sniper 戰情室", page_icon="🎯", layout="wide")
 
 try:
     FUGLE_API_KEY = st.secrets["Fugle_API_Key"]
@@ -455,3 +455,4 @@ else:
 
 time.sleep(3)
 st.rerun()
+
