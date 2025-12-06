@@ -15,7 +15,7 @@ import shutil
 # ==========================================
 # 1. 基礎設定
 # ==========================================
-st.set_page_config(page_title="Sniper 戰情室", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Sniper 即時股情觀測室", page_icon="🎯", layout="wide")
 
 try:
     FUGLE_API_KEY = st.secrets["Fugle_API_Key"]
@@ -368,7 +368,7 @@ with st.sidebar:
 # === 主畫面 ===
 
 now_time = datetime.now(timezone.utc) + timedelta(hours=8)
-st.title(f"⚡ Sniper 戰情室 (Fix v22.0)")
+st.title(f"⚡ Sniper 即時股情觀測室")
 st.caption(f"最後刷新: {now_time.strftime('%H:%M:%S')} (每3秒)")
 
 # 載入資料 (戰情官模式)
@@ -455,4 +455,5 @@ else:
 
 time.sleep(3)
 st.rerun()
+
 
