@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from fugle_marketdata import RestClient
-from datetime import datetime, time as dt_time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 import time
 import os
 import twstock
@@ -12,22 +12,26 @@ import threading
 import sqlite3
 import concurrent.futures
 from collections import deque
+import shutil
+import requests
 
 # ==========================================
-# 1. 基礎設定 & 常數
+# 1. 基礎設定
 # ==========================================
-st.set_page_config(page_title="Sniper 戰情室 (Pro v23.1)", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="Sniper 戰情室 (Pro v24.0)", page_icon="🎯", layout="wide")
 
-# 讀取多組 API Key
 try:
-    raw_keys = st.secrets["Fugle_API_Key"]
+    FUGLE_API_KEY = st.secrets["Fugle_API_Key"]
+    TG_BOT_TOKEN = st.secrets.get("TG_BOT_TOKEN", "") 
+    TG_CHAT_ID = st.secrets.get("TG_CHAT_ID", "")
 except:
-    raw_keys = os.getenv("Fugle_API_Key", "")
-API_KEYS = [k.strip() for k in raw_keys.split(',') if k.strip()]
+    FUGLE_API_KEY = os.getenv("Fugle_API_Key")
+    TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+    TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 DB_PATH = "sniper.db"
 
-# 核心股池
+# 預設核心股池 (只作為預設文字顯示，不自動加入運算)
 DEFAULT_POOL = (
     "3706 2449 6442 3017 6139 4977 3163 3037 2359 1519 "
     "2330 2317 2382 3231 2356 2454 2303 3711 3081 4979 3363 3450 2345 "
@@ -51,8 +55,21 @@ STOCK_CATS = {
 }
 
 # ==========================================
-# 2. 資料庫層 (SQLite)
+# 2. 核心函式
 # ==========================================
+
+def send_telegram_message(msg):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID: return
+    try:
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TG_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML"
+        }
+        requests.post(url, data=payload, timeout=5)
+    except: pass
+
 class Database:
     def __init__(self, db_path):
         self.db_path = db_path
@@ -75,6 +92,10 @@ class Database:
         c.execute('''CREATE TABLE IF NOT EXISTS pinned (
             code TEXT PRIMARY KEY
         )''')
+        # 儲存 metadata (如 targets_order)
+        c.execute('''CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY, value TEXT
+        )''')
         conn.commit()
         conn.close()
 
@@ -92,7 +113,6 @@ class Database:
 
     def get_display_data(self):
         conn = self.get_conn()
-        # 這裡會選出 vwap
         query = '''
             SELECT 
                 r.code, r.name, r.category, 
@@ -124,11 +144,40 @@ class Database:
         conn.commit()
         conn.close()
 
+    def save_targets_order(self, targets):
+        conn = self.get_conn()
+        c = conn.cursor()
+        # 存成 JSON string
+        c.execute('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)', ("targets_order", json.dumps(targets)))
+        conn.commit()
+        conn.close()
+
+    def get_targets_order(self):
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('SELECT value FROM metadata WHERE key = ?', ("targets_order",))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            try:
+                return json.loads(row[0])
+            except: pass
+        return []
+
+    # 清理非清單內的資料 (Strict Source Control)
+    def clean_stale_data(self, current_targets):
+        conn = self.get_conn()
+        c = conn.cursor()
+        placeholders = ','.join('?' * len(current_targets))
+        # 刪除不在 targets 裡的 realtime 數據
+        c.execute(f'DELETE FROM realtime WHERE code NOT IN ({placeholders})', current_targets)
+        # 刪除不在 targets 裡的 static 數據
+        c.execute(f'DELETE FROM static_info WHERE code NOT IN ({placeholders})', current_targets)
+        conn.commit()
+        conn.close()
+
 db = Database(DB_PATH)
 
-# ==========================================
-# 3. 邏輯層
-# ==========================================
 def get_yahoo_ticker(raw_code):
     code = raw_code.strip().upper()
     if code in twstock.codes:
@@ -173,7 +222,7 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is
     return "盤整"
 
 # ==========================================
-# 4. 核心引擎 (Singleton)
+# 3. 全局狀態與後端 (Singleton)
 # ==========================================
 @st.cache_resource
 class SniperEngine:
@@ -184,8 +233,11 @@ class SniperEngine:
         self.daily_net = {} 
         self.prev_data = {} 
         self.history_vol = {}
+        self.alert_history = {}
         self.clients = []
         self._init_clients()
+        # 啟動時從 DB 載入 targets
+        self.targets = db.get_targets_order()
 
     def _init_clients(self):
         if not API_KEYS: return
@@ -197,6 +249,11 @@ class SniperEngine:
     def start(self, targets):
         if self.is_running: return
         self.targets = targets
+        # 保存到 DB
+        db.save_targets_order(targets)
+        # 清理 DB 中不相關的資料 (Strict Control)
+        db.clean_stale_data(targets)
+        
         self.is_running = True
         threading.Thread(target=self._run_loop, daemon=True).start()
 
@@ -214,7 +271,6 @@ class SniperEngine:
             total_val = q.get('total', {}).get('tradeValue', 0)
             vwap = total_val / vol if vol > 0 else price
             
-            # 歷史量快取
             if code not in self.history_vol:
                 try:
                     candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=2)
@@ -227,14 +283,12 @@ class SniperEngine:
             est_vol = _calc_est_vol(q.get('total', {}).get('tradeVolume', 0))
             ratio = est_vol / base_vol if base_vol > 0 else 0
             
-            # 大戶籌碼
             delta_net = 0
             if code in self.prev_data:
                 prev_v = self.prev_data[code]['vol']
                 prev_p = self.prev_data[code]['price']
                 delta_v = (vol - prev_v) / 1000
                 threshold = get_big_order_threshold(price)
-                
                 if delta_v >= threshold:
                     if price >= prev_p: delta_net = int(delta_v)
                     elif price < prev_p: delta_net = -int(delta_v)
@@ -256,6 +310,23 @@ class SniperEngine:
             is_breakdown = price < (vwap * 0.99)
             signal = check_signal(pct, is_bullish, self.daily_net.get(code, 0), net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown)
             
+            # TG 推播
+            if signal in ["🔥攻擊", "💀出貨", "👑漲停", "👀量增"]:
+                alert_key = f"{code}_{signal}"
+                last_alert_time = self.alert_history.get(alert_key, 0)
+                if now_ts - last_alert_time > 600:
+                    emoji = "🚀" if signal == "🔥攻擊" else "☠️" if signal == "💀出貨" else "👀"
+                    msg = (
+                        f"{emoji} <b>【Sniper 戰報】</b>\n"
+                        f"股票：<code>{code} {get_stock_name(code)}</code>\n"
+                        f"訊號：<b>{signal}</b>\n"
+                        f"現價：{price:.2f} ({pct:.2f}%)\n"
+                        f"量比：{ratio:.1f}\n"
+                        f"大戶1H：{net_1h}"
+                    )
+                    send_telegram_message(msg)
+                    self.alert_history[alert_key] = now_ts
+
             return (code, get_stock_name(code), get_category(code), price, pct, vwap, vol, ratio, net_1h, self.daily_net.get(code, 0), signal, now_ts)
             
         except Exception as e:
@@ -272,11 +343,12 @@ class SniperEngine:
             market_close = dt_time(13, 35)
             is_market_open = market_open <= now.time() <= market_close
             
-            sleep_time = 0.5 if is_market_open else 30
+            sleep_time = 0.5 if is_market_open else 10 # 盤後稍微快一點更新 UI 測試用，實戰可改 30
             
             batch_data = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 futures = []
+                # Load Balancing
                 for i, code in enumerate(self.targets):
                     client = self.clients[i % len(self.clients)]
                     futures.append(executor.submit(self._fetch_single_stock, client, code))
@@ -294,10 +366,15 @@ class SniperEngine:
 engine = SniperEngine()
 
 # ==========================================
-# 5. UI 呈現
+# 4. UI 呈現
 # ==========================================
 
-# 側邊欄
+# --- 初始化排序狀態 (Session State) ---
+if 'sort_col' not in st.session_state:
+    st.session_state.sort_col = 'signal_score'
+if 'sort_asc' not in st.session_state:
+    st.session_state.sort_asc = False
+
 with st.sidebar:
     st.title("⚙️ 指揮中心")
     mode = st.radio("模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
@@ -310,13 +387,14 @@ with st.sidebar:
 
         raw_input = st.text_area("監控清單", DEFAULT_POOL, height=100)
         
-        if st.button("初始化 & 啟動"):
+        if st.button("1. 初始化 & 啟動"):
             if not API_KEYS:
                 st.error("請設定 API Key")
             else:
+                # Strict Source Control: 完全採用 user input
                 targets = [t.strip() for t in raw_input.split() if t.strip()]
                 
-                status = st.status("執行回測中...", expanded=True)
+                status = st.status("執行回測與初始化...", expanded=True)
                 end_date = datetime.now()
                 start_date = end_date - timedelta(days=180)
                 static_list = []
@@ -345,6 +423,7 @@ with st.sidebar:
                 db.upsert_static(static_list)
                 status.update(label="初始化完成，啟動監控！", state="complete")
                 
+                # 傳遞 targets 給 engine，engine 會存入 DB 並清理舊資料
                 engine.start(targets)
                 time.sleep(1)
                 st.rerun()
@@ -353,17 +432,71 @@ with st.sidebar:
             engine.stop()
             st.rerun()
 
-# 主畫面
+    if mode == "👀 戰情官":
+        st.info("僅讀取數據，安全省電。")
+
+    st.markdown("---")
+    st.subheader("🚥 訊號邏輯")
+    st.info("""
+    **🔥 攻擊**：漲+量+價穩+大戶買
+    **👀 量增**：價未噴+量增+1H大戶吸
+    **💀 出貨**：破均價1%+爆量+大戶賣
+    **❌ 誘多**：漲>2% + 1H大戶賣
+    **⚠️ 價強**：漲幅夠但量不足
+    """)
+
+# --- 主畫面 ---
 now_time = datetime.now(timezone.utc) + timedelta(hours=8)
-st.title(f"⚡ Sniper 戰情室 (Pro v23.1)")
-st.caption(f"最後更新: {now_time.strftime('%H:%M:%S')}")
+st.title(f"⚡ Sniper 戰情室 (Pro v24.0)")
+st.caption(f"最後刷新: {now_time.strftime('%H:%M:%S')} (每3秒)")
 
 df = db.get_display_data()
 
 if not df.empty:
     df['Pinned'] = df['is_pinned'].astype(bool)
     
-    # === 顯示設定：加入 vwap (均價) ===
+    # 增加訊號分數 (用於預設排序)
+    def get_sig_score(s):
+        s = str(s)
+        if '攻擊' in s or '漲停' in s: return 100
+        if '量增' in s: return 80
+        if '出貨' in s or '誘多' in s: return 60
+        if '價強' in s: return 40
+        return 0
+    df['signal_score'] = df['signal'].apply(get_sig_score)
+
+    # === 排序控制器 (Sort Controls) ===
+    # 放置在 Expander 或直接在上方
+    with st.expander("🔽 排序設定", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            sort_options = {
+                "訊號強度": "signal_score",
+                "漲跌幅%": "pct",
+                "大戶(1H)": "net_1h",
+                "大戶(日)": "net_day",
+                "量比": "ratio",
+                "報酬%": "ret",
+                "勝率%": "win"
+            }
+            # 獲取當前選項的 key (label)
+            current_label = [k for k, v in sort_options.items() if v == st.session_state.sort_col]
+            default_idx = list(sort_options.keys()).index(current_label[0]) if current_label else 0
+            
+            selected_label = st.selectbox("排序依據", list(sort_options.keys()), index=default_idx)
+            st.session_state.sort_col = sort_options[selected_label]
+            
+        with col2:
+            sort_order = st.radio("順序", ["從大到小 (Desc)", "從小到大 (Asc)"], index=0 if not st.session_state.sort_asc else 1)
+            st.session_state.sort_asc = True if sort_order == "從小到大 (Asc)" else False
+
+    # === 執行排序 (Pinned 優先 > 使用者設定) ===
+    # 注意：Pinned 永遠是 False/True (0/1)。要讓 Pinned 排在上面，需用 False (Descending) -> 1 在前
+    df = df.sort_values(
+        by=['Pinned', st.session_state.sort_col], 
+        ascending=[False, st.session_state.sort_asc]
+    )
+
     column_config = {
         "Pinned": st.column_config.CheckboxColumn("📌", width="small"),
         "code": "代碼",
@@ -373,17 +506,13 @@ if not df.empty:
         "ret": st.column_config.NumberColumn("報酬%", format="%.1f%%"),
         "price": st.column_config.NumberColumn("現價", format="%.2f"),
         "pct": st.column_config.NumberColumn("漲跌%", format="%.2f%%"),
-        "vwap": st.column_config.NumberColumn("均價", format="%.2f"), # <--- 補回這一行
+        "vwap": st.column_config.NumberColumn("均價", format="%.2f"),
         "ratio": st.column_config.NumberColumn("量比", format="%.1f"),
         "net_1h": st.column_config.NumberColumn("大戶1H", format="%d"),
         "net_day": st.column_config.NumberColumn("大戶日", format="%d"),
         "signal": "訊號"
     }
     
-    df['sig_score'] = df['signal'].apply(lambda x: 10 if '攻擊' in str(x) or '漲停' in str(x) else (5 if '量增' in str(x) else 0))
-    df = df.sort_values(by=['Pinned', 'sig_score', 'pct'], ascending=[False, False, False])
-    
-    # 在 column_order 中加入 "vwap"
     edited_df = st.data_editor(
         df,
         column_config=column_config,
@@ -396,7 +525,13 @@ if not df.empty:
     
     if not df.empty:
         changes = edited_df[['code', 'Pinned']].set_index('code')
+        # 這裡為了效率，我們假設只處理變更。
+        # 其實 data_editor 雖然會重繪，但 DB update 很快。
+        # 比對 Pinned 狀態並寫回 DB
         for index, row in changes.iterrows():
+            # 只有當狀態真的改變時才寫 DB (減少 IO)
+            # 但因為 df 每次都重抓，這裡簡單處理直接 update 也可以
+            # 為了嚴謹，可以用 DB 當下的值比對，但這裡 update_pinned 有做處理
             db.update_pinned(index, row['Pinned'])
 
 else:
