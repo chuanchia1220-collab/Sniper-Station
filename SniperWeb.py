@@ -18,20 +18,26 @@ import requests
 # ==========================================
 # 1. 基礎設定
 # ==========================================
-st.set_page_config(page_title="Sniper 戰情室 (Pro v24.0)", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Sniper 戰情室 (Pro v24.1)", page_icon="🎯", layout="wide")
 
+# 讀取金鑰 (容錯處理)
 try:
-    FUGLE_API_KEY = st.secrets["Fugle_API_Key"]
+    # 嘗試從 Secrets 讀取
+    raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
     TG_BOT_TOKEN = st.secrets.get("TG_BOT_TOKEN", "") 
     TG_CHAT_ID = st.secrets.get("TG_CHAT_ID", "")
 except:
-    FUGLE_API_KEY = os.getenv("Fugle_API_Key")
+    # 嘗試從環境變數讀取
+    raw_fugle_keys = os.getenv("Fugle_API_Key", "")
     TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
+# 【關鍵修正】解析多組 API Key 成為全域變數
+API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
+
 DB_PATH = "sniper.db"
 
-# 預設核心股池 (只作為預設文字顯示，不自動加入運算)
+# 預設核心股池
 DEFAULT_POOL = (
     "3706 2449 6442 3017 6139 4977 3163 3037 2359 1519 "
     "2330 2317 2382 3231 2356 2454 2303 3711 3081 4979 3363 3450 2345 "
@@ -92,7 +98,6 @@ class Database:
         c.execute('''CREATE TABLE IF NOT EXISTS pinned (
             code TEXT PRIMARY KEY
         )''')
-        # 儲存 metadata (如 targets_order)
         c.execute('''CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY, value TEXT
         )''')
@@ -147,7 +152,6 @@ class Database:
     def save_targets_order(self, targets):
         conn = self.get_conn()
         c = conn.cursor()
-        # 存成 JSON string
         c.execute('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)', ("targets_order", json.dumps(targets)))
         conn.commit()
         conn.close()
@@ -164,14 +168,12 @@ class Database:
             except: pass
         return []
 
-    # 清理非清單內的資料 (Strict Source Control)
     def clean_stale_data(self, current_targets):
         conn = self.get_conn()
         c = conn.cursor()
+        if not current_targets: return
         placeholders = ','.join('?' * len(current_targets))
-        # 刪除不在 targets 裡的 realtime 數據
         c.execute(f'DELETE FROM realtime WHERE code NOT IN ({placeholders})', current_targets)
-        # 刪除不在 targets 裡的 static 數據
         c.execute(f'DELETE FROM static_info WHERE code NOT IN ({placeholders})', current_targets)
         conn.commit()
         conn.close()
@@ -236,10 +238,10 @@ class SniperEngine:
         self.alert_history = {}
         self.clients = []
         self._init_clients()
-        # 啟動時從 DB 載入 targets
         self.targets = db.get_targets_order()
 
     def _init_clients(self):
+        # 關鍵修正：這裡現在可以正確讀取到全域變數 API_KEYS 了
         if not API_KEYS: return
         for key in API_KEYS:
             try:
@@ -249,9 +251,7 @@ class SniperEngine:
     def start(self, targets):
         if self.is_running: return
         self.targets = targets
-        # 保存到 DB
         db.save_targets_order(targets)
-        # 清理 DB 中不相關的資料 (Strict Control)
         db.clean_stale_data(targets)
         
         self.is_running = True
@@ -289,6 +289,7 @@ class SniperEngine:
                 prev_p = self.prev_data[code]['price']
                 delta_v = (vol - prev_v) / 1000
                 threshold = get_big_order_threshold(price)
+                
                 if delta_v >= threshold:
                     if price >= prev_p: delta_net = int(delta_v)
                     elif price < prev_p: delta_net = -int(delta_v)
@@ -343,7 +344,7 @@ class SniperEngine:
             market_close = dt_time(13, 35)
             is_market_open = market_open <= now.time() <= market_close
             
-            sleep_time = 0.5 if is_market_open else 10 # 盤後稍微快一點更新 UI 測試用，實戰可改 30
+            sleep_time = 0.5 if is_market_open else 10
             
             batch_data = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -384,14 +385,19 @@ with st.sidebar:
             st.success("🟢 核心運算中")
         else:
             st.warning("⚪ 核心待機")
+        
+        # 顯示 TG 狀態
+        if TG_BOT_TOKEN and TG_CHAT_ID:
+            st.caption("✅ TG 推播已就緒")
+        else:
+            st.caption("⚠️ TG 推播未設定")
 
         raw_input = st.text_area("監控清單", DEFAULT_POOL, height=100)
         
         if st.button("1. 初始化 & 啟動"):
             if not API_KEYS:
-                st.error("請設定 API Key")
+                st.error("缺 API Key")
             else:
-                # Strict Source Control: 完全採用 user input
                 targets = [t.strip() for t in raw_input.split() if t.strip()]
                 
                 status = st.status("執行回測與初始化...", expanded=True)
@@ -423,7 +429,6 @@ with st.sidebar:
                 db.upsert_static(static_list)
                 status.update(label="初始化完成，啟動監控！", state="complete")
                 
-                # 傳遞 targets 給 engine，engine 會存入 DB 並清理舊資料
                 engine.start(targets)
                 time.sleep(1)
                 st.rerun()
@@ -447,7 +452,7 @@ with st.sidebar:
 
 # --- 主畫面 ---
 now_time = datetime.now(timezone.utc) + timedelta(hours=8)
-st.title(f"⚡ Sniper 戰情室 (Pro v24.0)")
+st.title(f"⚡ Sniper 戰情室 (Pro v24.1)")
 st.caption(f"最後刷新: {now_time.strftime('%H:%M:%S')} (每3秒)")
 
 df = db.get_display_data()
@@ -455,7 +460,6 @@ df = db.get_display_data()
 if not df.empty:
     df['Pinned'] = df['is_pinned'].astype(bool)
     
-    # 增加訊號分數 (用於預設排序)
     def get_sig_score(s):
         s = str(s)
         if '攻擊' in s or '漲停' in s: return 100
@@ -465,8 +469,6 @@ if not df.empty:
         return 0
     df['signal_score'] = df['signal'].apply(get_sig_score)
 
-    # === 排序控制器 (Sort Controls) ===
-    # 放置在 Expander 或直接在上方
     with st.expander("🔽 排序設定", expanded=False):
         col1, col2 = st.columns(2)
         with col1:
@@ -479,7 +481,6 @@ if not df.empty:
                 "報酬%": "ret",
                 "勝率%": "win"
             }
-            # 獲取當前選項的 key (label)
             current_label = [k for k, v in sort_options.items() if v == st.session_state.sort_col]
             default_idx = list(sort_options.keys()).index(current_label[0]) if current_label else 0
             
@@ -490,8 +491,6 @@ if not df.empty:
             sort_order = st.radio("順序", ["從大到小 (Desc)", "從小到大 (Asc)"], index=0 if not st.session_state.sort_asc else 1)
             st.session_state.sort_asc = True if sort_order == "從小到大 (Asc)" else False
 
-    # === 執行排序 (Pinned 優先 > 使用者設定) ===
-    # 注意：Pinned 永遠是 False/True (0/1)。要讓 Pinned 排在上面，需用 False (Descending) -> 1 在前
     df = df.sort_values(
         by=['Pinned', st.session_state.sort_col], 
         ascending=[False, st.session_state.sort_asc]
@@ -525,13 +524,7 @@ if not df.empty:
     
     if not df.empty:
         changes = edited_df[['code', 'Pinned']].set_index('code')
-        # 這裡為了效率，我們假設只處理變更。
-        # 其實 data_editor 雖然會重繪，但 DB update 很快。
-        # 比對 Pinned 狀態並寫回 DB
         for index, row in changes.iterrows():
-            # 只有當狀態真的改變時才寫 DB (減少 IO)
-            # 但因為 df 每次都重抓，這裡簡單處理直接 update 也可以
-            # 為了嚴謹，可以用 DB 當下的值比對，但這裡 update_pinned 有做處理
             db.update_pinned(index, row['Pinned'])
 
 else:
