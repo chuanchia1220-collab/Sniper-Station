@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from fugle_marketdata import RestClient
-from datetime import datetime, time as dt_time, timedelta, timezone # 修正 import
+from datetime import datetime, timedelta, timezone
 import time
 import os
 import twstock
@@ -14,11 +14,14 @@ import concurrent.futures
 from collections import deque
 import shutil
 import requests
+import pandas_ta as ta
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # ==========================================
 # 1. 基礎設定
 # ==========================================
-st.set_page_config(page_title="Sniper 戰情室 (Fix v24.2)", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Sniper 戰情室 (v25.1)", page_icon="⚔️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -41,6 +44,7 @@ DEFAULT_WATCHLIST = (
     "2330 2454 2303 6781 4931 3533"
 )
 
+# 預設庫存範例
 DEFAULT_INVENTORY = """2330,800,1
 2317,105,5"""
 
@@ -101,10 +105,12 @@ class Database:
                 s.yoy, s.eps, s.pe,
                 i.cost, i.qty,
                 (r.price - i.cost) * i.qty * 1000 as profit_val,
-                (r.price - i.cost) / i.cost * 100 as profit_pct
+                (r.price - i.cost) / i.cost * 100 as profit_pct,
+                CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned
             FROM inventory i
             LEFT JOIN realtime r ON i.code = r.code
             LEFT JOIN static_info s ON i.code = s.code
+            LEFT JOIN pinned p ON i.code = p.code
         '''
         df = pd.read_sql(query, conn)
         conn.close()
@@ -177,6 +183,7 @@ class Database:
     def upsert_static(self, data_list):
         conn = self.get_conn()
         c = conn.cursor()
+        # data_list: (code, win, ret, yoy, eps, pe)
         c.executemany('INSERT OR REPLACE INTO static_info (code, win, ret, yoy, eps, pe) VALUES (?, ?, ?, ?, ?, ?)', data_list)
         conn.commit()
         conn.close()
@@ -232,6 +239,81 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is
     if is_bullish and pct >= tgt_pct: return "⚠️價強"
     return "盤整"
 
+# --- 強化版基本面抓取 ---
+def fetch_fundamental_data(code):
+    """
+    嘗試抓取基本面，自動切換 TW/TWO，並處理異常。
+    回傳: (yoy, eps, pe)
+    """
+    suffixes = ['.TW', '.TWO']
+    for suffix in suffixes:
+        try:
+            ticker = yf.Ticker(f"{code}{suffix}")
+            info = ticker.info
+            # 檢查是否有關鍵數據，如果沒有可能是代碼錯誤
+            if 'symbol' in info:
+                yoy = info.get('revenueGrowth', 0)
+                if yoy is None: yoy = 0
+                yoy = yoy * 100
+                
+                eps = info.get('trailingEps', 0)
+                if eps is None: eps = 0
+                
+                pe = info.get('trailingPE', 0)
+                if pe is None: pe = 0
+                
+                return yoy, eps, pe
+        except:
+            continue
+    return 0, 0, 0 # 真的抓不到
+
+@st.dialog("📈 戰情分析", width="large")
+def show_technical_analysis(code, name):
+    st.caption(f"正在分析 {code} {name} 的 K 線與技術指標...")
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=150)
+    ticker_id = f"{code}.TW"
+    try:
+        df = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
+        if df.empty:
+            ticker_id = f"{code}.TWO"
+            df = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
+        if df.empty:
+            st.error("無法取得 K 線資料")
+            return
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        kdj = df.ta.kdj(length=9, signal=3)
+        df = pd.concat([df, kdj], axis=1)
+        macd = df.ta.macd(fast=12, slow=26, signal=9)
+        df = pd.concat([df, macd], axis=1)
+        bbands = df.ta.bbands(length=20, std=2)
+        df = pd.concat([df, bbands], axis=1)
+        df['RSI'] = df.ta.rsi(length=14)
+
+        fig = make_subplots(rows=4, cols=1, shared_xaxes=True, 
+                            vertical_spacing=0.02, 
+                            row_heights=[0.5, 0.15, 0.15, 0.2],
+                            subplot_titles=(f'{name} 日K + 布林', '成交量', 'KD', 'MACD'))
+
+        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['BBU_20_2.0'], line=dict(color='gray', width=1), name='上軌'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['BBL_20_2.0'], line=dict(color='gray', width=1), name='下軌'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['BBM_20_2.0'], line=dict(color='orange', width=1), name='中軌'), row=1, col=1)
+        colors = ['red' if c >= o else 'green' for o, c in zip(df['Open'], df['Close'])]
+        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors, name='成交量'), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['K_9_3'], line=dict(color='orange', width=1), name='K'), row=3, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['D_9_3'], line=dict(color='blue', width=1), name='D'), row=3, col=1)
+        fig.add_trace(go.Bar(x=df.index, y=df['MACDh_12_26_9'], marker_color='red', name='MACD柱'), row=4, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['MACD_12_26_9'], line=dict(color='orange', width=1), name='快線'), row=4, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['MACDs_12_26_9'], line=dict(color='blue', width=1), name='慢線'), row=4, col=1)
+
+        fig.update_layout(xaxis_rangeslider_visible=False, height=800, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.error(f"分析失敗: {e}")
+
 # ==========================================
 # 4. 全局狀態與後端引擎 (Engine)
 # ==========================================
@@ -270,11 +352,9 @@ class SniperEngine:
 
     def _fetch_single_stock(self, client, code):
         try:
-            # Fugle API 請求 (直接用 code，不加 .TW)
             q = client.stock.intraday.quote(symbol=code)
             price = q.get('lastPrice', q.get('previousClose', 0))
             if price is None: price = 0
-            
             pct = q.get('changePercent', 0)
             vol = q.get('total', {}).get('tradeVolume', 0) * 1000
             total_val = q.get('total', {}).get('tradeValue', 0)
@@ -303,7 +383,6 @@ class SniperEngine:
                     elif price < prev_p: delta_net = -int(delta_v)
             
             self.prev_data[code] = {'vol': vol, 'price': price}
-            
             now_ts = time.time()
             if code not in self.vol_queues: self.vol_queues[code] = []
             if delta_net != 0:
@@ -336,9 +415,7 @@ class SniperEngine:
                     self.alert_history[alert_key] = now_ts
 
             return (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, self.daily_net.get(code, 0), signal, now_ts)
-            
         except Exception as e:
-            # print(f"Error fetching {code}: {e}") # Debug 用，雲端看不到 console 可註解
             return None
 
     def _run_loop(self):
@@ -346,13 +423,12 @@ class SniperEngine:
             if not self.targets:
                 time.sleep(1)
                 continue
-
             now = datetime.now(timezone.utc) + timedelta(hours=8)
-            market_open = dt_time(9, 0)
-            market_close = dt_time(13, 35)
-            is_market_open = market_open <= now.time() <= market_close
+            market_open = datetime.strptime("09:00", "%H:%M").time()
+            market_close = datetime.strptime("13:35", "%H:%M").time()
+            current_time = now.time()
             
-            sleep_time = 0.5 if is_market_open else 10
+            sleep_time = 0.5 if market_open <= current_time <= market_close else 10
             
             batch_data = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -369,20 +445,21 @@ class SniperEngine:
             
             if batch_data:
                 db.upsert_realtime_batch(batch_data)
-            
             time.sleep(sleep_time)
 
 engine = SniperEngine()
 
 # ==========================================
-# 5. UI 呈現 (上下分割 - 修復版)
+# 5. UI 呈現
 # ==========================================
 
-# --- 側邊欄：指揮官控制 ---
+inv_container = st.container()
+st.divider()
+watch_container = st.container()
+
 with st.sidebar:
     st.title("⚙️ 戰情室設定")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
-    
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
     if use_filter: st.caption("條件：YoY > 0, EPS > 0, PE < 50")
@@ -406,12 +483,13 @@ with st.sidebar:
                     targets = engine.targets
                     status = st.status("正在初始化數據 (含基本面)...", expanded=True)
                     
+                    # 抓歷史量 (Fugle)
                     client = RestClient(api_key=API_KEYS[0])
                     history_vol = {}
                     static_list = []
                     
-                    for code in targets:
-                        # 抓歷史量 (Fugle)
+                    progress_bar = status.progress(0)
+                    for i, code in enumerate(targets):
                         try:
                             candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=2)
                             if candles and 'data' in candles and len(candles['data']) >= 2:
@@ -419,21 +497,11 @@ with st.sidebar:
                             else: history_vol[code] = 1000
                         except: history_vol[code] = 1000
                         
-                        # 抓基本面 (YF) - 這裡會稍微久一點
-                        tk = f"{code}.TW"
-                        yoy, eps, pe = 0, 0, 0
-                        try:
-                            yf_tk = yf.Ticker(tk)
-                            info = yf_tk.info
-                            if 'trailingEps' not in info:
-                                yf_tk = yf.Ticker(f"{code}.TWO")
-                                info = yf_tk.info
-                            yoy = info.get('revenueGrowth', 0) * 100
-                            eps = info.get('trailingEps', 0)
-                            pe = info.get('trailingPE', 0)
-                        except: pass
-                        
+                        # 抓基本面 (YFinance 強化版)
+                        yoy, eps, pe = fetch_fundamental_data(code)
                         static_list.append((code, 0, 0, yoy, eps, pe))
+                        
+                        progress_bar.progress((i + 1) / len(targets))
                         time.sleep(0.1)
                     
                     engine.history_vol = history_vol
@@ -450,39 +518,23 @@ with st.sidebar:
     st.markdown("---")
     st.caption(f"Bot: {'✅ 啟用' if TG_BOT_TOKEN else '❌ 未設定'}")
 
-# --- 共用樣式函式 ---
+# --- 共用樣式 ---
 def style_df(row):
     yoy_color = 'color: #00FF00' if row['營收YoY'] < 0 else ('color: #FF4444' if row['營收YoY'] >= 20 else '')
     eps_color = 'color: gray' if row['EPS'] < 0 else ''
     pe_color = 'color: orange' if row['PE'] > 80 else ''
-    
-    # 建立樣式列表，長度必須與 row 的欄位數一致
-    styles = ['' for _ in row.index]
-    
-    # 根據欄位名稱填入樣式
-    for i, col in enumerate(row.index):
-        if col == '營收YoY': styles[i] = yoy_color
-        elif col == 'EPS': styles[i] = eps_color
-        elif col == 'PE': styles[i] = pe_color
-        
-    return styles
+    return [yoy_color if col == '營收YoY' else eps_color if col == 'EPS' else pe_color if col == 'PE' else '' for col in row.index]
 
 now_time = datetime.now(timezone.utc) + timedelta(hours=8)
-st.title(f"⚔️ Sniper 戰情室 3.0")
 st.caption(f"最後更新: {now_time.strftime('%H:%M:%S')} (每3秒)")
 
-# 佈局容器：明確的上下分割
-inv_container = st.container()
-st.divider() # 明顯的分隔線
-watch_container = st.container()
-
-# === 上方：庫存視窗 (Inventory) ===
+# === 上方：庫存視窗 ===
 with inv_container:
     st.subheader("📦 庫存損益 (Portfolio)")
     df_inv = db.get_inventory_view()
     
     if not df_inv.empty:
-        # 格式化與更名
+        # 格式化
         df_inv = df_inv.rename(columns={
             'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 
             'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 
@@ -491,25 +543,26 @@ with inv_container:
             'cost': '成本', 'profit_val': '損益$', 'profit_pct': '報酬%'
         })
         
-        # 選擇欄位順序
         cols = ['代碼', '名稱', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE', '成本', '損益$', '報酬%']
-        # 確保所有需要的 columns 都存在
         for c in cols:
             if c not in df_inv.columns: df_inv[c] = 0
-            
         df_inv_show = df_inv[cols].copy()
         
-        # 基本面處理 (填補 NaN)
+        # 填補 NaN
         df_inv_show['營收YoY'] = df_inv_show['營收YoY'].fillna(0)
         df_inv_show['EPS'] = df_inv_show['EPS'].fillna(0)
         df_inv_show['PE'] = df_inv_show['PE'].fillna(0)
 
-        # 顯示 Data Editor (這比 dataframe 更好控制格式)
+        # 動態高度計算 (Header + Rows)
+        row_count = len(df_inv_show)
+        calc_height = (row_count + 1) * 35 + 3 # 35px per row
+        if calc_height > 400: calc_height = 400
+
         st.data_editor(
             df_inv_show,
             column_config={
-                "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), # 釘選
-                "名稱": st.column_config.TextColumn("名稱", pinned=True), # 釘選
+                "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True),
+                "名稱": st.column_config.TextColumn("名稱", pinned=True),
                 "成本": st.column_config.NumberColumn("成本", format="%.2f"),
                 "現價": st.column_config.NumberColumn("現價", format="%.2f"),
                 "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"),
@@ -523,13 +576,14 @@ with inv_container:
             },
             use_container_width=True,
             hide_index=True,
-            height=300,
-            disabled=True # 禁止編輯
+            height=calc_height, # 自適應高度
+            disabled=True,
+            key="inv_table" # 給定 key 避免重繪錯誤
         )
     else:
         st.info("尚無庫存資料，請在左側「指揮官」模式設定。")
 
-# === 下方：新選監控 (Watchlist) ===
+# === 下方：新選監控 ===
 with watch_container:
     st.subheader("🔭 監控雷達 (Watchlist)")
     df_watch = db.get_watchlist_view()
@@ -537,7 +591,6 @@ with watch_container:
     if not df_watch.empty:
         df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
         
-        # 篩選邏輯
         if use_filter:
             df_watch = df_watch[
                 (df_watch['yoy'] > 0) & 
@@ -545,7 +598,6 @@ with watch_container:
                 (df_watch['pe'] < 50)
             ]
 
-        # 格式化
         df_watch = df_watch.rename(columns={
             'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 
             'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 
@@ -553,29 +605,25 @@ with watch_container:
             'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE'
         })
         
-        # 排序
         df_watch['sig_score'] = df_watch['訊號'].apply(lambda x: 10 if '攻擊' in str(x) else (5 if '量增' in str(x) else 0))
         df_watch = df_watch.sort_values(by=['Pinned', 'sig_score', '漲跌%'], ascending=[False, False, False])
 
         cols_w = ['Pinned', '代碼', '名稱', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE']
-        # 確保 columns 存在
         for c in cols_w:
             if c not in df_watch.columns: df_watch[c] = 0
             
         df_watch_show = df_watch[cols_w].copy()
         
-        # 填補 NaN
         df_watch_show['營收YoY'] = df_watch_show['營收YoY'].fillna(0)
         df_watch_show['EPS'] = df_watch_show['EPS'].fillna(0)
         df_watch_show['PE'] = df_watch_show['PE'].fillna(0)
 
-        # Data Editor
         edited_watch = st.data_editor(
             df_watch_show,
             column_config={
                 "Pinned": st.column_config.CheckboxColumn("📌", width="small", pinned=True),
-                "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), # 釘選
-                "名稱": st.column_config.TextColumn("名稱", pinned=True), # 釘選
+                "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True),
+                "名稱": st.column_config.TextColumn("名稱", pinned=True),
                 "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"),
                 "EPS": st.column_config.NumberColumn("EPS", format="%.2f"),
                 "PE": st.column_config.NumberColumn("PE", format="%.1f"),
@@ -590,7 +638,6 @@ with watch_container:
             key="watch_editor"
         )
         
-        # 更新釘選
         if not df_watch.empty:
             changes = edited_watch[['代碼', 'Pinned']].set_index('代碼')
             for index, row in changes.iterrows():
