@@ -14,68 +14,44 @@ import concurrent.futures
 from collections import deque
 import shutil
 import requests
+import pandas_ta as ta
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # ==========================================
-# 1. 基礎設定
+# 1. 基礎設定 & 2.0 架構參數
 # ==========================================
-st.set_page_config(page_title="Sniper 戰情室 (Pro v24.1)", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Sniper 戰情室 3.0", page_icon="⚔️", layout="wide")
 
-# 讀取金鑰 (容錯處理)
+# 讀取金鑰
 try:
-    # 嘗試從 Secrets 讀取
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
     TG_BOT_TOKEN = st.secrets.get("TG_BOT_TOKEN", "") 
     TG_CHAT_ID = st.secrets.get("TG_CHAT_ID", "")
 except:
-    # 嘗試從環境變數讀取
     raw_fugle_keys = os.getenv("Fugle_API_Key", "")
     TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
-# 【關鍵修正】解析多組 API Key 成為全域變數
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
+DB_PATH = "sniper_v3.db"
 
-DB_PATH = "sniper.db"
-
-# 預設核心股池
-DEFAULT_POOL = (
-    "3706 2449 6442 3017 6139 4977 3163 3037 2359 1519 "
-    "2330 2317 2382 3231 2356 2454 2303 3711 3081 4979 3363 3450 2345 "
-    "3324 3653 2421 3032 2059 3323 6781 4931 "
-    "3189 8046 2368 6274 2383 6191 5469 8021 "
-    "2344 2408 8299 3260 2409 3481 "
-    "1513 2609 2615 8033 2634 2201 4763 5284 3264"
+# 預設新選監控 (Watchlist)
+DEFAULT_WATCHLIST = (
+    "3035 3037 2368 2383 6274 8046 3189 "
+    "3324 3017 3653 2421 3483 "
+    "3081 3163 4979 4908 3363 4977 6442 "
+    "2356 3231 2382 6669 2317 "
+    "2330 2454 2303 6781 4931 3533"
 )
 
-STOCK_CATS = {
-    '2330': '半導體', '2303': '半導體', '2454': '半導體', '3711': '半導體',
-    '2317': 'AI組裝', '2382': 'AI組裝', '3231': 'AI組裝', '2356': 'AI組裝', '3706': 'AI組裝',
-    '3081': 'CPO/網通', '3163': 'CPO/網通', '4979': 'CPO/網通', '4977': 'CPO/網通', '3363': 'CPO/網通', '3450': 'CPO/網通', '2345': 'CPO/網通', '6442': 'CPO/網通',
-    '3017': '散熱/BBU', '3324': '散熱/BBU', '3653': '散熱/BBU', '2421': '散熱/BBU', '3032': '散熱/BBU', '2059': '散熱/BBU', '3323': '散熱/BBU', '6781': '散熱/BBU', '4931': '散熱/BBU',
-    '3037': 'PCB/載板', '3189': 'PCB/載板', '8046': 'PCB/載板', '2368': 'PCB/載板', '6274': 'PCB/載板', '2383': 'PCB/載板', '6191': 'PCB/載板', '5469': 'PCB/載板', '8021': 'PCB/載板',
-    '2344': '記憶體', '2408': '記憶體', '8299': '記憶體', '3260': '記憶體',
-    '2409': '面板', '3481': '面板',
-    '2359': '機器人', '8033': '軍工', '2634': '軍工', '5284': '軍工',
-    '2609': '航運', '2615': '航運',
-    '2449': '封測', '3264': '封測'
-}
+# 預設庫存範例
+DEFAULT_INVENTORY = """2330,800,1
+2317,105,5"""
 
 # ==========================================
-# 2. 核心函式
+# 2. 資料庫層 (SQLite - 支援基本面)
 # ==========================================
-
-def send_telegram_message(msg):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID: return
-    try:
-        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TG_CHAT_ID,
-            "text": msg,
-            "parse_mode": "HTML"
-        }
-        requests.post(url, data=payload, timeout=5)
-    except: pass
-
 class Database:
     def __init__(self, db_path):
         self.db_path = db_path
@@ -92,14 +68,19 @@ class Database:
             price REAL, pct REAL, vwap REAL, vol REAL, ratio REAL,
             net_1h REAL, net_day REAL, signal TEXT, update_time REAL
         )''')
+        # 增加基本面欄位: yoy, eps, pe
         c.execute('''CREATE TABLE IF NOT EXISTS static_info (
-            code TEXT PRIMARY KEY, win REAL, ret REAL
+            code TEXT PRIMARY KEY, win REAL, ret REAL,
+            yoy REAL, eps REAL, pe REAL
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS inventory (
+            code TEXT PRIMARY KEY, cost REAL, qty REAL
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS watchlist (
+            code TEXT PRIMARY KEY
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS pinned (
             code TEXT PRIMARY KEY
-        )''')
-        c.execute('''CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT PRIMARY KEY, value TEXT
         )''')
         conn.commit()
         conn.close()
@@ -116,21 +97,80 @@ class Database:
         conn.commit()
         conn.close()
 
-    def get_display_data(self):
+    # 取得庫存顯示資料 (含基本面)
+    def get_inventory_view(self):
         conn = self.get_conn()
         query = '''
             SELECT 
-                r.code, r.name, r.category, 
-                s.win, s.ret, 
-                r.price, r.pct, r.vwap, r.ratio, r.net_1h, r.net_day, r.signal,
-                CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned
-            FROM realtime r
-            LEFT JOIN static_info s ON r.code = s.code
-            LEFT JOIN pinned p ON r.code = p.code
+                i.code, r.name, 
+                r.pct, r.price, r.vwap, r.ratio, r.signal,
+                r.net_1h, r.net_day,
+                s.yoy, s.eps, s.pe,
+                i.cost, i.qty,
+                (r.price - i.cost) * i.qty * 1000 as profit_val,
+                (r.price - i.cost) / i.cost * 100 as profit_pct
+            FROM inventory i
+            LEFT JOIN realtime r ON i.code = r.code
+            LEFT JOIN static_info s ON i.code = s.code
         '''
         df = pd.read_sql(query, conn)
         conn.close()
         return df
+
+    # 取得監控顯示資料 (含基本面)
+    def get_watchlist_view(self):
+        conn = self.get_conn()
+        query = '''
+            SELECT 
+                w.code, r.name, 
+                r.pct, r.price, r.vwap, r.ratio, r.signal, 
+                r.net_1h, r.net_day,
+                s.yoy, s.eps, s.pe,
+                CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned
+            FROM watchlist w
+            LEFT JOIN realtime r ON w.code = r.code
+            LEFT JOIN static_info s ON w.code = s.code
+            LEFT JOIN pinned p ON w.code = p.code
+        '''
+        df = pd.read_sql(query, conn)
+        conn.close()
+        return df
+
+    def update_inventory_list(self, inventory_text):
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('DELETE FROM inventory')
+        lines = inventory_text.split('\n')
+        for line in lines:
+            parts = line.split(',')
+            if len(parts) >= 2:
+                code = parts[0].strip()
+                try:
+                    cost = float(parts[1].strip())
+                    qty = float(parts[2].strip()) if len(parts) > 2 else 1.0
+                    c.execute('INSERT OR REPLACE INTO inventory (code, cost, qty) VALUES (?, ?, ?)', (code, cost, qty))
+                except: pass
+        conn.commit()
+        conn.close()
+
+    def update_watchlist(self, codes_text):
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('DELETE FROM watchlist')
+        targets = [t.strip() for t in codes_text.split() if t.strip()]
+        for t in targets:
+            c.execute('INSERT OR REPLACE INTO watchlist (code) VALUES (?)', (t,))
+        conn.commit()
+        conn.close()
+        return targets
+
+    def get_all_targets(self):
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('SELECT code FROM inventory UNION SELECT code FROM watchlist')
+        rows = c.fetchall()
+        conn.close()
+        return [r[0] for r in rows]
 
     def update_pinned(self, code, is_pinned):
         conn = self.get_conn()
@@ -141,59 +181,37 @@ class Database:
             c.execute('DELETE FROM pinned WHERE code = ?', (code,))
         conn.commit()
         conn.close()
-    
+
     def upsert_static(self, data_list):
         conn = self.get_conn()
         c = conn.cursor()
-        c.executemany('INSERT OR REPLACE INTO static_info (code, win, ret) VALUES (?, ?, ?)', data_list)
-        conn.commit()
-        conn.close()
-
-    def save_targets_order(self, targets):
-        conn = self.get_conn()
-        c = conn.cursor()
-        c.execute('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)', ("targets_order", json.dumps(targets)))
-        conn.commit()
-        conn.close()
-
-    def get_targets_order(self):
-        conn = self.get_conn()
-        c = conn.cursor()
-        c.execute('SELECT value FROM metadata WHERE key = ?', ("targets_order",))
-        row = c.fetchone()
-        conn.close()
-        if row:
-            try:
-                return json.loads(row[0])
-            except: pass
-        return []
-
-    def clean_stale_data(self, current_targets):
-        conn = self.get_conn()
-        c = conn.cursor()
-        if not current_targets: return
-        placeholders = ','.join('?' * len(current_targets))
-        c.execute(f'DELETE FROM realtime WHERE code NOT IN ({placeholders})', current_targets)
-        c.execute(f'DELETE FROM static_info WHERE code NOT IN ({placeholders})', current_targets)
+        # data_list: (code, win, ret, yoy, eps, pe)
+        c.executemany('INSERT OR REPLACE INTO static_info (code, win, ret, yoy, eps, pe) VALUES (?, ?, ?, ?, ?, ?)', data_list)
         conn.commit()
         conn.close()
 
 db = Database(DB_PATH)
 
-def get_yahoo_ticker(raw_code):
-    code = raw_code.strip().upper()
-    if code in twstock.codes:
-        if twstock.codes[code].market == '上櫃': return f"{code}.TWO"
-    return f"{code}.TW"
+# ==========================================
+# 3. 核心邏輯層 (含 TA & 爬蟲)
+# ==========================================
+
+def send_telegram_message(msg):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID: return
+    try:
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+        requests.post(url, data=payload, timeout=5)
+    except: pass
 
 def get_stock_name(symbol):
+    if symbol not in twstock.codes:
+        try: twstock.__update_codes()
+        except: pass
     try:
         if symbol in twstock.codes: return twstock.codes[symbol].name
         return symbol
     except: return symbol
-
-def get_category(code):
-    return STOCK_CATS.get(code, '其他')
 
 def get_dynamic_thresholds(price):
     if price < 50: return 3.5, 2.5
@@ -223,8 +241,84 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is
     if is_bullish and pct >= tgt_pct: return "⚠️價強"
     return "盤整"
 
+# --- 技術指標計算 & 繪圖 ---
+@st.dialog("📈 戰情分析", width="large")
+def show_technical_analysis(code, name):
+    st.caption(f"正在分析 {code} {name} 的 K 線與技術指標...")
+    
+    # 抓取歷史資料 (日K)
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=150)
+    ticker_id = f"{code}.TW"
+    
+    try:
+        df = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
+        if df.empty:
+            ticker_id = f"{code}.TWO"
+            df = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
+        
+        if df.empty:
+            st.error("無法取得 K 線資料")
+            return
+
+        # 處理 MultiIndex
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        # 計算指標 (pandas_ta)
+        # KD
+        kdj = df.ta.kdj(length=9, signal=3)
+        df = pd.concat([df, kdj], axis=1)
+        # MACD
+        macd = df.ta.macd(fast=12, slow=26, signal=9)
+        df = pd.concat([df, macd], axis=1)
+        # BBands
+        bbands = df.ta.bbands(length=20, std=2)
+        df = pd.concat([df, bbands], axis=1)
+        # RSI
+        df['RSI'] = df.ta.rsi(length=14)
+
+        # 繪圖 (Plotly)
+        fig = make_subplots(rows=4, cols=1, shared_xaxes=True, 
+                            vertical_spacing=0.02, 
+                            row_heights=[0.5, 0.15, 0.15, 0.2],
+                            subplot_titles=(f'{name} 日K + 布林', '成交量', 'KD', 'MACD'))
+
+        # 1. K線 + BBands
+        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['BBU_20_2.0'], line=dict(color='gray', width=1), name='上軌'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['BBL_20_2.0'], line=dict(color='gray', width=1), name='下軌'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['BBM_20_2.0'], line=dict(color='orange', width=1), name='中軌'), row=1, col=1)
+
+        # 2. 成交量
+        colors = ['red' if c >= o else 'green' for o, c in zip(df['Open'], df['Close'])]
+        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors, name='成交量'), row=2, col=1)
+
+        # 3. KD
+        fig.add_trace(go.Scatter(x=df.index, y=df['K_9_3'], line=dict(color='orange', width=1), name='K'), row=3, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['D_9_3'], line=dict(color='blue', width=1), name='D'), row=3, col=1)
+        
+        # 4. MACD
+        fig.add_trace(go.Bar(x=df.index, y=df['MACDh_12_26_9'], marker_color='red', name='MACD柱'), row=4, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['MACD_12_26_9'], line=dict(color='orange', width=1), name='快線'), row=4, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['MACDs_12_26_9'], line=dict(color='blue', width=1), name='慢線'), row=4, col=1)
+
+        fig.update_layout(xaxis_rangeslider_visible=False, height=800, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # 顯示數值
+        last_row = df.iloc[-1]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("RSI (14)", f"{last_row['RSI']:.2f}")
+        c2.metric("K (9)", f"{last_row['K_9_3']:.2f}")
+        c3.metric("D (9)", f"{last_row['D_9_3']:.2f}")
+        c4.metric("MACD柱", f"{last_row['MACDh_12_26_9']:.2f}")
+
+    except Exception as e:
+        st.error(f"分析失敗: {e}")
+
 # ==========================================
-# 3. 全局狀態與後端 (Singleton)
+# 4. 全局狀態與後端引擎 (Engine)
 # ==========================================
 @st.cache_resource
 class SniperEngine:
@@ -238,22 +332,21 @@ class SniperEngine:
         self.alert_history = {}
         self.clients = []
         self._init_clients()
-        self.targets = db.get_targets_order()
+        self.targets = db.get_all_targets()
 
     def _init_clients(self):
-        # 關鍵修正：這裡現在可以正確讀取到全域變數 API_KEYS 了
         if not API_KEYS: return
         for key in API_KEYS:
             try:
                 self.clients.append(RestClient(api_key=key))
             except: pass
 
-    def start(self, targets):
+    def update_targets(self):
+        self.targets = db.get_all_targets()
+
+    def start(self):
         if self.is_running: return
-        self.targets = targets
-        db.save_targets_order(targets)
-        db.clean_stale_data(targets)
-        
+        self.update_targets()
         self.is_running = True
         threading.Thread(target=self._run_loop, daemon=True).start()
 
@@ -289,7 +382,6 @@ class SniperEngine:
                 prev_p = self.prev_data[code]['price']
                 delta_v = (vol - prev_v) / 1000
                 threshold = get_big_order_threshold(price)
-                
                 if delta_v >= threshold:
                     if price >= prev_p: delta_net = int(delta_v)
                     elif price < prev_p: delta_net = -int(delta_v)
@@ -311,7 +403,6 @@ class SniperEngine:
             is_breakdown = price < (vwap * 0.99)
             signal = check_signal(pct, is_bullish, self.daily_net.get(code, 0), net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown)
             
-            # TG 推播
             if signal in ["🔥攻擊", "💀出貨", "👑漲停", "👀量增"]:
                 alert_key = f"{code}_{signal}"
                 last_alert_time = self.alert_history.get(alert_key, 0)
@@ -328,14 +419,14 @@ class SniperEngine:
                     send_telegram_message(msg)
                     self.alert_history[alert_key] = now_ts
 
-            return (code, get_stock_name(code), get_category(code), price, pct, vwap, vol, ratio, net_1h, self.daily_net.get(code, 0), signal, now_ts)
+            return (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, self.daily_net.get(code, 0), signal, now_ts)
             
         except Exception as e:
             return None
 
     def _run_loop(self):
         while self.is_running:
-            if not self.targets or not self.clients:
+            if not self.targets:
                 time.sleep(1)
                 continue
 
@@ -349,10 +440,10 @@ class SniperEngine:
             batch_data = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 futures = []
-                # Load Balancing
                 for i, code in enumerate(self.targets):
-                    client = self.clients[i % len(self.clients)]
-                    futures.append(executor.submit(self._fetch_single_stock, client, code))
+                    client = self.clients[i % len(self.clients)] if self.clients else None
+                    if client:
+                        futures.append(executor.submit(self._fetch_single_stock, client, code))
                 
                 for future in concurrent.futures.as_completed(futures):
                     res = future.result()
@@ -367,168 +458,194 @@ class SniperEngine:
 engine = SniperEngine()
 
 # ==========================================
-# 4. UI 呈現
+# 5. UI 呈現 (雙視窗 3.0)
 # ==========================================
 
-# --- 初始化排序狀態 (Session State) ---
-if 'sort_col' not in st.session_state:
-    st.session_state.sort_col = 'signal_score'
-if 'sort_asc' not in st.session_state:
-    st.session_state.sort_asc = False
-
+# --- 側邊欄：指揮官控制 ---
 with st.sidebar:
-    st.title("⚙️ 指揮中心")
-    mode = st.radio("模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
+    st.title("⚙️ 戰情室設定")
+    mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     
+    # 濾網 (Filter)
+    st.subheader("🔍 濾網設定")
+    use_filter = st.checkbox("只看基本面良好")
+    if use_filter:
+        st.caption("條件：YoY > 0, EPS > 0, PE < 50")
+
     if mode == "👨‍✈️ 指揮官":
-        if engine.is_running:
-            st.success("🟢 核心運算中")
-        else:
-            st.warning("⚪ 核心待機")
-        
-        # 顯示 TG 狀態
-        if TG_BOT_TOKEN and TG_CHAT_ID:
-            st.caption("✅ TG 推播已就緒")
-        else:
-            st.caption("⚠️ TG 推播未設定")
+        with st.expander("📦 庫存管理 (Inventory)", expanded=False):
+            inv_input = st.text_area("庫存清單 (代碼,成本,張數)", DEFAULT_INVENTORY, height=100)
+            if st.button("更新庫存"):
+                db.update_inventory_list(inv_input)
+                engine.update_targets()
+                st.toast("庫存已更新！")
 
-        raw_input = st.text_area("監控清單", DEFAULT_POOL, height=100)
-        
-        if st.button("1. 初始化 & 啟動"):
-            if not API_KEYS:
-                st.error("缺 API Key")
+        with st.expander("🔭 監控設定 (Watchlist)", expanded=True):
+            raw_input = st.text_area("新選清單", DEFAULT_WATCHLIST, height=150)
+            
+            if st.button("1. 初始化並更新清單", type="primary"):
+                if not API_KEYS:
+                    st.error("缺 API Key")
+                else:
+                    db.update_watchlist(raw_input)
+                    engine.update_targets()
+                    targets = engine.targets
+                    status = st.status("正在初始化數據 (含基本面)...", expanded=True)
+                    
+                    client = RestClient(api_key=API_KEYS[0])
+                    history_vol = {}
+                    static_list = []
+                    
+                    for code in targets:
+                        # 抓歷史量 (Fugle)
+                        try:
+                            candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=2)
+                            if candles and 'data' in candles and len(candles['data']) >= 2:
+                                history_vol[code] = int(candles['data'][-2]['volume']) // 1000
+                            else: history_vol[code] = 1000
+                        except: history_vol[code] = 1000
+                        
+                        # 抓基本面 (YF) - 這裡會稍微久一點
+                        tk = f"{code}.TW"
+                        yoy, eps, pe = 0, 0, 0
+                        try:
+                            yf_tk = yf.Ticker(tk)
+                            info = yf_tk.info
+                            if 'trailingEps' not in info: # 試試上櫃
+                                yf_tk = yf.Ticker(f"{code}.TWO")
+                                info = yf_tk.info
+                            
+                            yoy = info.get('revenueGrowth', 0) * 100
+                            eps = info.get('trailingEps', 0)
+                            pe = info.get('trailingPE', 0)
+                        except: pass
+                        
+                        static_list.append((code, 0, 0, yoy, eps, pe))
+                        time.sleep(0.1)
+                    
+                    engine.history_vol = history_vol
+                    db.upsert_static(static_list)
+                    status.update(label="初始化完成！", state="complete")
+                    
+            if st.checkbox("2. 啟動監控核心", value=engine.is_running):
+                if not engine.is_running:
+                    engine.start()
+                    st.toast("核心已啟動")
             else:
-                targets = [t.strip() for t in raw_input.split() if t.strip()]
-                
-                status = st.status("執行回測與初始化...", expanded=True)
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=180)
-                static_list = []
-                
-                for code in targets:
-                    tk = get_yahoo_ticker(code)
-                    try:
-                        df = yf.download(tk, start=start_date, end=end_date, progress=False)
-                        if df.empty:
-                             alt = tk.replace('.TW', '.TWO') if '.TW' in tk else tk.replace('.TWO', '.TW')
-                             df = yf.download(alt, start=start_date, end=end_date, progress=False)
-                        
-                        win, ret = 0, 0
-                        if not df.empty and len(df) > 20:
-                            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-                            df['ret'] = df['Close'].pct_change()
-                            df = df.dropna()
-                            if len(df) > 0:
-                                ret = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0] * 100
-                                win = len(df[df['ret'] > 0]) / len(df) * 100
-                        
-                        static_list.append((code, win, ret))
-                    except: 
-                        static_list.append((code, 0, 0))
-                
-                db.upsert_static(static_list)
-                status.update(label="初始化完成，啟動監控！", state="complete")
-                
-                engine.start(targets)
-                time.sleep(1)
-                st.rerun()
-                
-        if st.button("停止運算"):
-            engine.stop()
-            st.rerun()
-
-    if mode == "👀 戰情官":
-        st.info("僅讀取數據，安全省電。")
-
-    st.markdown("---")
-    st.subheader("🚥 訊號邏輯")
-    st.info("""
-    **🔥 攻擊**：漲+量+價穩+大戶買
-    **👀 量增**：價未噴+量增+1H大戶吸
-    **💀 出貨**：破均價1%+爆量+大戶賣
-    **❌ 誘多**：漲>2% + 1H大戶賣
-    **⚠️ 價強**：漲幅夠但量不足
-    """)
+                engine.stop()
 
 # --- 主畫面 ---
 now_time = datetime.now(timezone.utc) + timedelta(hours=8)
-st.title(f"⚡ Sniper 戰情室 (Pro v24.1)")
-st.caption(f"最後刷新: {now_time.strftime('%H:%M:%S')} (每3秒)")
+st.title(f"⚔️ Sniper 戰情室 3.0")
+st.caption(f"最後更新: {now_time.strftime('%H:%M:%S')} (每3秒)")
 
-df = db.get_display_data()
+# 樣式定義
+def format_yoy(val):
+    if val < 0: return f"⚠️投機 ({val:.1f}%)"
+    return f"{val:.1f}%"
 
-if not df.empty:
-    df['Pinned'] = df['is_pinned'].astype(bool)
+def style_df(row):
+    # 基本面顏色
+    yoy_color = 'color: #00FF00' if row['yoy'] < 0 else ('color: #FF4444' if row['yoy'] >= 20 else '')
+    eps_color = 'color: gray' if row['eps'] < 0 else ''
+    pe_color = 'color: orange' if row['pe'] > 80 else ''
+    return [
+        yoy_color if col == '營收YoY' else 
+        eps_color if col == 'EPS' else 
+        pe_color if col == 'PE' else 
+        '' for col in row.index
+    ]
+
+# 上方：庫存視窗
+st.subheader("📦 庫存損益 (Portfolio)")
+df_inv = db.get_inventory_view()
+
+if not df_inv.empty:
+    # 格式化與更名
+    df_inv = df_inv.rename(columns={
+        'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 
+        'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 
+        'code': '代碼', 'name': '名稱', 'signal': '訊號',
+        'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE',
+        'cost': '成本', 'profit_val': '損益$', 'profit_pct': '報酬%'
+    })
     
-    def get_sig_score(s):
-        s = str(s)
-        if '攻擊' in s or '漲停' in s: return 100
-        if '量增' in s: return 80
-        if '出貨' in s or '誘多' in s: return 60
-        if '價強' in s: return 40
-        return 0
-    df['signal_score'] = df['signal'].apply(get_sig_score)
-
-    with st.expander("🔽 排序設定", expanded=False):
-        col1, col2 = st.columns(2)
-        with col1:
-            sort_options = {
-                "訊號強度": "signal_score",
-                "漲跌幅%": "pct",
-                "大戶(1H)": "net_1h",
-                "大戶(日)": "net_day",
-                "量比": "ratio",
-                "報酬%": "ret",
-                "勝率%": "win"
-            }
-            current_label = [k for k, v in sort_options.items() if v == st.session_state.sort_col]
-            default_idx = list(sort_options.keys()).index(current_label[0]) if current_label else 0
-            
-            selected_label = st.selectbox("排序依據", list(sort_options.keys()), index=default_idx)
-            st.session_state.sort_col = sort_options[selected_label]
-            
-        with col2:
-            sort_order = st.radio("順序", ["從大到小 (Desc)", "從小到大 (Asc)"], index=0 if not st.session_state.sort_asc else 1)
-            st.session_state.sort_asc = True if sort_order == "從小到大 (Asc)" else False
-
-    df = df.sort_values(
-        by=['Pinned', st.session_state.sort_col], 
-        ascending=[False, st.session_state.sort_asc]
-    )
-
-    column_config = {
-        "Pinned": st.column_config.CheckboxColumn("📌", width="small"),
-        "code": "代碼",
-        "name": "名稱",
-        "category": "類別",
-        "win": st.column_config.NumberColumn("勝率%", format="%.0f%%"),
-        "ret": st.column_config.NumberColumn("報酬%", format="%.1f%%"),
-        "price": st.column_config.NumberColumn("現價", format="%.2f"),
-        "pct": st.column_config.NumberColumn("漲跌%", format="%.2f%%"),
-        "vwap": st.column_config.NumberColumn("均價", format="%.2f"),
-        "ratio": st.column_config.NumberColumn("量比", format="%.1f"),
-        "net_1h": st.column_config.NumberColumn("大戶1H", format="%d"),
-        "net_day": st.column_config.NumberColumn("大戶日", format="%d"),
-        "signal": "訊號"
-    }
+    # 選擇欄位順序
+    cols = ['代碼', '名稱', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE', '成本', '損益$', '報酬%']
+    df_inv_show = df_inv[cols].copy()
     
-    edited_df = st.data_editor(
-        df,
-        column_config=column_config,
-        column_order=["Pinned", "code", "name", "price", "pct", "vwap", "signal", "ratio", "net_1h", "net_day", "win", "ret", "category"],
-        hide_index=True,
+    # 基本面處理
+    df_inv_show['營收YoY'] = df_inv_show['營收YoY'].apply(lambda x: x if pd.notnull(x) else 0)
+    df_inv_show['EPS'] = df_inv_show['EPS'].apply(lambda x: x if pd.notnull(x) else 0)
+    df_inv_show['PE'] = df_inv_show['PE'].apply(lambda x: x if pd.notnull(x) else 0)
+
+    # 顯示
+    event = st.dataframe(
+        df_inv_show.style.apply(style_df, axis=1),
         use_container_width=True,
-        height=1000,
-        key="data_editor"
+        hide_index=True,
+        height=300,
+        selection_mode="single-row",
+        on_select="rerun"
     )
     
-    if not df.empty:
-        changes = edited_df[['code', 'Pinned']].set_index('code')
+    # 彈窗觸發
+    if event.selection.rows:
+        idx = event.selection.rows[0]
+        code = df_inv_show.iloc[idx]['代碼']
+        name = df_inv_show.iloc[idx]['名稱']
+        show_technical_analysis(code, name)
+
+# 下方：新選監控
+st.subheader("🔭 監控雷達 (Watchlist)")
+df_watch = db.get_watchlist_view()
+
+if not df_watch.empty:
+    df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
+    
+    # 篩選邏輯
+    if use_filter:
+        df_watch = df_watch[
+            (df_watch['yoy'] > 0) & 
+            (df_watch['eps'] > 0) & 
+            (df_watch['pe'] < 50)
+        ]
+
+    # 格式化
+    df_watch = df_watch.rename(columns={
+        'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 
+        'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 
+        'code': '代碼', 'name': '名稱', 'signal': '訊號',
+        'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE'
+    })
+    
+    # 排序
+    df_watch['sig_score'] = df_watch['訊號'].apply(lambda x: 10 if '攻擊' in str(x) else (5 if '量增' in str(x) else 0))
+    df_watch = df_watch.sort_values(by=['Pinned', 'sig_score', '漲跌%'], ascending=[False, False, False])
+
+    cols_w = ['Pinned', '代碼', '名稱', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE']
+    df_watch_show = df_watch[cols_w].copy()
+
+    # Data Editor
+    edited_watch = st.data_editor(
+        df_watch_show,
+        column_config={
+            "Pinned": st.column_config.CheckboxColumn("📌", width="small"),
+            "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"),
+            "EPS": st.column_config.NumberColumn("EPS", format="%.2f"),
+            "PE": st.column_config.NumberColumn("PE", format="%.1f")
+        },
+        use_container_width=True,
+        hide_index=True,
+        height=600,
+        key="watch_editor"
+    )
+    
+    # 更新釘選
+    if not df_watch.empty:
+        changes = edited_watch[['代碼', 'Pinned']].set_index('代碼')
         for index, row in changes.iterrows():
             db.update_pinned(index, row['Pinned'])
-
-else:
-    st.info("尚無數據。請切換至「指揮官」模式進行初始化。")
 
 time.sleep(3)
 st.rerun()
