@@ -15,7 +15,7 @@ import shutil
 # ==========================================
 # 1. 基礎設定
 # ==========================================
-st.set_page_config(page_title="Sniper 即時股情觀測室", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Sniper 戰情室 (Fix v22.1)", page_icon="🎯", layout="wide")
 
 try:
     FUGLE_API_KEY = st.secrets["Fugle_API_Key"]
@@ -34,7 +34,6 @@ DEFAULT_POOL = (
     "1513 2609 2615 8033 2634 2201 4763 5284 3264"
 )
 
-# 類別表
 STOCK_CATS = {
     '2330': '半導體', '2303': '半導體', '2454': '半導體', '3711': '半導體',
     '2317': 'AI組裝', '2382': 'AI組裝', '3231': 'AI組裝', '2356': 'AI組裝', '3706': 'AI組裝',
@@ -94,7 +93,6 @@ def get_big_order_threshold(price):
     return max(1, threshold)
 
 def _calc_est_vol(current_vol):
-    # 修正時區警告
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     open_t = now.replace(hour=9, minute=0, second=0, microsecond=0)
     elapsed = (now - open_t).seconds / 60
@@ -199,21 +197,11 @@ class SniperCore:
                     pct = q.get('changePercent', 0)
                     vol = q.get('total', {}).get('tradeVolume', 0) * 1000
                     
-                    # === 資料自動修復機制 ===
-                    # 確保 static_data 中有該有的欄位，如果沒有就補上
-                    if code not in self.static_data: self.static_data[code] = {}
-                    
-                    # 補名稱
-                    if 'name' not in self.static_data[code] or self.static_data[code]['name'] == code:
-                        self.static_data[code]['name'] = get_stock_name(code)
-                    
-                    # 補類別 (KeyError 修復點)
-                    if 'cat' not in self.static_data[code]:
-                         self.static_data[code]['cat'] = get_category(code)
-                         
-                    # 補回測 (KeyError 修復點)
-                    if 'win' not in self.static_data[code]: self.static_data[code]['win'] = 0
-                    if 'ret' not in self.static_data[code]: self.static_data[code]['ret'] = 0
+                    name = self.static_data.get(code, {}).get('name', code)
+                    if name == code: 
+                        name = get_stock_name(code)
+                        if code not in self.static_data: self.static_data[code] = {}
+                        self.static_data[code]['name'] = name
 
                     total_val = q.get('total', {}).get('tradeValue', 0)
                     vwap = total_val / vol if vol > 0 else price
@@ -313,11 +301,19 @@ with st.sidebar:
                             alt = ticker.replace('.TW', '.TWO') if '.TW' in ticker else ticker.replace('.TWO', '.TW')
                             df = yf.download(alt, start=start_date, end=end_date, progress=False)
                         
+                        # 真實回測邏輯 (嚴格過濾空值)
                         if not df.empty and len(df) > 20:
                             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
                             df['ret'] = df['Close'].pct_change()
-                            win = 60 
-                            ret = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0] * 100
+                            df = df.dropna()
+                            
+                            # 計算累積報酬 (Simple Buy & Hold)
+                            if len(df) > 0:
+                                ret = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0] * 100
+                                # 模擬勝率：這裡計算「上漲天數 / 總天數」作為一個參考指標
+                                win = len(df[df['ret'] > 0]) / len(df) * 100
+                            else:
+                                ret, win = 0, 0
                     except: pass
                     
                     static_data[code] = {
@@ -368,7 +364,7 @@ with st.sidebar:
 # === 主畫面 ===
 
 now_time = datetime.now(timezone.utc) + timedelta(hours=8)
-st.title(f"⚡ Sniper 即時股情觀測室")
+st.title(f"⚡ Sniper 戰情室 (Fix v22.1)")
 st.caption(f"最後刷新: {now_time.strftime('%H:%M:%S')} (每3秒)")
 
 # 載入資料 (戰情官模式)
@@ -377,7 +373,6 @@ if mode == "👀 戰情官":
     if data:
         core.static_data = data.get("static_data", {})
         core.realtime_data = data.get("realtime_data", {})
-        # 嘗試恢復排序後的 targets
         if "targets_order" in data:
             core.targets = data["targets_order"]
         elif core.static_data:
@@ -388,14 +383,12 @@ if core.targets:
     display_rows = []
     
     for code in core.targets:
-        # 靜態資料 (使用 .get 安全讀取，防止 KeyError)
         static = core.static_data.get(code, {})
         name = static.get('name', code)
         cat = static.get('cat', '-')
         win = static.get('win', 0)
         ret = static.get('ret', 0)
         
-        # 動態資料
         real = core.realtime_data.get(code, {})
         
         price_raw = real.get('price', 0)
@@ -455,5 +448,3 @@ else:
 
 time.sleep(3)
 st.rerun()
-
-
