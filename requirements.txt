@@ -5,3 +5,6 @@ yfinance
 fugle-marketdata
 twstock
 lxml
+requests
+pandas_ta
+plotly
