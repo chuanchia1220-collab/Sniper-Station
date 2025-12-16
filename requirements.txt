@@ -9,4 +9,4 @@ requests
 pandas_ta
 plotly
 openai
-kaleido  <-- 新增：用於將 Plotly 圖表轉為圖片檔傳送
+kaleido
