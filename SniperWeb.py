@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from fugle_marketdata import RestClient
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dt_time
 import time
 import os
 import twstock
@@ -17,25 +17,35 @@ import requests
 import pandas_ta as ta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import queue
+from openai import OpenAI
+from io import BytesIO
 
 # ==========================================
-# 1. 基礎設定
+# 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper 戰情室 (v25.1)", page_icon="⚔️", layout="wide")
+st.set_page_config(page_title="Sniper 戰情室 3.0 (事件分級版)", page_icon="⚔️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
     TG_BOT_TOKEN = st.secrets.get("TG_BOT_TOKEN", "") 
     TG_CHAT_ID = st.secrets.get("TG_CHAT_ID", "")
+    OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
 except:
     raw_fugle_keys = os.getenv("Fugle_API_Key", "")
     TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
 DB_PATH = "sniper_v3.db"
 
-# 預設新選監控 (Watchlist)
+# 初始化 OpenAI Client
+openai_client = None
+if OPENAI_API_KEY:
+    try: openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except: pass
+
 DEFAULT_WATCHLIST = (
     "3035 3037 2368 2383 6274 8046 3189 "
     "3324 3017 3653 2421 3483 "
@@ -43,10 +53,7 @@ DEFAULT_WATCHLIST = (
     "2356 3231 2382 6669 2317 "
     "2330 2454 2303 6781 4931 3533"
 )
-
-# 預設庫存範例
-DEFAULT_INVENTORY = """2330,800,1
-2317,105,5"""
+DEFAULT_INVENTORY = """2330,800,1\n2317,105,5"""
 
 # ==========================================
 # 2. 資料庫層 (SQLite)
@@ -68,18 +75,13 @@ class Database:
             net_1h REAL, net_day REAL, signal TEXT, update_time REAL
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS static_info (
-            code TEXT PRIMARY KEY, win REAL, ret REAL,
-            yoy REAL, eps REAL, pe REAL
+            code TEXT PRIMARY KEY, win REAL, ret REAL, yoy REAL, eps REAL, pe REAL
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS inventory (
             code TEXT PRIMARY KEY, cost REAL, qty REAL
         )''')
-        c.execute('''CREATE TABLE IF NOT EXISTS watchlist (
-            code TEXT PRIMARY KEY
-        )''')
-        c.execute('''CREATE TABLE IF NOT EXISTS pinned (
-            code TEXT PRIMARY KEY
-        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS pinned (code TEXT PRIMARY KEY)''')
         conn.commit()
         conn.close()
 
@@ -95,18 +97,27 @@ class Database:
         conn.commit()
         conn.close()
 
+    def get_pinned_view(self):
+        conn = self.get_conn()
+        query = '''
+            SELECT p.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.signal,
+            r.net_1h, r.net_day, s.yoy, s.eps, s.pe, 1 as is_pinned
+            FROM pinned p
+            LEFT JOIN realtime r ON p.code = r.code
+            LEFT JOIN static_info s ON p.code = s.code
+        '''
+        df = pd.read_sql(query, conn)
+        conn.close()
+        return df
+
     def get_inventory_view(self):
         conn = self.get_conn()
         query = '''
-            SELECT 
-                i.code, r.name, 
-                r.pct, r.price, r.vwap, r.ratio, r.signal,
-                r.net_1h, r.net_day,
-                s.yoy, s.eps, s.pe,
-                i.cost, i.qty,
-                (r.price - i.cost) * i.qty * 1000 as profit_val,
-                (r.price - i.cost) / i.cost * 100 as profit_pct,
-                CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned
+            SELECT i.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.signal,
+            r.net_1h, r.net_day, s.yoy, s.eps, s.pe, i.cost, i.qty,
+            (r.price - i.cost) * i.qty * 1000 as profit_val,
+            (r.price - i.cost) / i.cost * 100 as profit_pct,
+            CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned
             FROM inventory i
             LEFT JOIN realtime r ON i.code = r.code
             LEFT JOIN static_info s ON i.code = s.code
@@ -119,12 +130,9 @@ class Database:
     def get_watchlist_view(self):
         conn = self.get_conn()
         query = '''
-            SELECT 
-                w.code, r.name, 
-                r.pct, r.price, r.vwap, r.ratio, r.signal, 
-                r.net_1h, r.net_day,
-                s.yoy, s.eps, s.pe,
-                CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned
+            SELECT w.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.signal, 
+            r.net_1h, r.net_day, s.yoy, s.eps, s.pe,
+            CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned
             FROM watchlist w
             LEFT JOIN realtime r ON w.code = r.code
             LEFT JOIN static_info s ON w.code = s.code
@@ -165,7 +173,15 @@ class Database:
     def get_all_targets(self):
         conn = self.get_conn()
         c = conn.cursor()
-        c.execute('SELECT code FROM inventory UNION SELECT code FROM watchlist')
+        c.execute('SELECT code FROM inventory UNION SELECT code FROM watchlist UNION SELECT code FROM pinned')
+        rows = c.fetchall()
+        conn.close()
+        return [r[0] for r in rows]
+        
+    def get_inventory_codes(self):
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('SELECT code FROM inventory')
         rows = c.fetchall()
         conn.close()
         return [r[0] for r in rows]
@@ -173,17 +189,14 @@ class Database:
     def update_pinned(self, code, is_pinned):
         conn = self.get_conn()
         c = conn.cursor()
-        if is_pinned:
-            c.execute('INSERT OR IGNORE INTO pinned (code) VALUES (?)', (code,))
-        else:
-            c.execute('DELETE FROM pinned WHERE code = ?', (code,))
+        if is_pinned: c.execute('INSERT OR IGNORE INTO pinned (code) VALUES (?)', (code,))
+        else: c.execute('DELETE FROM pinned WHERE code = ?', (code,))
         conn.commit()
         conn.close()
 
     def upsert_static(self, data_list):
         conn = self.get_conn()
         c = conn.cursor()
-        # data_list: (code, win, ret, yoy, eps, pe)
         c.executemany('INSERT OR REPLACE INTO static_info (code, win, ret, yoy, eps, pe) VALUES (?, ?, ?, ?, ?, ?)', data_list)
         conn.commit()
         conn.close()
@@ -191,16 +204,57 @@ class Database:
 db = Database(DB_PATH)
 
 # ==========================================
-# 3. 核心邏輯層
+# 3. 核心工具與定義 (含 Telegram 產圖)
 # ==========================================
 
-def send_telegram_message(msg):
+def send_telegram_message(message):
     if not TG_BOT_TOKEN or not TG_CHAT_ID: return
-    try:
-        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"}
-        requests.post(url, data=payload, timeout=5)
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
+    try: requests.post(url, data=payload, timeout=5)
     except: pass
+
+def send_telegram_photo(caption, image_bytes):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID: return
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
+    payload = {"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
+    files = {'photo': image_bytes}
+    try: requests.post(url, data=payload, files=files, timeout=10)
+    except: pass
+
+# --- 產圖工具 (Deterministic Chart Generation) ---
+def generate_intraday_chart(code, name):
+    try:
+        # 抓即時資料 (利用 yfinance 抓 1m 資料模擬分時圖，實務上可用 Fugle Chart API)
+        ticker = f"{code}.TW"
+        df = yf.download(ticker, period="1d", interval="1m", progress=False)
+        if df.empty:
+            ticker = f"{code}.TWO"
+            df = yf.download(ticker, period="1d", interval="1m", progress=False)
+        
+        if df.empty: return None
+
+        # 簡單畫圖：價格線 + VWAP
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        df['VWAP'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).cumsum() / df['Volume'].cumsum()
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='Price', line=dict(color='red')))
+        fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], mode='lines', name='VWAP', line=dict(color='orange', dash='dot')))
+        
+        fig.update_layout(
+            title=f"{code} {name} Intraday",
+            xaxis_title="Time", yaxis_title="Price",
+            template="plotly_white",
+            margin=dict(l=20, r=20, t=40, b=20),
+            height=400, width=600
+        )
+        
+        # 轉為 Bytes
+        img_bytes = fig.to_image(format="png")
+        return img_bytes
+    except:
+        return None
 
 def get_stock_name(symbol):
     if symbol not in twstock.codes:
@@ -239,107 +293,207 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is
     if is_bullish and pct >= tgt_pct: return "⚠️價強"
     return "盤整"
 
-# --- 強化版基本面抓取 ---
 def fetch_fundamental_data(code):
-    """
-    嘗試抓取基本面，自動切換 TW/TWO，並處理異常。
-    回傳: (yoy, eps, pe)
-    """
     suffixes = ['.TW', '.TWO']
     for suffix in suffixes:
         try:
             ticker = yf.Ticker(f"{code}{suffix}")
             info = ticker.info
-            # 檢查是否有關鍵數據，如果沒有可能是代碼錯誤
             if 'symbol' in info:
-                yoy = info.get('revenueGrowth', 0)
-                if yoy is None: yoy = 0
-                yoy = yoy * 100
-                
-                eps = info.get('trailingEps', 0)
-                if eps is None: eps = 0
-                
-                pe = info.get('trailingPE', 0)
-                if pe is None: pe = 0
-                
+                yoy = info.get('revenueGrowth', 0); yoy = yoy * 100 if yoy else 0
+                eps = info.get('trailingEps', 0) if info.get('trailingEps') else 0
+                pe = info.get('trailingPE', 0) if info.get('trailingPE') else 0
                 return yoy, eps, pe
-        except:
-            continue
-    return 0, 0, 0 # 真的抓不到
-
-@st.dialog("📈 戰情分析", width="large")
-def show_technical_analysis(code, name):
-    st.caption(f"正在分析 {code} {name} 的 K 線與技術指標...")
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=150)
-    ticker_id = f"{code}.TW"
-    try:
-        df = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
-        if df.empty:
-            ticker_id = f"{code}.TWO"
-            df = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
-        if df.empty:
-            st.error("無法取得 K 線資料")
-            return
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        kdj = df.ta.kdj(length=9, signal=3)
-        df = pd.concat([df, kdj], axis=1)
-        macd = df.ta.macd(fast=12, slow=26, signal=9)
-        df = pd.concat([df, macd], axis=1)
-        bbands = df.ta.bbands(length=20, std=2)
-        df = pd.concat([df, bbands], axis=1)
-        df['RSI'] = df.ta.rsi(length=14)
-
-        fig = make_subplots(rows=4, cols=1, shared_xaxes=True, 
-                            vertical_spacing=0.02, 
-                            row_heights=[0.5, 0.15, 0.15, 0.2],
-                            subplot_titles=(f'{name} 日K + 布林', '成交量', 'KD', 'MACD'))
-
-        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['BBU_20_2.0'], line=dict(color='gray', width=1), name='上軌'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['BBL_20_2.0'], line=dict(color='gray', width=1), name='下軌'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['BBM_20_2.0'], line=dict(color='orange', width=1), name='中軌'), row=1, col=1)
-        colors = ['red' if c >= o else 'green' for o, c in zip(df['Open'], df['Close'])]
-        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors, name='成交量'), row=2, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['K_9_3'], line=dict(color='orange', width=1), name='K'), row=3, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['D_9_3'], line=dict(color='blue', width=1), name='D'), row=3, col=1)
-        fig.add_trace(go.Bar(x=df.index, y=df['MACDh_12_26_9'], marker_color='red', name='MACD柱'), row=4, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['MACD_12_26_9'], line=dict(color='orange', width=1), name='快線'), row=4, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['MACDs_12_26_9'], line=dict(color='blue', width=1), name='慢線'), row=4, col=1)
-
-        fig.update_layout(xaxis_rangeslider_visible=False, height=800, margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig, use_container_width=True)
-    except Exception as e:
-        st.error(f"分析失敗: {e}")
+        except: continue
+    return 0, 0, 0
 
 # ==========================================
-# 4. 全局狀態與後端引擎 (Engine)
+# 4. State Builder & AI Agent
+# ==========================================
+class AIAgent:
+    def __init__(self):
+        self.event_queue = queue.Queue()
+        self.is_running = False
+        self.BANNED_KEYWORDS = [
+            "進場", "出場", "操作", "佈局", "加碼", "減碼", "有利", "不利",
+            "偏多", "偏空", "看好", "看壞", "適合", "不適合", "建議"
+        ]
+        
+    def start(self):
+        if self.is_running: return
+        self.is_running = True
+        threading.Thread(target=self._agent_loop, daemon=True).start()
+        
+    def push_event(self, event):
+        self.event_queue.put(event)
+        
+    def _agent_loop(self):
+        while self.is_running:
+            try:
+                event = self.event_queue.get(timeout=1)
+                self._process_event(event)
+            except queue.Empty: continue
+            except Exception: pass
+
+    def _build_state(self, event):
+        return {
+            "ticker": event['code'],
+            "name": event['name'],
+            "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            "facts": {
+                "price": event['price'],
+                "change_pct": {"value": event['pct'], "direction": "UP" if event['pct'] > 0 else "DOWN"},
+                "vwap": event['vwap'],
+                "volume_ratio": event['ratio'],
+                "net_main_1h": {"value": event['net_1h'], "direction": "BUY" if event['net_1h'] > 0 else "SELL"}
+            },
+            "signal": event['trigger'],
+            "position_status": "HOLD" if event['scope'] == "inventory" else "NO_POSITION",
+            "context": "此分析僅為單一股票單一時點狀態，不包含大盤、產業或未來推論" # 架構師建議補充
+        }
+
+    def _process_event(self, event):
+        if not openai_client: return
+
+        state_json = json.dumps(self._build_state(event), ensure_ascii=False)
+        
+        system_prompt = """
+        你是交易輔助分析引擎，不是交易員。
+        你的任務：
+        1. 解讀提供的「結構化市場狀態」
+        2. 標示潛在風險與注意事項
+        3. 用中性、客觀語言描述目前狀態
+
+        嚴格限制：
+        - 不得提供任何買賣、進出場建議
+        - 不得改寫或質疑既有訊號
+        - 不得預測未來價格
+        - 不得使用情緒性或鼓動性語言
+
+        嚴重警告：你的回應將直接影響人類的交易決策，因此任何模糊、暗示性、具引導性的語言都視為錯誤。
+        如果資訊不足，請明確回答「資訊不足，無法判斷」。
+        """
+        
+        user_prompt = f"""
+        以下是即時交易狀態（JSON），請依規則分析：
+        1. 僅根據 facts 與 signal 解讀
+        2. 輸出固定結構
+        3. 不加入額外假設
+
+        請輸出：
+        - 狀態摘要（1 句）
+        - 風險提醒（若無請寫「無明顯風險」）
+        - 訊號解讀（描述型，不評價）
+
+        資料如下：
+        {state_json}
+        """
+
+        try:
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                temperature=0.3
+            )
+            ai_analysis = response.choices[0].message.content
+            
+            hit_banned = False
+            for keyword in self.BANNED_KEYWORDS:
+                if keyword in ai_analysis:
+                    hit_banned = True
+                    break
+            
+            if hit_banned:
+                ai_analysis = "⚠️ AI 回應包含行為暗示，已被系統中立化處理。\n(分析內容含有違規詞彙，暫不顯示)"
+
+            report = f"🤖 <b>Sniper GPT 分析｜{event['code']}</b>\n{ai_analysis}"
+            send_telegram_message(report)
+            
+        except Exception: pass
+
+agent = AIAgent()
+agent.start()
+
+# ==========================================
+# 5. Event Dispatcher (事件分級與產圖)
+# ==========================================
+class EventDispatcher:
+    def __init__(self):
+        self.alert_history = {}
+
+    def dispatch(self, event):
+        alert_key = f"{event['code']}_{event['trigger']}"
+        last_time = self.alert_history.get(alert_key, 0)
+        now_ts = time.time()
+        
+        if now_ts - last_time > 600:
+            # 1. 立即通知 (所有事件)
+            self._send_instant_notification(event)
+            
+            trigger = event['trigger']
+            scope = event['scope']
+
+            # 2. 分級處理策略
+            # 🟢 A 級：分析型事件 (攻擊、量增) -> 送 AI 分析 + 畫圖 (提供證據)
+            if trigger in ["🔥攻擊", "👀量增"]:
+                agent.push_event(event) # AI 分析
+                # 非同步產圖發送 (避免阻塞)
+                threading.Thread(target=self._send_chart, args=(event,)).start()
+
+            # 🔴 B 級：行動型事件 (庫存出貨、大跌) -> 送 AI 分析 (只做風險提示)，不畫圖 (你要馬上去看盤)
+            elif scope == "inventory" and (trigger in ["💀出貨", "跌破-2%"]):
+                agent.push_event(event) # AI 分析 (重點在風險提醒)
+                # 不畫圖，直接提醒人去操作
+
+            # ⚪ C 級：其他 -> 僅文字通知 (已在第1步完成)
+
+            self.alert_history[alert_key] = now_ts
+
+    def _send_instant_notification(self, event):
+        emoji = "🚀" if "攻擊" in event['trigger'] else "☠️" if "出貨" in event['trigger'] or "跌破" in event['trigger'] else "👀"
+        msg = (
+            f"{emoji} <b>{event['trigger']}偵測：{event['code']} {event['name']}</b>\n"
+            f"現價：{event['price']:.2f} ({event['pct']:.2f}%)\n"
+            f"量比：{event['ratio']:.1f}\n"
+            f"🤖 系統處理中..."
+        )
+        send_telegram_message(msg)
+
+    def _send_chart(self, event):
+        # 產生分時圖
+        img_bytes = generate_intraday_chart(event['code'], event['name'])
+        if img_bytes:
+            caption = f"📉 <b>{event['code']} 當日走勢證據</b>\nTrigger: {event['trigger']}\n(此圖為原始數據，非投資建議)"
+            send_telegram_photo(caption, img_bytes)
+
+dispatcher = EventDispatcher()
+
+# ==========================================
+# 6. Sniper Engine (Core Strategy)
 # ==========================================
 @st.cache_resource
 class SniperEngine:
     def __init__(self):
         self.is_running = False
         self.targets = []
+        self.inventory_codes = []
         self.vol_queues = {} 
         self.daily_net = {} 
         self.prev_data = {} 
         self.history_vol = {}
-        self.alert_history = {}
         self.clients = []
         self._init_clients()
-        self.targets = db.get_all_targets()
+        self.update_targets()
 
     def _init_clients(self):
         if not API_KEYS: return
         for key in API_KEYS:
-            try:
-                self.clients.append(RestClient(api_key=key))
+            try: self.clients.append(RestClient(api_key=key))
             except: pass
 
     def update_targets(self):
         self.targets = db.get_all_targets()
+        self.inventory_codes = db.get_inventory_codes()
 
     def start(self):
         if self.is_running: return
@@ -392,30 +546,43 @@ class SniperEngine:
             one_hour_ago = now_ts - 3600
             self.vol_queues[code] = [x for x in self.vol_queues[code] if x[0] > one_hour_ago]
             net_1h = sum(x[1] for x in self.vol_queues[code])
+            net_day = self.daily_net.get(code, 0)
             
             tgt_pct, tgt_ratio = get_dynamic_thresholds(price)
             is_bullish = price >= vwap
             is_breakdown = price < (vwap * 0.99)
-            signal = check_signal(pct, is_bullish, self.daily_net.get(code, 0), net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown)
+            signal = check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown)
             
-            if signal in ["🔥攻擊", "💀出貨", "👑漲停", "👀量增"]:
-                alert_key = f"{code}_{signal}"
-                last_alert_time = self.alert_history.get(alert_key, 0)
-                if now_ts - last_alert_time > 600:
-                    emoji = "🚀" if signal == "🔥攻擊" else "☠️" if signal == "💀出貨" else "👀"
-                    msg = (
-                        f"{emoji} <b>【Sniper 戰報】</b>\n"
-                        f"股票：<code>{code} {get_stock_name(code)}</code>\n"
-                        f"訊號：<b>{signal}</b>\n"
-                        f"現價：{price:.2f} ({pct:.2f}%)\n"
-                        f"量比：{ratio:.1f}\n"
-                        f"大戶1H：{net_1h}"
-                    )
-                    send_telegram_message(msg)
-                    self.alert_history[alert_key] = now_ts
+            # Event Trigger Logic
+            scope = "inventory" if code in self.inventory_codes else "watchlist"
+            trigger = None
+            
+            if scope == "watchlist":
+                if "攻擊" in signal or "量增" in signal: trigger = signal
+            
+            if scope == "inventory":
+                if pct <= -2.0: trigger = "跌破-2%" 
+                elif "出貨" in signal: trigger = "💀出貨"
+                elif "攻擊" in signal: trigger = "🔥攻擊"
 
-            return (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, self.daily_net.get(code, 0), signal, now_ts)
-        except Exception as e:
+            if trigger:
+                event = {
+                    "code": code,
+                    "name": get_stock_name(code),
+                    "scope": scope,
+                    "trigger": trigger,
+                    "price": price,
+                    "pct": pct,
+                    "vwap": vwap,
+                    "ratio": ratio,
+                    "net_1h": net_1h,
+                    "net_day": net_day,
+                    "timestamp": now_ts
+                }
+                dispatcher.dispatch(event)
+
+            return (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, net_day, signal, now_ts)
+        except Exception:
             return None
 
     def _run_loop(self):
@@ -424,11 +591,10 @@ class SniperEngine:
                 time.sleep(1)
                 continue
             now = datetime.now(timezone.utc) + timedelta(hours=8)
-            market_open = datetime.strptime("09:00", "%H:%M").time()
-            market_close = datetime.strptime("13:35", "%H:%M").time()
-            current_time = now.time()
-            
-            sleep_time = 0.5 if market_open <= current_time <= market_close else 10
+            market_open = dt_time(9, 0)
+            market_close = dt_time(13, 35)
+            is_market_open = market_open <= now.time() <= market_close
+            sleep_time = 0.5 if is_market_open else 10
             
             batch_data = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -450,7 +616,7 @@ class SniperEngine:
 engine = SniperEngine()
 
 # ==========================================
-# 5. UI 呈現
+# 7. UI 呈現
 # ==========================================
 
 inv_container = st.container()
@@ -483,7 +649,6 @@ with st.sidebar:
                     targets = engine.targets
                     status = st.status("正在初始化數據 (含基本面)...", expanded=True)
                     
-                    # 抓歷史量 (Fugle)
                     client = RestClient(api_key=API_KEYS[0])
                     history_vol = {}
                     static_list = []
@@ -497,10 +662,8 @@ with st.sidebar:
                             else: history_vol[code] = 1000
                         except: history_vol[code] = 1000
                         
-                        # 抓基本面 (YFinance 強化版)
                         yoy, eps, pe = fetch_fundamental_data(code)
                         static_list.append((code, 0, 0, yoy, eps, pe))
-                        
                         progress_bar.progress((i + 1) / len(targets))
                         time.sleep(0.1)
                     
@@ -517,133 +680,57 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption(f"Bot: {'✅ 啟用' if TG_BOT_TOKEN else '❌ 未設定'}")
-
-# --- 共用樣式 ---
-def style_df(row):
-    yoy_color = 'color: #00FF00' if row['營收YoY'] < 0 else ('color: #FF4444' if row['營收YoY'] >= 20 else '')
-    eps_color = 'color: gray' if row['EPS'] < 0 else ''
-    pe_color = 'color: orange' if row['PE'] > 80 else ''
-    return [yoy_color if col == '營收YoY' else eps_color if col == 'EPS' else pe_color if col == 'PE' else '' for col in row.index]
+    st.caption(f"GPT: {'✅ 啟用' if OPENAI_API_KEY else '❌ 未設定'}")
 
 now_time = datetime.now(timezone.utc) + timedelta(hours=8)
 st.caption(f"最後更新: {now_time.strftime('%H:%M:%S')} (每3秒)")
 
-# === 上方：庫存視窗 ===
+# UI Rendering
 with inv_container:
     st.subheader("📦 庫存損益 (Portfolio)")
     df_inv = db.get_inventory_view()
-    
     if not df_inv.empty:
-        # 格式化
-        df_inv = df_inv.rename(columns={
-            'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 
-            'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 
-            'code': '代碼', 'name': '名稱', 'signal': '訊號',
-            'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE',
-            'cost': '成本', 'profit_val': '損益$', 'profit_pct': '報酬%'
-        })
-        
+        df_inv = df_inv.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'signal': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'cost': '成本', 'profit_val': '損益$', 'profit_pct': '報酬%'})
         cols = ['代碼', '名稱', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE', '成本', '損益$', '報酬%']
-        for c in cols:
+        for c in cols: 
             if c not in df_inv.columns: df_inv[c] = 0
         df_inv_show = df_inv[cols].copy()
-        
-        # 填補 NaN
-        df_inv_show['營收YoY'] = df_inv_show['營收YoY'].fillna(0)
-        df_inv_show['EPS'] = df_inv_show['EPS'].fillna(0)
-        df_inv_show['PE'] = df_inv_show['PE'].fillna(0)
-
-        # 動態高度計算 (Header + Rows)
+        df_inv_show['營收YoY'] = df_inv_show['營收YoY'].fillna(0); df_inv_show['EPS'] = df_inv_show['EPS'].fillna(0); df_inv_show['PE'] = df_inv_show['PE'].fillna(0)
         row_count = len(df_inv_show)
-        calc_height = (row_count + 1) * 35 + 3 # 35px per row
+        calc_height = (row_count + 1) * 35 + 3
         if calc_height > 400: calc_height = 400
-
+        
         st.data_editor(
             df_inv_show,
-            column_config={
-                "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True),
-                "名稱": st.column_config.TextColumn("名稱", pinned=True),
-                "成本": st.column_config.NumberColumn("成本", format="%.2f"),
-                "現價": st.column_config.NumberColumn("現價", format="%.2f"),
-                "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"),
-                "均價": st.column_config.NumberColumn("均價", format="%.2f"),
-                "量比": st.column_config.NumberColumn("量比", format="%.1f"),
-                "損益$": st.column_config.NumberColumn("損益$", format="%d"),
-                "報酬%": st.column_config.NumberColumn("報酬%", format="%.2f%%"),
-                "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"),
-                "EPS": st.column_config.NumberColumn("EPS", format="%.2f"),
-                "PE": st.column_config.NumberColumn("PE", format="%.1f")
-            },
-            use_container_width=True,
-            hide_index=True,
-            height=calc_height, # 自適應高度
-            disabled=True,
-            key="inv_table" # 給定 key 避免重繪錯誤
+            column_config={"代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "成本": st.column_config.NumberColumn("成本", format="%.2f"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f"), "損益$": st.column_config.NumberColumn("損益$", format="%d"), "報酬%": st.column_config.NumberColumn("報酬%", format="%.2f%%"), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f")},
+            use_container_width=True, hide_index=True, height=calc_height, disabled=True, key="inv_table"
         )
-    else:
-        st.info("尚無庫存資料，請在左側「指揮官」模式設定。")
+    else: st.info("尚無庫存資料，請在左側「指揮官」模式設定。")
 
-# === 下方：新選監控 ===
 with watch_container:
     st.subheader("🔭 監控雷達 (Watchlist)")
     df_watch = db.get_watchlist_view()
-    
     if not df_watch.empty:
         df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
-        
-        if use_filter:
-            df_watch = df_watch[
-                (df_watch['yoy'] > 0) & 
-                (df_watch['eps'] > 0) & 
-                (df_watch['pe'] < 50)
-            ]
-
-        df_watch = df_watch.rename(columns={
-            'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 
-            'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 
-            'code': '代碼', 'name': '名稱', 'signal': '訊號',
-            'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE'
-        })
-        
+        if use_filter: df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'] < 50)]
+        df_watch = df_watch.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'signal': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE'})
         df_watch['sig_score'] = df_watch['訊號'].apply(lambda x: 10 if '攻擊' in str(x) else (5 if '量增' in str(x) else 0))
         df_watch = df_watch.sort_values(by=['Pinned', 'sig_score', '漲跌%'], ascending=[False, False, False])
-
         cols_w = ['Pinned', '代碼', '名稱', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE']
-        for c in cols_w:
+        for c in cols_w: 
             if c not in df_watch.columns: df_watch[c] = 0
-            
         df_watch_show = df_watch[cols_w].copy()
+        df_watch_show['營收YoY'] = df_watch_show['營收YoY'].fillna(0); df_watch_show['EPS'] = df_watch_show['EPS'].fillna(0); df_watch_show['PE'] = df_watch_show['PE'].fillna(0)
         
-        df_watch_show['營收YoY'] = df_watch_show['營收YoY'].fillna(0)
-        df_watch_show['EPS'] = df_watch_show['EPS'].fillna(0)
-        df_watch_show['PE'] = df_watch_show['PE'].fillna(0)
-
         edited_watch = st.data_editor(
             df_watch_show,
-            column_config={
-                "Pinned": st.column_config.CheckboxColumn("📌", width="small", pinned=True),
-                "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True),
-                "名稱": st.column_config.TextColumn("名稱", pinned=True),
-                "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"),
-                "EPS": st.column_config.NumberColumn("EPS", format="%.2f"),
-                "PE": st.column_config.NumberColumn("PE", format="%.1f"),
-                "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"),
-                "現價": st.column_config.NumberColumn("現價", format="%.2f"),
-                "均價": st.column_config.NumberColumn("均價", format="%.2f"),
-                "量比": st.column_config.NumberColumn("量比", format="%.1f")
-            },
-            use_container_width=True,
-            hide_index=True,
-            height=600,
-            key="watch_editor"
+            column_config={"Pinned": st.column_config.CheckboxColumn("📌", width="small", pinned=True), "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f")},
+            use_container_width=True, hide_index=True, height=600, key="watch_editor"
         )
-        
         if not df_watch.empty:
             changes = edited_watch[['代碼', 'Pinned']].set_index('代碼')
-            for index, row in changes.iterrows():
-                db.update_pinned(index, row['Pinned'])
-    else:
-        st.info("尚無監控資料。")
+            for index, row in changes.iterrows(): db.update_pinned(index, row['Pinned'])
+    else: st.info("尚無監控資料。")
 
 time.sleep(3)
 st.rerun()
