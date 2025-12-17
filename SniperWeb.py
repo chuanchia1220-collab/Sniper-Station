@@ -765,33 +765,58 @@ with inv_container:
         )
     else: st.info("尚無庫存資料，請在左側「指揮官」模式設定。")
 
-with watch_container:
-    st.subheader("🔭 監控雷達 (Watchlist)")
-    df_watch = db.get_watchlist_view()
-    if not df_watch.empty:
-        df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
-        if use_filter: df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'] < 50)]
-        df_watch = df_watch.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'signal': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
-        # B-1: 排序 (A_PLUS > A_MINUS > B)
-        df_watch['level_score'] = df_watch['等級'].apply(lambda x: 10 if x == 'A_PLUS' else (5 if x == 'A_MINUS' else 0))
-        df_watch = df_watch.sort_values(by=['Pinned', 'level_score', '漲跌%'], ascending=[False, False, False])
+# === 右側：新選監控 (Watchlist) ===
+    with watch_container:
+        st.subheader("🔭 監控雷達 (Watchlist)")
+        df_watch = db.get_watchlist_view()
         
-        cols_w = ['Pinned', '代碼', '名稱', '等級', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE']
-        for c in cols_w: 
-            if c not in df_watch.columns: df_watch[c] = 0
-        df_watch_show = df_watch[cols_w].copy()
-        df_watch_show['營收YoY'] = df_watch_show['營收YoY'].fillna(0); df_watch_show['EPS'] = df_watch_show['EPS'].fillna(0); df_watch_show['PE'] = df_watch_show['PE'].fillna(0)
-        
-        edited_watch = st.data_editor(
-            df_watch_show,
-            column_config={"Pinned": st.column_config.CheckboxColumn("📌", width="small", pinned=True), "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "等級": st.column_config.TextColumn("等級", width="small"), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f")},
-            use_container_width=True, hide_index=True, height=600, key="watch_editor"
-        )
         if not df_watch.empty:
-            changes = edited_watch[['代碼', 'Pinned']].set_index('代碼')
-            for index, row in changes.iterrows(): db.update_pinned(index, row['Pinned'])
-    else: st.info("尚無監控資料。")
+            # ... (中間資料處理邏輯不用動) ...
+            # ... (直到 df_watch_show 準備好為止) ...
+            
+            # --- 貼上這段新的高度計算邏輯 ---
+            # 計算高度：(資料筆數 + 1標題列) * 35px
+            # 目標：預設顯示 45 列，約 1600px
+            rows = len(df_watch_show)
+            row_height = 35
+            max_rows = 45 
+            
+            # 計算理應需要的高度
+            calc_height = (rows + 1) * row_height + 5
+            
+            # 設定上限：最多只展現到 45 列的高度 (超過出卷軸)
+            # 設定下限：最少顯示 300px (避免沒資料時太扁)
+            limit_height = (max_rows + 1) * row_height + 5
+            final_height = min(calc_height, limit_height)
+            final_height = max(final_height, 300) 
 
-time.sleep(3)
-st.rerun()
+            edited_watch = st.data_editor(
+                df_watch_show,
+                column_config={
+                    "Pinned": st.column_config.CheckboxColumn("📌", width="small", pinned=True),
+                    "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True),
+                    "名稱": st.column_config.TextColumn("名稱", pinned=True),
+                    "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"),
+                    "EPS": st.column_config.NumberColumn("EPS", format="%.2f"),
+                    "PE": st.column_config.NumberColumn("PE", format="%.1f"),
+                    "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"),
+                    "現價": st.column_config.NumberColumn("現價", format="%.2f"),
+                    "均價": st.column_config.NumberColumn("均價", format="%.2f"),
+                    "量比": st.column_config.NumberColumn("量比", format="%.1f")
+                },
+                use_container_width=True,
+                hide_index=True,
+                height=final_height,  # <--- 這裡套用計算後的高度
+                key="watch_editor"
+            )
+            
+            if not df_watch.empty:
+                changes = edited_watch[['代碼', 'Pinned']].set_index('代碼')
+                for index, row in changes.iterrows(): db.update_pinned(index, row['Pinned'])
+        else:
+            st.info("尚無監控資料。")
+
+    time.sleep(3)
+    st.rerun()
+
 
