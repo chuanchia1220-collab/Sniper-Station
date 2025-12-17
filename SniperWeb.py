@@ -24,7 +24,7 @@ from io import BytesIO
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper 戰情室 v2.0 (Debug)", page_icon="🛠️", layout="wide")
+st.set_page_config(page_title="Sniper 戰情室 v2.0 (Debug+)", page_icon="🐞", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -212,6 +212,7 @@ db = Database(DB_PATH)
 # ==========================================
 
 def send_telegram_message(message):
+    print(f"[TG DEBUG] Sending message: {message[:20]}...") # Log
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("[TG ERROR] No Token or Chat ID found!")
         return
@@ -228,6 +229,7 @@ def send_telegram_message(message):
         print(f"[TG EXCEPTION] {e}")
 
 def send_telegram_photo(caption, image_bytes):
+    print(f"[TG DEBUG] Sending photo: {caption[:20]}...") # Log
     if not TG_BOT_TOKEN or not TG_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
     payload = {"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
@@ -236,6 +238,8 @@ def send_telegram_photo(caption, image_bytes):
         r = requests.post(url, data=payload, files=files, timeout=10)
         if r.status_code != 200:
             print(f"[TG PHOTO ERROR] {r.text}")
+        else:
+            print("[TG PHOTO OK] Photo sent.")
     except Exception as e:
         print(f"[TG PHOTO EXCEPTION] {e}")
 
@@ -427,6 +431,8 @@ class EventDispatcher:
         trigger = event['trigger']
         code = event['code']
         scope = event['scope']
+        
+        print(f"[DISPATCH] Processing: {trigger} | {code}") # Log
 
         if event_type == "SYSTEM":
             alert_key = f"{code}_SYSTEM"
@@ -439,11 +445,11 @@ class EventDispatcher:
         alert_key = f"{code}_{trigger}"
         last_time = self.alert_history.get(alert_key, 0)
         
-        # Test Mode Force Through
+        # Force Send if Test
         is_test = event.get('is_test', False)
         
         if (time.time() - last_time > 600) or is_test:
-            print(f"[DISPATCH] Trigger: {trigger} | Code: {code}") # Debug
+            print(f"[DISPATCH] Sending Notification...") # Log
             self._send_instant_notification(event)
             
             if trigger in ["🔥攻擊", "💣伏擊"]:
@@ -457,6 +463,8 @@ class EventDispatcher:
                 agent.push_event(event)
 
             self.alert_history[alert_key] = time.time()
+        else:
+            print("[DISPATCH] Cooldown active, skipped.")
 
     def _send_instant_notification(self, event):
         emoji = "💣" if "伏擊" in event['trigger'] else "🚀" if "攻擊" in event['trigger'] else "☠️" if "出貨" in event['trigger'] or "跌破" in event['trigger'] else "👀"
