@@ -25,7 +25,7 @@ import random
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper v2.5 (Chart Fix)", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v2.5 (Chart Debug)", page_icon="📈", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -220,39 +220,53 @@ def send_telegram_message(message):
     except: pass
 
 def send_telegram_photo(caption, image_bytes):
+    print(f"[TG] Sending Photo... Size: {len(image_bytes)} bytes")
     if not TG_BOT_TOKEN or not TG_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
     payload = {"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
-    files = {'photo': image_bytes}
-    try: requests.post(url, data=payload, files=files, timeout=10)
-    except: pass
+    # 這裡直接傳 BytesIO
+    files = {'photo': ('chart.png', image_bytes, 'image/png')}
+    try: 
+        r = requests.post(url, data=payload, files=files, timeout=10)
+        print(f"[TG] Photo Resp: {r.status_code} | {r.text[:50]}")
+    except Exception as e:
+        print(f"[TG] Photo Err: {e}")
 
-# --- 產圖工具 (增強版：自動備援) ---
+# --- 產圖工具 (Debug Enhanced) ---
 def generate_intraday_chart(code, name):
+    print(f"[CHART] Start generating for {code}...")
     try:
-        # 1. 嘗試抓取當日 1m 數據 (首選)
         ticker_list = [f"{code}.TW", f"{code}.TWO"]
         df = pd.DataFrame()
         
         # 策略 A: 1日 1分K
         for ticker in ticker_list:
             try:
+                print(f"[CHART] Fetching {ticker} (1d/1m)...")
                 df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
-                if not df.empty: break
-            except: pass
+                if not df.empty: 
+                    print(f"[CHART] Got {len(df)} rows (1m)")
+                    break
+            except Exception as e:
+                print(f"[CHART] YF Error 1: {e}")
             
-        # 策略 B: 如果抓不到 (例如非開盤日)，抓近 5 日 5分K 作為替代
+        # 策略 B: 5日 5分K
         chart_title = f"{code} {name} Intraday"
         if df.empty:
+            print("[CHART] 1m failed, trying 5d/5m...")
             for ticker in ticker_list:
                 try:
                     df = yf.download(ticker, period="5d", interval="5m", progress=False, auto_adjust=False)
                     if not df.empty: 
+                        print(f"[CHART] Got {len(df)} rows (5m)")
                         chart_title = f"{code} {name} 5-Day Trend (Backup)"
                         break
-                except: pass
+                except Exception as e:
+                    print(f"[CHART] YF Error 2: {e}")
 
-        if df.empty: return None
+        if df.empty: 
+            print("[CHART] All fetch failed!")
+            return None
 
         # 處理 MultiIndex
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
@@ -262,7 +276,6 @@ def generate_intraday_chart(code, name):
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='Price', line=dict(color='red')))
-        # VWAP 只有在當日圖才有意義，如果是 5日圖就不畫 VWAP 避免混亂
         if "Intraday" in chart_title:
             fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], mode='lines', name='VWAP', line=dict(color='orange', dash='dot')))
         
@@ -274,8 +287,11 @@ def generate_intraday_chart(code, name):
             height=400, width=600
         )
         img_bytes = fig.to_image(format="png")
+        print(f"[CHART] Generated PNG: {len(img_bytes)} bytes")
         return img_bytes
-    except Exception: return None
+    except Exception as e: 
+        print(f"[CHART] Generate Exception: {e}")
+        return None
 
 def get_stock_name(symbol):
     if symbol not in twstock.codes:
@@ -406,6 +422,7 @@ class AIAgent:
         if not openai_client: return
         state_json = json.dumps(self._build_state(event), ensure_ascii=False)
         
+        # V2.5 System Prompt: 格式化引擎
         system_prompt = """
         你不是分析師，也不是交易顧問。
         你是「即時市場資料格式化引擎（Market Snapshot Formatter）」。
@@ -502,10 +519,14 @@ class EventDispatcher:
         send_telegram_message(msg)
 
     def _send_chart(self, event):
+        print(f"[CHART] Thread Start: {event['code']}")
         img_bytes = generate_intraday_chart(event['code'], event['name'])
         if img_bytes:
+            print(f"[CHART] Success, sending TG photo...")
             caption = f"📉 <b>{event['code']} 當日走勢參考 (非預測)</b>\nTrigger: {event['trigger']}"
             send_telegram_photo(caption, img_bytes)
+        else:
+            print("[CHART] Failed to generate image.")
 
 dispatcher = EventDispatcher()
 
