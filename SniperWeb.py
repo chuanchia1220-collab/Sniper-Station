@@ -24,7 +24,7 @@ from io import BytesIO
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper 戰情室 v2.0 (Debug+)", page_icon="🐞", layout="wide")
+st.set_page_config(page_title="Sniper 戰情室 v2.0 (UI Debug)", page_icon="👀", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -208,13 +208,12 @@ class Database:
 db = Database(DB_PATH)
 
 # ==========================================
-# 3. 核心工具與定義 (Debug Enhanced)
+# 3. 核心工具與定義 (UI Debug Enhanced)
 # ==========================================
 
 def send_telegram_message(message):
-    print(f"[TG DEBUG] Sending message: {message[:20]}...") # Log
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("[TG ERROR] No Token or Chat ID found!")
+        st.toast("❌ TG 錯誤: 無 Token 或 Chat ID")
         return
     
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -222,14 +221,14 @@ def send_telegram_message(message):
     try:
         r = requests.post(url, data=payload, timeout=5)
         if r.status_code != 200:
-            print(f"[TG ERROR] Status: {r.status_code}, Response: {r.text}")
+            st.toast(f"❌ TG 發送失敗: {r.status_code}")
+            print(f"[TG ERROR] {r.text}")
         else:
-            print("[TG OK] Message sent.")
+            st.toast(f"✅ TG 已發送: {message[:10]}...")
     except Exception as e:
-        print(f"[TG EXCEPTION] {e}")
+        st.toast(f"❌ TG 連線錯誤: {e}")
 
 def send_telegram_photo(caption, image_bytes):
-    print(f"[TG DEBUG] Sending photo: {caption[:20]}...") # Log
     if not TG_BOT_TOKEN or not TG_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
     payload = {"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
@@ -237,22 +236,23 @@ def send_telegram_photo(caption, image_bytes):
     try:
         r = requests.post(url, data=payload, files=files, timeout=10)
         if r.status_code != 200:
-            print(f"[TG PHOTO ERROR] {r.text}")
+            st.toast(f"❌ TG 圖片失敗: {r.status_code}")
         else:
-            print("[TG PHOTO OK] Photo sent.")
+            st.toast("✅ TG 圖片已發送")
     except Exception as e:
-        print(f"[TG PHOTO EXCEPTION] {e}")
+        st.toast(f"❌ TG 圖片連線錯誤: {e}")
 
 def generate_intraday_chart(code, name):
     try:
         ticker = f"{code}.TW"
-        # Fix YF Future Warning
         df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
         if df.empty:
             ticker = f"{code}.TWO"
             df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
         
-        if df.empty: return None
+        if df.empty: 
+            st.toast(f"⚠️ {code} 抓無 K 線資料")
+            return None
 
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df['VWAP'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).cumsum() / df['Volume'].cumsum()
@@ -431,8 +431,6 @@ class EventDispatcher:
         trigger = event['trigger']
         code = event['code']
         scope = event['scope']
-        
-        print(f"[DISPATCH] Processing: {trigger} | {code}") # Log
 
         if event_type == "SYSTEM":
             alert_key = f"{code}_SYSTEM"
@@ -449,7 +447,9 @@ class EventDispatcher:
         is_test = event.get('is_test', False)
         
         if (time.time() - last_time > 600) or is_test:
-            print(f"[DISPATCH] Sending Notification...") # Log
+            # UI Debug Hint
+            st.toast(f"🚀 觸發事件: {trigger} | {code}")
+            
             self._send_instant_notification(event)
             
             if trigger in ["🔥攻擊", "💣伏擊"]:
@@ -463,8 +463,6 @@ class EventDispatcher:
                 agent.push_event(event)
 
             self.alert_history[alert_key] = time.time()
-        else:
-            print("[DISPATCH] Cooldown active, skipped.")
 
     def _send_instant_notification(self, event):
         emoji = "💣" if "伏擊" in event['trigger'] else "🚀" if "攻擊" in event['trigger'] else "☠️" if "出貨" in event['trigger'] or "跌破" in event['trigger'] else "👀"
@@ -806,6 +804,7 @@ with watch_container:
         df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
         if use_filter: df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'] < 50)]
         df_watch = df_watch.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'signal': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
+        # B-1: 排序 (A_PLUS > A_MINUS > B)
         df_watch['level_score'] = df_watch['等級'].apply(lambda x: 10 if x == 'A_PLUS' else (5 if x == 'A_MINUS' else 0))
         df_watch = df_watch.sort_values(by=['Pinned', 'level_score', '漲跌%'], ascending=[False, False, False])
         cols_w = ['Pinned', '代碼', '名稱', '等級', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE']
