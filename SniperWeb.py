@@ -25,7 +25,7 @@ import random
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper v2.5 (Formatter+)", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v2.5 (Chart Fix)", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -227,25 +227,47 @@ def send_telegram_photo(caption, image_bytes):
     try: requests.post(url, data=payload, files=files, timeout=10)
     except: pass
 
+# --- 產圖工具 (增強版：自動備援) ---
 def generate_intraday_chart(code, name):
     try:
-        ticker = f"{code}.TW"
-        df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
-        if df.empty:
-            ticker = f"{code}.TWO"
-            df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
+        # 1. 嘗試抓取當日 1m 數據 (首選)
+        ticker_list = [f"{code}.TW", f"{code}.TWO"]
+        df = pd.DataFrame()
         
+        # 策略 A: 1日 1分K
+        for ticker in ticker_list:
+            try:
+                df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
+                if not df.empty: break
+            except: pass
+            
+        # 策略 B: 如果抓不到 (例如非開盤日)，抓近 5 日 5分K 作為替代
+        chart_title = f"{code} {name} Intraday"
+        if df.empty:
+            for ticker in ticker_list:
+                try:
+                    df = yf.download(ticker, period="5d", interval="5m", progress=False, auto_adjust=False)
+                    if not df.empty: 
+                        chart_title = f"{code} {name} 5-Day Trend (Backup)"
+                        break
+                except: pass
+
         if df.empty: return None
 
+        # 處理 MultiIndex
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        
+        # 繪圖
         df['VWAP'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).cumsum() / df['Volume'].cumsum()
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='Price', line=dict(color='red')))
-        fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], mode='lines', name='VWAP', line=dict(color='orange', dash='dot')))
+        # VWAP 只有在當日圖才有意義，如果是 5日圖就不畫 VWAP 避免混亂
+        if "Intraday" in chart_title:
+            fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], mode='lines', name='VWAP', line=dict(color='orange', dash='dot')))
         
         fig.update_layout(
-            title=f"{code} {name} Intraday (Ref)",
+            title=chart_title,
             xaxis_title="Time", yaxis_title="Price",
             template="plotly_white",
             margin=dict(l=20, r=20, t=40, b=20),
@@ -313,14 +335,12 @@ def fetch_fundamental_data(code):
 # ==========================================
 
 def _get_institutional_3d(code):
-    # 模擬數據 (之後換成真實API)
     return {
         "foreign": [random.randint(-1000, 2000), random.randint(-500, 1500), random.randint(100, 1000)],
         "trust":   [random.randint(-200, 500), random.randint(0, 300), random.randint(-100, 200)],
         "dealer":  [random.randint(-100, 100), random.randint(-50, 50), random.randint(-50, 50)]
     }
 
-# 規則引擎 (Rule Engine)
 def calculate_flags(inst_data, price, price_change_pct):
     flags = []
     f_d, f_d1, f_d2 = inst_data['foreign']
@@ -328,13 +348,9 @@ def calculate_flags(inst_data, price, price_change_pct):
     d_d, d_d1, d_d2 = inst_data['dealer']
     total_d = f_d + t_d + d_d
     
-    # R1: 法人共振
     if f_d > 0 and t_d > 0 and total_d >= 500: flags.append("INST_SYNC")
-    # R2: 外資連三
     if f_d > 0 and f_d1 > 0 and f_d2 > 0: flags.append("FOREIGN_3UP")
-    # R3: 投信接棒
     if f_d <= 0 and t_d >= 200: flags.append("TRUST_TAKEOVER")
-    # R4: 假拉抬
     if price_change_pct > 0 and total_d < 0: flags.append("PRICE_UP_INST_DOWN")
         
     return flags if flags else ["—"]
@@ -390,7 +406,6 @@ class AIAgent:
         if not openai_client: return
         state_json = json.dumps(self._build_state(event), ensure_ascii=False)
         
-        # V2.5 System Prompt: 格式化引擎
         system_prompt = """
         你不是分析師，也不是交易顧問。
         你是「即時市場資料格式化引擎（Market Snapshot Formatter）」。
@@ -425,7 +440,7 @@ class AIAgent:
             response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-                temperature=0.0 # 零隨機性
+                temperature=0.0
             )
             ai_output = response.choices[0].message.content
             send_telegram_message(ai_output)
@@ -464,9 +479,8 @@ class EventDispatcher:
             st.toast(f"🚀 觸發事件: {trigger} | {code}")
             self._send_instant_notification(event)
             
-            # 攻擊與伏擊：發送 AI快照 + K線圖
             if trigger in ["🔥攻擊", "💣伏擊"]:
-                agent.push_event(event)
+                agent.push_event(event) # AI Formatter
                 threading.Thread(target=self._send_chart, args=(event,)).start()
 
             elif trigger in ["👀量增"]:
