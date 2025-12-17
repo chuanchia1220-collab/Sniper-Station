@@ -24,7 +24,7 @@ from io import BytesIO
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper 戰情室 v2.0 (Pro)", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper 戰情室 v2.0 (Debug)", page_icon="🛠️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -208,31 +208,45 @@ class Database:
 db = Database(DB_PATH)
 
 # ==========================================
-# 3. 核心工具與定義
+# 3. 核心工具與定義 (Debug Enhanced)
 # ==========================================
 
 def send_telegram_message(message):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID: return
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print("[TG ERROR] No Token or Chat ID found!")
+        return
+    
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
-    try: requests.post(url, data=payload, timeout=5)
-    except: pass
+    try:
+        r = requests.post(url, data=payload, timeout=5)
+        if r.status_code != 200:
+            print(f"[TG ERROR] Status: {r.status_code}, Response: {r.text}")
+        else:
+            print("[TG OK] Message sent.")
+    except Exception as e:
+        print(f"[TG EXCEPTION] {e}")
 
 def send_telegram_photo(caption, image_bytes):
     if not TG_BOT_TOKEN or not TG_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
     payload = {"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
     files = {'photo': image_bytes}
-    try: requests.post(url, data=payload, files=files, timeout=10)
-    except: pass
+    try:
+        r = requests.post(url, data=payload, files=files, timeout=10)
+        if r.status_code != 200:
+            print(f"[TG PHOTO ERROR] {r.text}")
+    except Exception as e:
+        print(f"[TG PHOTO EXCEPTION] {e}")
 
 def generate_intraday_chart(code, name):
     try:
         ticker = f"{code}.TW"
-        df = yf.download(ticker, period="1d", interval="1m", progress=False)
+        # Fix YF Future Warning
+        df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
         if df.empty:
             ticker = f"{code}.TWO"
-            df = yf.download(ticker, period="1d", interval="1m", progress=False)
+            df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
         
         if df.empty: return None
 
@@ -244,7 +258,7 @@ def generate_intraday_chart(code, name):
         fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], mode='lines', name='VWAP', line=dict(color='orange', dash='dot')))
         
         fig.update_layout(
-            title=f"{code} {name} Intraday",
+            title=f"{code} {name} Intraday (Ref)",
             xaxis_title="Time", yaxis_title="Price",
             template="plotly_white",
             margin=dict(l=20, r=20, t=40, b=20),
@@ -252,7 +266,9 @@ def generate_intraday_chart(code, name):
         )
         img_bytes = fig.to_image(format="png")
         return img_bytes
-    except: return None
+    except Exception as e:
+        print(f"[CHART ERROR] {e}")
+        return None
 
 def get_stock_name(symbol):
     if symbol not in twstock.codes:
@@ -282,10 +298,13 @@ def _calc_est_vol(current_vol):
     if elapsed >= total: return current_vol
     return int(current_vol * (total / elapsed))
 
+# v2 Trigger Engine
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown, price, vwap, has_attacked):
     if pct >= 9.5: return "👑漲停"
+    
     if (ratio >= 10.0) and (abs(price - vwap) / vwap <= 0.01) and (pct <= 2.0) and (net_1h > 0) and (not has_attacked):
         return "💣伏擊"
+
     if is_bullish and net_day > 200 and pct >= tgt_pct and ratio >= tgt_ratio: return "🔥攻擊"
     if ratio >= tgt_ratio and pct < tgt_pct and is_bullish and net_1h > 200: return "👀量增"
     if is_breakdown and ratio >= tgt_ratio and net_1h < 0: return "💀出貨"
@@ -420,10 +439,11 @@ class EventDispatcher:
         alert_key = f"{code}_{trigger}"
         last_time = self.alert_history.get(alert_key, 0)
         
-        # 修正：測試模式下強制發送 (不檢查冷卻)
-        # 但正常邏輯保留
-        is_test = False 
-        if time.time() - last_time > 600 or event.get('is_test', False):
+        # Test Mode Force Through
+        is_test = event.get('is_test', False)
+        
+        if (time.time() - last_time > 600) or is_test:
+            print(f"[DISPATCH] Trigger: {trigger} | Code: {code}") # Debug
             self._send_instant_notification(event)
             
             if trigger in ["🔥攻擊", "💣伏擊"]:
@@ -453,6 +473,8 @@ class EventDispatcher:
         if img_bytes:
             caption = f"📉 <b>{event['code']} 當日走勢參考 (非預測)</b>\nTrigger: {event['trigger']}"
             send_telegram_photo(caption, img_bytes)
+        else:
+            print("[CHART] Gen failed or empty")
 
 dispatcher = EventDispatcher()
 
@@ -713,8 +735,21 @@ with st.sidebar:
             else: engine.stop()
 
     st.markdown("---")
+    
+    # --- Token Status ---
+    tg_status = "✅" if TG_BOT_TOKEN and TG_CHAT_ID else "❌ Missing"
+    gpt_status = "✅" if OPENAI_API_KEY else "❌ Missing"
+    if tg_status == "✅":
+        tg_display = f"{tg_status} ({TG_BOT_TOKEN[:4]}...)"
+    else:
+        tg_display = tg_status
+        
+    st.caption(f"Telegram: {tg_display}")
+    st.caption(f"GPT: {gpt_status}")
+
     st.subheader("🧪 系統測試 (盤後專用)")
     if st.button("發送測試訊號 (Test Fire)"):
+        print("[TEST] Manually firing test events...")
         # Mock Attack
         mock_event = {
             "code": "2330", "name": "台積電 (測試)", "scope": "watchlist", "event_type": "STRATEGY",
@@ -730,11 +765,7 @@ with st.sidebar:
             "is_test": True
         }
         dispatcher.dispatch(mock_risk)
-        st.success("測試訊號已發送！")
-
-    st.markdown("---")
-    st.caption(f"Bot: {'✅ 啟用' if TG_BOT_TOKEN else '❌ 未設定'}")
-    st.caption(f"GPT: {'✅ 啟用' if OPENAI_API_KEY else '❌ 未設定'}")
+        st.success("測試訊號已發送！請檢查 TG 與 Console。")
 
 now_time = datetime.now(timezone.utc) + timedelta(hours=8)
 st.caption(f"最後更新: {now_time.strftime('%H:%M:%S')} (每3秒)")
