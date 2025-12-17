@@ -20,12 +20,12 @@ from plotly.subplots import make_subplots
 import queue
 from openai import OpenAI
 from io import BytesIO
-import random # 用於模擬法人數據
+import random
 
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper v2.5 (Formatter)", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v2.5 (Formatter+)", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -312,42 +312,30 @@ def fetch_fundamental_data(code):
 # 4. Agent Logic: 模擬數據與規則引擎 (Backend)
 # ==========================================
 
-# 模擬法人數據 (D, D-1, D-2)
 def _get_institutional_3d(code):
-    # TODO: 未來接上真實 API，目前為展示用
-    # D: 模擬今日數據，D-1/D-2: 模擬歷史
+    # 模擬數據 (之後換成真實API)
     return {
         "foreign": [random.randint(-1000, 2000), random.randint(-500, 1500), random.randint(100, 1000)],
         "trust":   [random.randint(-200, 500), random.randint(0, 300), random.randint(-100, 200)],
         "dealer":  [random.randint(-100, 100), random.randint(-50, 50), random.randint(-50, 50)]
     }
 
-# 規則引擎 (Rule Engine) - 純 Python 計算
+# 規則引擎 (Rule Engine)
 def calculate_flags(inst_data, price, price_change_pct):
     flags = []
-    
-    # 取出數據
     f_d, f_d1, f_d2 = inst_data['foreign']
     t_d, t_d1, t_d2 = inst_data['trust']
     d_d, d_d1, d_d2 = inst_data['dealer']
-    
     total_d = f_d + t_d + d_d
     
     # R1: 法人共振
-    if f_d > 0 and t_d > 0 and total_d >= 500:
-        flags.append("INST_SYNC")
-        
+    if f_d > 0 and t_d > 0 and total_d >= 500: flags.append("INST_SYNC")
     # R2: 外資連三
-    if f_d > 0 and f_d1 > 0 and f_d2 > 0:
-        flags.append("FOREIGN_3UP")
-        
-    # R3: 投信接棒 (外資賣, 投信買)
-    if f_d <= 0 and t_d >= 200:
-        flags.append("TRUST_TAKEOVER")
-        
-    # R4: 假拉抬 (股價漲, 法人賣)
-    if price_change_pct > 0 and total_d < 0:
-        flags.append("PRICE_UP_INST_DOWN")
+    if f_d > 0 and f_d1 > 0 and f_d2 > 0: flags.append("FOREIGN_3UP")
+    # R3: 投信接棒
+    if f_d <= 0 and t_d >= 200: flags.append("TRUST_TAKEOVER")
+    # R4: 假拉抬
+    if price_change_pct > 0 and total_d < 0: flags.append("PRICE_UP_INST_DOWN")
         
     return flags if flags else ["—"]
 
@@ -376,13 +364,8 @@ class AIAgent:
             except Exception: pass
 
     def _build_state(self, event):
-        # 1. 取得法人數據 (模擬/真實)
         inst_data = _get_institutional_3d(event['code'])
-        
-        # 2. 計算規則 Flags (Backend Logic)
         flags = calculate_flags(inst_data, event['price'], event['pct'])
-        
-        # 3. 組合 JSON (嚴格依照設計書)
         return {
             "meta": {
                 "code": event['code'],
@@ -405,7 +388,6 @@ class AIAgent:
 
     def _process_event(self, event):
         if not openai_client: return
-        
         state_json = json.dumps(self._build_state(event), ensure_ascii=False)
         
         # V2.5 System Prompt: 格式化引擎
@@ -437,18 +419,15 @@ class AIAgent:
         
         若資料缺失，請顯示 N/A。
         """
-        
         user_prompt = f"Input JSON:\n{state_json}"
 
         try:
             response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-                temperature=0.0 # 零隨機性，確保格式一致
+                temperature=0.0 # 零隨機性
             )
             ai_output = response.choices[0].message.content
-            
-            # 直接發送格式化後的結果
             send_telegram_message(ai_output)
         except Exception: pass
 
@@ -485,8 +464,9 @@ class EventDispatcher:
             st.toast(f"🚀 觸發事件: {trigger} | {code}")
             self._send_instant_notification(event)
             
+            # 攻擊與伏擊：發送 AI快照 + K線圖
             if trigger in ["🔥攻擊", "💣伏擊"]:
-                agent.push_event(event) # AI Formatter
+                agent.push_event(event)
                 threading.Thread(target=self._send_chart, args=(event,)).start()
 
             elif trigger in ["👀量增"]:
@@ -782,7 +762,7 @@ with st.sidebar:
     st.caption(f"GPT: {gpt_status}")
 
     st.subheader("🧪 系統測試 (盤後專用)")
-    if st.button("發送測試訊號 (Test Fire)"):
+    if st.button("發送測試訊號 (Test Fire 🔥)"):
         # Mock Attack
         mock_event = {
             "code": "2330", "name": "台積電 (測試)", "scope": "watchlist", "event_type": "STRATEGY",
@@ -790,7 +770,19 @@ with st.sidebar:
             "is_test": True
         }
         dispatcher.dispatch(mock_event)
+        st.success("測試「攻擊」訊號已發送！")
         
+    if st.button("發送測試訊號 (Test Ambush 💣)"):
+        # Mock Ambush
+        mock_ambush = {
+            "code": "2603", "name": "長榮 (測試)", "scope": "watchlist", "event_type": "STRATEGY",
+            "trigger": "💣伏擊", "price": 155.5, "pct": 0.8, "vwap": 155.0, "ratio": 12.5, "net_1h": 800, "net_day": 1500, "timestamp": time.time(),
+            "is_test": True
+        }
+        dispatcher.dispatch(mock_ambush)
+        st.success("測試「伏擊」訊號已發送！")
+
+    if st.button("發送測試訊號 (Test Risk 💀)"):
         # Mock Risk
         mock_risk = {
             "code": "2317", "name": "鴻海 (測試)", "scope": "inventory", "event_type": "RISK",
@@ -798,7 +790,7 @@ with st.sidebar:
             "is_test": True
         }
         dispatcher.dispatch(mock_risk)
-        st.success("測試訊號已發送！請檢查 TG。")
+        st.success("測試「風險」訊號已發送！")
 
 now_time = datetime.now(timezone.utc) + timedelta(hours=8)
 st.caption(f"最後更新: {now_time.strftime('%H:%M:%S')} (每3秒)")
