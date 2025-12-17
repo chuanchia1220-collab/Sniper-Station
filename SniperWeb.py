@@ -15,8 +15,6 @@ from collections import deque
 import shutil
 import requests
 import pandas_ta as ta
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import queue
 from openai import OpenAI
 from io import BytesIO
@@ -25,7 +23,7 @@ import random
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper v2.5 (Chart Debug)", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Sniper v2.5 (Tactical Buttons)", page_icon="🔘", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -212,86 +210,23 @@ db = Database(DB_PATH)
 # 3. 核心工具與定義
 # ==========================================
 
-def send_telegram_message(message):
+# 修正：支援 Buttons 的發送函式
+def send_telegram_message(message, buttons=None):
     if not TG_BOT_TOKEN or not TG_CHAT_ID: return
+    
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
+    payload = {
+        "chat_id": TG_CHAT_ID, 
+        "text": message, 
+        "parse_mode": "HTML", 
+        "disable_web_page_preview": True
+    }
+    
+    if buttons:
+        payload["reply_markup"] = json.dumps({"inline_keyboard": buttons})
+        
     try: requests.post(url, data=payload, timeout=5)
     except: pass
-
-def send_telegram_photo(caption, image_bytes):
-    print(f"[TG] Sending Photo... Size: {len(image_bytes)} bytes")
-    if not TG_BOT_TOKEN or not TG_CHAT_ID: return
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
-    payload = {"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
-    # 這裡直接傳 BytesIO
-    files = {'photo': ('chart.png', image_bytes, 'image/png')}
-    try: 
-        r = requests.post(url, data=payload, files=files, timeout=10)
-        print(f"[TG] Photo Resp: {r.status_code} | {r.text[:50]}")
-    except Exception as e:
-        print(f"[TG] Photo Err: {e}")
-
-# --- 產圖工具 (Debug Enhanced) ---
-def generate_intraday_chart(code, name):
-    print(f"[CHART] Start generating for {code}...")
-    try:
-        ticker_list = [f"{code}.TW", f"{code}.TWO"]
-        df = pd.DataFrame()
-        
-        # 策略 A: 1日 1分K
-        for ticker in ticker_list:
-            try:
-                print(f"[CHART] Fetching {ticker} (1d/1m)...")
-                df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
-                if not df.empty: 
-                    print(f"[CHART] Got {len(df)} rows (1m)")
-                    break
-            except Exception as e:
-                print(f"[CHART] YF Error 1: {e}")
-            
-        # 策略 B: 5日 5分K
-        chart_title = f"{code} {name} Intraday"
-        if df.empty:
-            print("[CHART] 1m failed, trying 5d/5m...")
-            for ticker in ticker_list:
-                try:
-                    df = yf.download(ticker, period="5d", interval="5m", progress=False, auto_adjust=False)
-                    if not df.empty: 
-                        print(f"[CHART] Got {len(df)} rows (5m)")
-                        chart_title = f"{code} {name} 5-Day Trend (Backup)"
-                        break
-                except Exception as e:
-                    print(f"[CHART] YF Error 2: {e}")
-
-        if df.empty: 
-            print("[CHART] All fetch failed!")
-            return None
-
-        # 處理 MultiIndex
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        
-        # 繪圖
-        df['VWAP'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).cumsum() / df['Volume'].cumsum()
-
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='Price', line=dict(color='red')))
-        if "Intraday" in chart_title:
-            fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], mode='lines', name='VWAP', line=dict(color='orange', dash='dot')))
-        
-        fig.update_layout(
-            title=chart_title,
-            xaxis_title="Time", yaxis_title="Price",
-            template="plotly_white",
-            margin=dict(l=20, r=20, t=40, b=20),
-            height=400, width=600
-        )
-        img_bytes = fig.to_image(format="png")
-        print(f"[CHART] Generated PNG: {len(img_bytes)} bytes")
-        return img_bytes
-    except Exception as e: 
-        print(f"[CHART] Generate Exception: {e}")
-        return None
 
 def get_stock_name(symbol):
     if symbol not in twstock.codes:
@@ -422,7 +357,6 @@ class AIAgent:
         if not openai_client: return
         state_json = json.dumps(self._build_state(event), ensure_ascii=False)
         
-        # V2.5 System Prompt: 格式化引擎
         system_prompt = """
         你不是分析師，也不是交易顧問。
         你是「即時市場資料格式化引擎（Market Snapshot Formatter）」。
@@ -460,14 +394,26 @@ class AIAgent:
                 temperature=0.0
             )
             ai_output = response.choices[0].message.content
-            send_telegram_message(ai_output)
+            
+            # 使用帶按鈕的發送函式 (戰術按鈕)
+            buttons = [
+                [
+                    {"text": "📈 TradingView", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{event['code']}"},
+                    {"text": "📊 Yahoo K線", "url": f"https://tw.stock.yahoo.com/quote/{event['code']}.TW/technical-analysis"}
+                ],
+                [
+                    {"text": "🏦 籌碼 K 線", "url": f"https://www.cmoney.tw/finance/technicalanalysis.aspx?s={event['code']}"},
+                    {"text": "📱 Goodinfo", "url": f"https://goodinfo.tw/tw/ShowK_Chart.asp?STOCK_ID={event['code']}&CHT_CAT=WEEK"}
+                ]
+            ]
+            send_telegram_message(ai_output, buttons=buttons)
         except Exception: pass
 
 agent = AIAgent()
 agent.start()
 
 # ==========================================
-# 5. Event Dispatcher
+# 5. Event Dispatcher (Tactical Button Ver.)
 # ==========================================
 class EventDispatcher:
     def __init__(self):
@@ -494,21 +440,29 @@ class EventDispatcher:
         
         if (time.time() - last_time > 600) or is_test:
             st.toast(f"🚀 觸發事件: {trigger} | {code}")
-            self._send_instant_notification(event)
             
+            # 產生戰術按鈕
+            buttons = [
+                [
+                    {"text": "📈 TradingView", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{code}"},
+                    {"text": "📊 Yahoo K線", "url": f"https://tw.stock.yahoo.com/quote/{code}.TW/technical-analysis"}
+                ]
+            ]
+            
+            # 1. 立即通知 (帶按鈕)
+            self._send_instant_notification(event, buttons)
+            
+            # 2. A級事件 -> AI Formatter (這裡會再送一次帶法人按鈕的訊息)
             if trigger in ["🔥攻擊", "💣伏擊"]:
-                agent.push_event(event) # AI Formatter
-                threading.Thread(target=self._send_chart, args=(event,)).start()
+                agent.push_event(event) 
 
-            elif trigger in ["👀量增"]:
-                threading.Thread(target=self._send_chart, args=(event,)).start()
-
+            # 3. 風險事件 -> 僅 AI 分析 (不畫圖)
             elif scope == "inventory" and event_type == "RISK":
                 agent.push_event(event)
 
             self.alert_history[alert_key] = time.time()
 
-    def _send_instant_notification(self, event):
+    def _send_instant_notification(self, event, buttons=None):
         emoji = "💣" if "伏擊" in event['trigger'] else "🚀" if "攻擊" in event['trigger'] else "☠️" if "出貨" in event['trigger'] or "跌破" in event['trigger'] else "👀"
         msg = (
             f"{emoji} <b>{event['trigger']}偵測：{event['code']} {event['name']}</b>\n"
@@ -516,17 +470,7 @@ class EventDispatcher:
             f"量比：{event['ratio']:.1f}\n"
             f"🤖 正在快照法人數據..."
         )
-        send_telegram_message(msg)
-
-    def _send_chart(self, event):
-        print(f"[CHART] Thread Start: {event['code']}")
-        img_bytes = generate_intraday_chart(event['code'], event['name'])
-        if img_bytes:
-            print(f"[CHART] Success, sending TG photo...")
-            caption = f"📉 <b>{event['code']} 當日走勢參考 (非預測)</b>\nTrigger: {event['trigger']}"
-            send_telegram_photo(caption, img_bytes)
-        else:
-            print("[CHART] Failed to generate image.")
+        send_telegram_message(msg, buttons)
 
 dispatcher = EventDispatcher()
 
