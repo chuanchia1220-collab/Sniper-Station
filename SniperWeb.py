@@ -23,7 +23,7 @@ import random
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper v2.5 (Tactical Buttons)", page_icon="🔘", layout="wide")
+st.set_page_config(page_title="Sniper v2.5 (Trend Buttons)", page_icon="🔘", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -210,7 +210,7 @@ db = Database(DB_PATH)
 # 3. 核心工具與定義
 # ==========================================
 
-# 修正：支援 Buttons 的發送函式
+# 支援 Buttons 的發送函式
 def send_telegram_message(message, buttons=None):
     if not TG_BOT_TOKEN or not TG_CHAT_ID: return
     
@@ -286,6 +286,7 @@ def fetch_fundamental_data(code):
 # ==========================================
 
 def _get_institutional_3d(code):
+    # 模擬 3 天法人數據 (今日、昨日、前日)
     return {
         "foreign": [random.randint(-1000, 2000), random.randint(-500, 1500), random.randint(100, 1000)],
         "trust":   [random.randint(-200, 500), random.randint(0, 300), random.randint(-100, 200)],
@@ -347,8 +348,13 @@ class AIAgent:
             },
             "price_ctx": {
                 "price_vs_vwap_pct": round((event['price'] - event['vwap']) / event['vwap'] * 100, 2),
-                "volume_ratio": event['ratio'],
-                "net_main_1h": "BUY" if event['net_1h'] > 0 else "SELL"
+                "volume_ratio": event['ratio']
+            },
+            "big_order": {
+                # 這裡傳入的數值會在 Prompt 中被要求強制顯示正負號
+                "10m": event.get('net_10m', 0),
+                "1h": event.get('net_1h', 0),
+                "day": event.get('net_day', 0)
             },
             "flags": flags
         }
@@ -357,6 +363,7 @@ class AIAgent:
         if not openai_client: return
         state_json = json.dumps(self._build_state(event), ensure_ascii=False)
         
+        # V2.5 System Prompt: 格式化引擎 (Updated V37.1)
         system_prompt = """
         你不是分析師，也不是交易顧問。
         你是「即時市場資料格式化引擎（Market Snapshot Formatter）」。
@@ -374,14 +381,14 @@ class AIAgent:
         ────────────────
         合計：{Total_D}｜{Total_D-1}｜{Total_D-2}
         P/V：{price_vs_vwap_pct}%｜量比 {volume_ratio}
-        1H 大戶：{net_main_1h}
+        10Min 大戶：{10m (強制正負號)} | 1H 大戶：{1h (強制正負號)} | 大戶日：{day (強制正負號)}
         Flags：{flags (用｜分隔)}
 
-        禁止事項：
-        ❌ 禁止使用任何形容詞 (偏多/偏空/強/弱)
-        ❌ 禁止進行解讀、預測或評論
-        ❌ 禁止推論不存在的資料
-        ❌ 禁止修改 Flags 內容
+        規則：
+        1. 法人數據 (外資/投信/自營/合計)：直接顯示數字，正數不需加號，負數顯示負號。
+        2. 大戶數據 (10Min/1H/日)：**必須** 顯示正負號 (例如 +300, -500)。
+        3. 禁止使用任何形容詞 (偏多/偏空/強/弱)。
+        4. 禁止進行解讀、預測或評論。
         
         若資料缺失，請顯示 N/A。
         """
@@ -395,15 +402,11 @@ class AIAgent:
             )
             ai_output = response.choices[0].message.content
             
-            # 使用帶按鈕的發送函式 (戰術按鈕)
+            # 使用帶按鈕的發送函式 (戰術按鈕 - 修正連結)
             buttons = [
                 [
-                    {"text": "📈 TradingView", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{event['code']}"},
-                    {"text": "📊 Yahoo K線", "url": f"https://tw.stock.yahoo.com/quote/{event['code']}.TW/technical-analysis"}
-                ],
-                [
-                    {"text": "🏦 籌碼 K 線", "url": f"https://www.cmoney.tw/finance/technicalanalysis.aspx?s={event['code']}"},
-                    {"text": "📱 Goodinfo", "url": f"https://goodinfo.tw/tw/ShowK_Chart.asp?STOCK_ID={event['code']}&CHT_CAT=WEEK"}
+                    {"text": "📈 TradingView (1m)", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{event['code']}&interval=1"},
+                    {"text": "📊 Yahoo 走勢", "url": f"https://tw.stock.yahoo.com/quote/{event['code']}.TW"}
                 ]
             ]
             send_telegram_message(ai_output, buttons=buttons)
@@ -441,11 +444,11 @@ class EventDispatcher:
         if (time.time() - last_time > 600) or is_test:
             st.toast(f"🚀 觸發事件: {trigger} | {code}")
             
-            # 產生戰術按鈕
+            # 產生戰術按鈕 (修正版)
             buttons = [
                 [
-                    {"text": "📈 TradingView", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{code}"},
-                    {"text": "📊 Yahoo K線", "url": f"https://tw.stock.yahoo.com/quote/{code}.TW/technical-analysis"}
+                    {"text": "📈 TradingView (1m)", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{code}&interval=1"},
+                    {"text": "📊 Yahoo 走勢", "url": f"https://tw.stock.yahoo.com/quote/{code}.TW"}
                 ]
             ]
             
@@ -456,7 +459,7 @@ class EventDispatcher:
             if trigger in ["🔥攻擊", "💣伏擊"]:
                 agent.push_event(event) 
 
-            # 3. 風險事件 -> 僅 AI 分析 (不畫圖)
+            # 3. 風險事件 -> 僅 AI 分析
             elif scope == "inventory" and event_type == "RISK":
                 agent.push_event(event)
 
@@ -556,9 +559,15 @@ class SniperEngine:
                 self.vol_queues[code].append((now_ts, delta_net))
                 self.daily_net[code] = self.daily_net.get(code, 0) + delta_net
             
+            # 計算 1H 與 10Min 大戶 (修正：新增 10Min 計算)
             one_hour_ago = now_ts - 3600
+            ten_min_ago = now_ts - 600
+            
+            # 清理過期資料 (保留1小時內)
             self.vol_queues[code] = [x for x in self.vol_queues[code] if x[0] > one_hour_ago]
+            
             net_1h = sum(x[1] for x in self.vol_queues[code])
+            net_10m = sum(x[1] for x in self.vol_queues[code] if x[0] > ten_min_ago)
             net_day = self.daily_net.get(code, 0)
             
             tgt_pct, tgt_ratio = get_dynamic_thresholds(price)
@@ -630,6 +639,7 @@ class SniperEngine:
                     "vwap": vwap,
                     "ratio": ratio,
                     "net_1h": net_1h,
+                    "net_10m": net_10m, # 新增 10m 數據
                     "net_day": net_day,
                     "timestamp": now_ts
                 }
@@ -745,7 +755,7 @@ with st.sidebar:
         # Mock Attack
         mock_event = {
             "code": "2330", "name": "台積電 (測試)", "scope": "watchlist", "event_type": "STRATEGY",
-            "trigger": "🔥攻擊", "price": 888.0, "pct": 3.5, "vwap": 870.0, "ratio": 2.5, "net_1h": 500, "net_day": 1200, "timestamp": time.time(),
+            "trigger": "🔥攻擊", "price": 888.0, "pct": 3.5, "vwap": 870.0, "ratio": 2.5, "net_10m": 150, "net_1h": 500, "net_day": 1200, "timestamp": time.time(),
             "is_test": True
         }
         dispatcher.dispatch(mock_event)
@@ -755,7 +765,7 @@ with st.sidebar:
         # Mock Ambush
         mock_ambush = {
             "code": "2603", "name": "長榮 (測試)", "scope": "watchlist", "event_type": "STRATEGY",
-            "trigger": "💣伏擊", "price": 155.5, "pct": 0.8, "vwap": 155.0, "ratio": 12.5, "net_1h": 800, "net_day": 1500, "timestamp": time.time(),
+            "trigger": "💣伏擊", "price": 155.5, "pct": 0.8, "vwap": 155.0, "ratio": 12.5, "net_10m": 300, "net_1h": 800, "net_day": 1500, "timestamp": time.time(),
             "is_test": True
         }
         dispatcher.dispatch(mock_ambush)
@@ -765,7 +775,7 @@ with st.sidebar:
         # Mock Risk
         mock_risk = {
             "code": "2317", "name": "鴻海 (測試)", "scope": "inventory", "event_type": "RISK",
-            "trigger": "💀出貨", "price": 100.0, "pct": -2.5, "vwap": 103.0, "ratio": 1.8, "net_1h": -300, "net_day": -800, "timestamp": time.time(),
+            "trigger": "💀出貨", "price": 100.0, "pct": -2.5, "vwap": 103.0, "ratio": 1.8, "net_10m": -100, "net_1h": -300, "net_day": -800, "timestamp": time.time(),
             "is_test": True
         }
         dispatcher.dispatch(mock_risk)
