@@ -20,11 +20,12 @@ from plotly.subplots import make_subplots
 import queue
 from openai import OpenAI
 from io import BytesIO
+import random # 用於模擬法人數據
 
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper 戰情室 v2.0 (Pro)", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v2.5 (Formatter)", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -229,10 +230,10 @@ def send_telegram_photo(caption, image_bytes):
 def generate_intraday_chart(code, name):
     try:
         ticker = f"{code}.TW"
-        df = yf.download(ticker, period="1d", interval="1m", progress=False)
+        df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
         if df.empty:
             ticker = f"{code}.TWO"
-            df = yf.download(ticker, period="1d", interval="1m", progress=False)
+            df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
         
         if df.empty: return None
 
@@ -244,7 +245,7 @@ def generate_intraday_chart(code, name):
         fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], mode='lines', name='VWAP', line=dict(color='orange', dash='dot')))
         
         fig.update_layout(
-            title=f"{code} {name} Intraday",
+            title=f"{code} {name} Intraday (Ref)",
             xaxis_title="Time", yaxis_title="Price",
             template="plotly_white",
             margin=dict(l=20, r=20, t=40, b=20),
@@ -252,7 +253,7 @@ def generate_intraday_chart(code, name):
         )
         img_bytes = fig.to_image(format="png")
         return img_bytes
-    except: return None
+    except Exception: return None
 
 def get_stock_name(symbol):
     if symbol not in twstock.codes:
@@ -308,13 +309,55 @@ def fetch_fundamental_data(code):
     return 0, 0, 0
 
 # ==========================================
-# 4. State Builder & AI Agent
+# 4. Agent Logic: 模擬數據與規則引擎 (Backend)
+# ==========================================
+
+# 模擬法人數據 (D, D-1, D-2)
+def _get_institutional_3d(code):
+    # TODO: 未來接上真實 API，目前為展示用
+    # D: 模擬今日數據，D-1/D-2: 模擬歷史
+    return {
+        "foreign": [random.randint(-1000, 2000), random.randint(-500, 1500), random.randint(100, 1000)],
+        "trust":   [random.randint(-200, 500), random.randint(0, 300), random.randint(-100, 200)],
+        "dealer":  [random.randint(-100, 100), random.randint(-50, 50), random.randint(-50, 50)]
+    }
+
+# 規則引擎 (Rule Engine) - 純 Python 計算
+def calculate_flags(inst_data, price, price_change_pct):
+    flags = []
+    
+    # 取出數據
+    f_d, f_d1, f_d2 = inst_data['foreign']
+    t_d, t_d1, t_d2 = inst_data['trust']
+    d_d, d_d1, d_d2 = inst_data['dealer']
+    
+    total_d = f_d + t_d + d_d
+    
+    # R1: 法人共振
+    if f_d > 0 and t_d > 0 and total_d >= 500:
+        flags.append("INST_SYNC")
+        
+    # R2: 外資連三
+    if f_d > 0 and f_d1 > 0 and f_d2 > 0:
+        flags.append("FOREIGN_3UP")
+        
+    # R3: 投信接棒 (外資賣, 投信買)
+    if f_d <= 0 and t_d >= 200:
+        flags.append("TRUST_TAKEOVER")
+        
+    # R4: 假拉抬 (股價漲, 法人賣)
+    if price_change_pct > 0 and total_d < 0:
+        flags.append("PRICE_UP_INST_DOWN")
+        
+    return flags if flags else ["—"]
+
+# ==========================================
+# 5. AIAgent (Formatter Role)
 # ==========================================
 class AIAgent:
     def __init__(self):
         self.event_queue = queue.Queue()
         self.is_running = False
-        self.BANNED_KEYWORDS = ["進場", "出場", "操作", "佈局", "加碼", "減碼", "有利", "不利", "偏多", "偏空", "看好", "看壞", "適合", "不適合", "建議"]
         
     def start(self):
         if self.is_running: return
@@ -333,64 +376,80 @@ class AIAgent:
             except Exception: pass
 
     def _build_state(self, event):
-        risk_note = ""
-        if event['scope'] == "inventory" and event['trigger'] in ["💀出貨", "跌破-2%"]:
-            risk_note = "IMMEDIATE_ATTENTION"
-
+        # 1. 取得法人數據 (模擬/真實)
+        inst_data = _get_institutional_3d(event['code'])
+        
+        # 2. 計算規則 Flags (Backend Logic)
+        flags = calculate_flags(inst_data, event['price'], event['pct'])
+        
+        # 3. 組合 JSON (嚴格依照設計書)
         return {
-            "ticker": event['code'],
-            "name": event['name'],
-            "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-            "facts": {
-                "price": event['price'],
-                "change_pct": {"value": event['pct'], "direction": "UP" if event['pct'] > 0 else "DOWN"},
-                "vwap": event['vwap'],
-                "volume_ratio": event['ratio'],
-                "net_main_1h": {"value": event['net_1h'], "direction": "BUY" if event['net_1h'] > 0 else "SELL"}
+            "meta": {
+                "code": event['code'],
+                "name": event['name'],
+                "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                "mode": "standard"
             },
-            "signal": event['trigger'],
-            "position_status": "HOLD" if event['scope'] == "inventory" else "NO_POSITION",
-            "risk_level": risk_note, 
-            "context": "此分析僅為單一股票單一時點狀態，不包含大盤、產業或未來推論"
+            "institutional": {
+                "foreign": {"D": inst_data['foreign'][0], "D-1": inst_data['foreign'][1], "D-2": inst_data['foreign'][2]},
+                "trust":   {"D": inst_data['trust'][0],   "D-1": inst_data['trust'][1],   "D-2": inst_data['trust'][2]},
+                "dealer":  {"D": inst_data['dealer'][0],  "D-1": inst_data['dealer'][1],  "D-2": inst_data['dealer'][2]}
+            },
+            "price_ctx": {
+                "price_vs_vwap_pct": round((event['price'] - event['vwap']) / event['vwap'] * 100, 2),
+                "volume_ratio": event['ratio'],
+                "net_main_1h": "BUY" if event['net_1h'] > 0 else "SELL"
+            },
+            "flags": flags
         }
 
     def _process_event(self, event):
         if not openai_client: return
+        
         state_json = json.dumps(self._build_state(event), ensure_ascii=False)
         
+        # V2.5 System Prompt: 格式化引擎
         system_prompt = """
-        你不是交易員、不是分析師，你是「市場狀態轉譯器」。
-        你的任務：
-        1. 重述事實 (根據提供的 JSON 數據)
-        2. 指出數據間的矛盾
-        3. 標示風險來源
+        你不是分析師，也不是交易顧問。
+        你是「即時市場資料格式化引擎（Market Snapshot Formatter）」。
 
-        嚴格限制：
-        - 禁止預測未來走勢
-        - 禁止使用任何方向性詞彙
-        - 禁止給出行動暗示
-
-        嚴重警告 (Risk Protocol)：
-        若 JSON 中 risk_level 為 "IMMEDIATE_ATTENTION"，代表此為庫存風險事件。
-        你必須以極度嚴肅、客觀甚至偏向負面的語氣描述現況，不得使用任何安撫性、正面或中性偏多的語句。
+        專職任務：
+        將輸入資料轉為「極短、可掃描」的 Telegram 快照卡片。
         
-        若資料不足，請只回覆「資訊不足，無法判斷」。
+        嚴格遵守以下輸出格式 (包含分隔線與符號)：
+        
+        【法人快照｜{code}｜{time}】
+
+        外資：{D}｜{D-1}｜{D-2}
+        投信：{D}｜{D-1}｜{D-2}
+        自營：{D}｜{D-1}｜{D-2}
+        ────────────────
+        合計：{Total_D}｜{Total_D-1}｜{Total_D-2}
+        P/V：{price_vs_vwap_pct}%｜量比 {volume_ratio}
+        1H 大戶：{net_main_1h}
+        Flags：{flags (用｜分隔)}
+
+        禁止事項：
+        ❌ 禁止使用任何形容詞 (偏多/偏空/強/弱)
+        ❌ 禁止進行解讀、預測或評論
+        ❌ 禁止推論不存在的資料
+        ❌ 禁止修改 Flags 內容
+        
+        若資料缺失，請顯示 N/A。
         """
-        user_prompt = f"市場狀態(JSON)：\n{state_json}"
+        
+        user_prompt = f"Input JSON:\n{state_json}"
 
         try:
             response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-                temperature=0.1
+                temperature=0.0 # 零隨機性，確保格式一致
             )
-            ai_analysis = response.choices[0].message.content
-            hit_banned = False
-            for keyword in self.BANNED_KEYWORDS:
-                if keyword in ai_analysis: hit_banned = True; break
-            if hit_banned: ai_analysis = "⚠️ AI 回應包含行為暗示，已被系統中立化處理。"
-            report = f"🤖 <b>Sniper GPT 分析｜{event['code']}</b>\n{ai_analysis}"
-            send_telegram_message(report)
+            ai_output = response.choices[0].message.content
+            
+            # 直接發送格式化後的結果
+            send_telegram_message(ai_output)
         except Exception: pass
 
 agent = AIAgent()
@@ -420,14 +479,14 @@ class EventDispatcher:
         alert_key = f"{code}_{trigger}"
         last_time = self.alert_history.get(alert_key, 0)
         
-        # 修正：測試模式下強制發送 (不檢查冷卻)
-        # 但正常邏輯保留
-        is_test = False 
-        if time.time() - last_time > 600 or event.get('is_test', False):
+        is_test = event.get('is_test', False)
+        
+        if (time.time() - last_time > 600) or is_test:
+            st.toast(f"🚀 觸發事件: {trigger} | {code}")
             self._send_instant_notification(event)
             
             if trigger in ["🔥攻擊", "💣伏擊"]:
-                agent.push_event(event)
+                agent.push_event(event) # AI Formatter
                 threading.Thread(target=self._send_chart, args=(event,)).start()
 
             elif trigger in ["👀量增"]:
@@ -444,7 +503,7 @@ class EventDispatcher:
             f"{emoji} <b>{event['trigger']}偵測：{event['code']} {event['name']}</b>\n"
             f"現價：{event['price']:.2f} ({event['pct']:.2f}%)\n"
             f"量比：{event['ratio']:.1f}\n"
-            f"🤖 系統處理中..."
+            f"🤖 正在快照法人數據..."
         )
         send_telegram_message(msg)
 
@@ -713,6 +772,15 @@ with st.sidebar:
             else: engine.stop()
 
     st.markdown("---")
+    
+    tg_status = "✅" if TG_BOT_TOKEN and TG_CHAT_ID else "❌ Missing"
+    gpt_status = "✅" if OPENAI_API_KEY else "❌ Missing"
+    if tg_status == "✅": tg_display = f"{tg_status} ({TG_BOT_TOKEN[:4]}...)"
+    else: tg_display = tg_status
+        
+    st.caption(f"Telegram: {tg_display}")
+    st.caption(f"GPT: {gpt_status}")
+
     st.subheader("🧪 系統測試 (盤後專用)")
     if st.button("發送測試訊號 (Test Fire)"):
         # Mock Attack
@@ -730,11 +798,7 @@ with st.sidebar:
             "is_test": True
         }
         dispatcher.dispatch(mock_risk)
-        st.success("測試訊號已發送！")
-
-    st.markdown("---")
-    st.caption(f"Bot: {'✅ 啟用' if TG_BOT_TOKEN else '❌ 未設定'}")
-    st.caption(f"GPT: {'✅ 啟用' if OPENAI_API_KEY else '❌ 未設定'}")
+        st.success("測試訊號已發送！請檢查 TG。")
 
 now_time = datetime.now(timezone.utc) + timedelta(hours=8)
 st.caption(f"最後更新: {now_time.strftime('%H:%M:%S')} (每3秒)")
@@ -756,7 +820,7 @@ with inv_container:
         st.data_editor(
             df_inv_show,
             column_config={"代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "狀態": st.column_config.TextColumn("狀態", width="small"), "成本": st.column_config.NumberColumn("成本", format="%.2f"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f"), "損益$": st.column_config.NumberColumn("損益$", format="%d"), "報酬%": st.column_config.NumberColumn("報酬%", format="%.2f%%"), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f")},
-            use_container_width=True, hide_index=True, height=calc_height, disabled=True, key="inv_table"
+            width='stretch', hide_index=True, height=calc_height, disabled=True, key="inv_table"
         )
     else: st.info("尚無庫存資料，請在左側「指揮官」模式設定。")
 
@@ -784,7 +848,7 @@ with watch_container:
         edited_watch = st.data_editor(
             df_watch_show,
             column_config={"Pinned": st.column_config.CheckboxColumn("📌", width="small", pinned=True), "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "等級": st.column_config.TextColumn("等級", width="small"), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f")},
-            use_container_width=True, hide_index=True, height=final_height, key="watch_editor"
+            width='stretch', hide_index=True, height=final_height, key="watch_editor"
         )
         if not df_watch.empty:
             changes = edited_watch[['代碼', 'Pinned']].set_index('代碼')
