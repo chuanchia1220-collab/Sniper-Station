@@ -38,7 +38,7 @@ except:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v35.db" # 鎖定 V35 版本
+DB_PATH = "sniper_v35.db"
 
 openai_client = None
 if OPENAI_API_KEY:
@@ -420,7 +420,10 @@ class EventDispatcher:
         alert_key = f"{code}_{trigger}"
         last_time = self.alert_history.get(alert_key, 0)
         
-        if time.time() - last_time > 600:
+        # 修正：測試模式下強制發送 (不檢查冷卻)
+        # 但正常邏輯保留
+        is_test = False 
+        if time.time() - last_time > 600 or event.get('is_test', False):
             self._send_instant_notification(event)
             
             if trigger in ["🔥攻擊", "💣伏擊"]:
@@ -467,8 +470,8 @@ class SniperEngine:
         self.prev_data = {} 
         self.history_vol = {}
         
-        self.daily_active_flags = {} # A-1
-        self.daily_risk_flags = {}   # A-2
+        self.daily_active_flags = {} 
+        self.daily_risk_flags = {}   
         
         self.last_reset_date = datetime.now().date()
         self.clients = []
@@ -544,7 +547,6 @@ class SniperEngine:
             is_bullish = price >= vwap
             is_breakdown = price < (vwap * 0.99)
             
-            # --- State Check ---
             event_type = "STRATEGY"
             signal_level = "B"
             risk_status = "NORMAL"
@@ -561,7 +563,6 @@ class SniperEngine:
             scope = "inventory" if code in self.inventory_codes else "watchlist"
             trigger = None
 
-            # Inventory Logic
             if scope == "inventory":
                 if pct <= -2.0:
                     trigger = "跌破-2%"
@@ -584,7 +585,6 @@ class SniperEngine:
                     signal_level = "A_PLUS"
                     self.daily_active_flags.setdefault(code, set()).add("ATTACK")
 
-            # Watchlist Logic
             if scope == "watchlist":
                 if not has_active_signal:
                     if "攻擊" in raw_signal:
@@ -713,14 +713,31 @@ with st.sidebar:
             else: engine.stop()
 
     st.markdown("---")
+    st.subheader("🧪 系統測試 (盤後專用)")
+    if st.button("發送測試訊號 (Test Fire)"):
+        # Mock Attack
+        mock_event = {
+            "code": "2330", "name": "台積電 (測試)", "scope": "watchlist", "event_type": "STRATEGY",
+            "trigger": "🔥攻擊", "price": 888.0, "pct": 3.5, "vwap": 870.0, "ratio": 2.5, "net_1h": 500, "net_day": 1200, "timestamp": time.time(),
+            "is_test": True
+        }
+        dispatcher.dispatch(mock_event)
+        
+        # Mock Risk
+        mock_risk = {
+            "code": "2317", "name": "鴻海 (測試)", "scope": "inventory", "event_type": "RISK",
+            "trigger": "💀出貨", "price": 100.0, "pct": -2.5, "vwap": 103.0, "ratio": 1.8, "net_1h": -300, "net_day": -800, "timestamp": time.time(),
+            "is_test": True
+        }
+        dispatcher.dispatch(mock_risk)
+        st.success("測試訊號已發送！")
+
+    st.markdown("---")
     st.caption(f"Bot: {'✅ 啟用' if TG_BOT_TOKEN else '❌ 未設定'}")
     st.caption(f"GPT: {'✅ 啟用' if OPENAI_API_KEY else '❌ 未設定'}")
 
 now_time = datetime.now(timezone.utc) + timedelta(hours=8)
 st.caption(f"最後更新: {now_time.strftime('%H:%M:%S')} (每3秒)")
-
-def style_risk(val):
-    return "background-color: #FFDDDD; color: red; font-weight: bold" if val == "RISK_LOCKED" else ""
 
 with inv_container:
     st.subheader("📦 庫存損益 (Portfolio)")
@@ -750,7 +767,6 @@ with watch_container:
         df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
         if use_filter: df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'] < 50)]
         df_watch = df_watch.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'signal': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
-        # B-1: 排序 (A_PLUS > A_MINUS > B)
         df_watch['level_score'] = df_watch['等級'].apply(lambda x: 10 if x == 'A_PLUS' else (5 if x == 'A_MINUS' else 0))
         df_watch = df_watch.sort_values(by=['Pinned', 'level_score', '漲跌%'], ascending=[False, False, False])
         cols_w = ['Pinned', '代碼', '名稱', '等級', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE']
@@ -758,7 +774,6 @@ with watch_container:
             if c not in df_watch.columns: df_watch[c] = 0
         df_watch_show = df_watch[cols_w].copy()
         
-        # 動態計算高度
         rows = len(df_watch_show)
         row_height = 35
         max_rows = 45 
