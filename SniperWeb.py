@@ -24,7 +24,7 @@ from io import BytesIO
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper 戰情室 v2.0 (UI Debug)", page_icon="👀", layout="wide")
+st.set_page_config(page_title="Sniper 戰情室 v2.0 (Pro)", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -208,51 +208,33 @@ class Database:
 db = Database(DB_PATH)
 
 # ==========================================
-# 3. 核心工具與定義 (UI Debug Enhanced)
+# 3. 核心工具與定義
 # ==========================================
 
 def send_telegram_message(message):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        st.toast("❌ TG 錯誤: 無 Token 或 Chat ID")
-        return
-    
+    if not TG_BOT_TOKEN or not TG_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
-    try:
-        r = requests.post(url, data=payload, timeout=5)
-        if r.status_code != 200:
-            st.toast(f"❌ TG 發送失敗: {r.status_code}")
-            print(f"[TG ERROR] {r.text}")
-        else:
-            st.toast(f"✅ TG 已發送: {message[:10]}...")
-    except Exception as e:
-        st.toast(f"❌ TG 連線錯誤: {e}")
+    try: requests.post(url, data=payload, timeout=5)
+    except: pass
 
 def send_telegram_photo(caption, image_bytes):
     if not TG_BOT_TOKEN or not TG_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
     payload = {"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
     files = {'photo': image_bytes}
-    try:
-        r = requests.post(url, data=payload, files=files, timeout=10)
-        if r.status_code != 200:
-            st.toast(f"❌ TG 圖片失敗: {r.status_code}")
-        else:
-            st.toast("✅ TG 圖片已發送")
-    except Exception as e:
-        st.toast(f"❌ TG 圖片連線錯誤: {e}")
+    try: requests.post(url, data=payload, files=files, timeout=10)
+    except: pass
 
 def generate_intraday_chart(code, name):
     try:
         ticker = f"{code}.TW"
-        df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
+        df = yf.download(ticker, period="1d", interval="1m", progress=False)
         if df.empty:
             ticker = f"{code}.TWO"
-            df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
+            df = yf.download(ticker, period="1d", interval="1m", progress=False)
         
-        if df.empty: 
-            st.toast(f"⚠️ {code} 抓無 K 線資料")
-            return None
+        if df.empty: return None
 
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df['VWAP'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).cumsum() / df['Volume'].cumsum()
@@ -262,7 +244,7 @@ def generate_intraday_chart(code, name):
         fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], mode='lines', name='VWAP', line=dict(color='orange', dash='dot')))
         
         fig.update_layout(
-            title=f"{code} {name} Intraday (Ref)",
+            title=f"{code} {name} Intraday",
             xaxis_title="Time", yaxis_title="Price",
             template="plotly_white",
             margin=dict(l=20, r=20, t=40, b=20),
@@ -270,9 +252,7 @@ def generate_intraday_chart(code, name):
         )
         img_bytes = fig.to_image(format="png")
         return img_bytes
-    except Exception as e:
-        print(f"[CHART ERROR] {e}")
-        return None
+    except: return None
 
 def get_stock_name(symbol):
     if symbol not in twstock.codes:
@@ -302,13 +282,10 @@ def _calc_est_vol(current_vol):
     if elapsed >= total: return current_vol
     return int(current_vol * (total / elapsed))
 
-# v2 Trigger Engine
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown, price, vwap, has_attacked):
     if pct >= 9.5: return "👑漲停"
-    
     if (ratio >= 10.0) and (abs(price - vwap) / vwap <= 0.01) and (pct <= 2.0) and (net_1h > 0) and (not has_attacked):
         return "💣伏擊"
-
     if is_bullish and net_day > 200 and pct >= tgt_pct and ratio >= tgt_ratio: return "🔥攻擊"
     if ratio >= tgt_ratio and pct < tgt_pct and is_bullish and net_1h > 200: return "👀量增"
     if is_breakdown and ratio >= tgt_ratio and net_1h < 0: return "💀出貨"
@@ -443,13 +420,10 @@ class EventDispatcher:
         alert_key = f"{code}_{trigger}"
         last_time = self.alert_history.get(alert_key, 0)
         
-        # Force Send if Test
-        is_test = event.get('is_test', False)
-        
-        if (time.time() - last_time > 600) or is_test:
-            # UI Debug Hint
-            st.toast(f"🚀 觸發事件: {trigger} | {code}")
-            
+        # 修正：測試模式下強制發送 (不檢查冷卻)
+        # 但正常邏輯保留
+        is_test = False 
+        if time.time() - last_time > 600 or event.get('is_test', False):
             self._send_instant_notification(event)
             
             if trigger in ["🔥攻擊", "💣伏擊"]:
@@ -479,8 +453,6 @@ class EventDispatcher:
         if img_bytes:
             caption = f"📉 <b>{event['code']} 當日走勢參考 (非預測)</b>\nTrigger: {event['trigger']}"
             send_telegram_photo(caption, img_bytes)
-        else:
-            print("[CHART] Gen failed or empty")
 
 dispatcher = EventDispatcher()
 
@@ -741,21 +713,8 @@ with st.sidebar:
             else: engine.stop()
 
     st.markdown("---")
-    
-    # --- Token Status ---
-    tg_status = "✅" if TG_BOT_TOKEN and TG_CHAT_ID else "❌ Missing"
-    gpt_status = "✅" if OPENAI_API_KEY else "❌ Missing"
-    if tg_status == "✅":
-        tg_display = f"{tg_status} ({TG_BOT_TOKEN[:4]}...)"
-    else:
-        tg_display = tg_status
-        
-    st.caption(f"Telegram: {tg_display}")
-    st.caption(f"GPT: {gpt_status}")
-
     st.subheader("🧪 系統測試 (盤後專用)")
     if st.button("發送測試訊號 (Test Fire)"):
-        print("[TEST] Manually firing test events...")
         # Mock Attack
         mock_event = {
             "code": "2330", "name": "台積電 (測試)", "scope": "watchlist", "event_type": "STRATEGY",
@@ -771,7 +730,11 @@ with st.sidebar:
             "is_test": True
         }
         dispatcher.dispatch(mock_risk)
-        st.success("測試訊號已發送！請檢查 TG 與 Console。")
+        st.success("測試訊號已發送！")
+
+    st.markdown("---")
+    st.caption(f"Bot: {'✅ 啟用' if TG_BOT_TOKEN else '❌ 未設定'}")
+    st.caption(f"GPT: {'✅ 啟用' if OPENAI_API_KEY else '❌ 未設定'}")
 
 now_time = datetime.now(timezone.utc) + timedelta(hours=8)
 st.caption(f"最後更新: {now_time.strftime('%H:%M:%S')} (每3秒)")
@@ -804,7 +767,6 @@ with watch_container:
         df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
         if use_filter: df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'] < 50)]
         df_watch = df_watch.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'signal': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
-        # B-1: 排序 (A_PLUS > A_MINUS > B)
         df_watch['level_score'] = df_watch['等級'].apply(lambda x: 10 if x == 'A_PLUS' else (5 if x == 'A_MINUS' else 0))
         df_watch = df_watch.sort_values(by=['Pinned', 'level_score', '漲跌%'], ascending=[False, False, False])
         cols_w = ['Pinned', '代碼', '名稱', '等級', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE']
