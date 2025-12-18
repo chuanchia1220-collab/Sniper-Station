@@ -24,7 +24,7 @@ from itertools import cycle
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper v2.5 (Cache)", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v2.5 (Hybrid)", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -308,7 +308,7 @@ def calculate_flags(inst_data, price, price_change_pct):
     return flags if flags else ["—"]
 
 # ==========================================
-# 5. AIAgent (Formatter Role)
+# 5. AIAgent (Formatter Role - Streamlined)
 # ==========================================
 class AIAgent:
     def __init__(self):
@@ -332,6 +332,7 @@ class AIAgent:
             except Exception: pass
 
     def _build_state(self, event):
+        # 這裡會產生法人數據
         inst_data = _get_institutional_3d(event['code'])
         flags = calculate_flags(inst_data, event['price'], event['pct'])
         return {
@@ -346,15 +347,7 @@ class AIAgent:
                 "trust":   {"D": inst_data['trust'][0],   "D-1": inst_data['trust'][1],   "D-2": inst_data['trust'][2]},
                 "dealer":  {"D": inst_data['dealer'][0],  "D-1": inst_data['dealer'][1],  "D-2": inst_data['dealer'][2]}
             },
-            "price_ctx": {
-                "price_vs_vwap_pct": round((event['price'] - event['vwap']) / event['vwap'] * 100, 2),
-                "volume_ratio": event['ratio']
-            },
-            "big_order": {
-                "10m": event.get('net_10m', 0),
-                "1h": event.get('net_1h', 0),
-                "day": event.get('net_day', 0)
-            },
+            # 這裡我們只傳 Flags，因為大戶數據已經在第一則訊息送出了
             "flags": flags
         }
 
@@ -362,14 +355,13 @@ class AIAgent:
         if not openai_client: return
         state_json = json.dumps(self._build_state(event), ensure_ascii=False)
         
+        # System Prompt: 純法人表格 (移除大戶數據要求)
         system_prompt = """
-        你不是分析師，也不是交易顧問。
-        你是「即時市場資料格式化引擎（Market Snapshot Formatter）」。
-
-        專職任務：
-        將輸入資料轉為「極短、可掃描」的 Telegram 快照卡片。
+        你是「即時市場資料格式化引擎」。
         
-        嚴格遵守以下輸出格式 (包含分隔線與符號)：
+        專職任務：將輸入資料轉為「Telegram 法人快照卡片」。
+        
+        嚴格遵守輸出格式：
         
         【法人快照｜{code}｜{time}】
 
@@ -378,17 +370,11 @@ class AIAgent:
         自營：{D}｜{D-1}｜{D-2}
         ────────────────
         合計：{Total_D}｜{Total_D-1}｜{Total_D-2}
-        P/V：{price_vs_vwap_pct}%｜量比 {volume_ratio}
-        10Min 大戶：{10m (強制正負號)} | 1H 大戶：{1h (強制正負號)} | 大戶日：{day (強制正負號)}
         Flags：{flags (用｜分隔)}
 
         規則：
-        1. 法人數據 (外資/投信/自營/合計)：直接顯示數字，正數不需加號，負數顯示負號。
-        2. 大戶數據 (10Min/1H/日)：**必須** 顯示正負號 (例如 +300, -500)。
-        3. 禁止使用任何形容詞 (偏多/偏空/強/弱)。
-        4. 禁止進行解讀、預測或評論。
-        
-        若資料缺失，請顯示 N/A。
+        1. 法人數據：直接顯示數字，正數不需加號，負數顯示負號。
+        2. 禁止解讀、預測或評論。
         """
         user_prompt = f"Input JSON:\n{state_json}"
 
@@ -400,6 +386,7 @@ class AIAgent:
             )
             ai_output = response.choices[0].message.content
             
+            # 使用帶按鈕的發送函式 (戰術按鈕)
             buttons = [
                 [
                     {"text": "📈 TradingView (1m)", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{event['code']}&interval=1"},
@@ -413,7 +400,7 @@ agent = AIAgent()
 agent.start()
 
 # ==========================================
-# 5. Event Dispatcher (Tactical Button Ver.)
+# 5. Event Dispatcher (v37.6 Enhanced)
 # ==========================================
 class EventDispatcher:
     def __init__(self):
@@ -441,18 +428,10 @@ class EventDispatcher:
         if (time.time() - last_time > 600) or is_test:
             st.toast(f"🚀 觸發事件: {trigger} | {code}")
             
-            # 產生戰術按鈕 (修正版)
-            buttons = [
-                [
-                    {"text": "📈 TradingView (1m)", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{code}&interval=1"},
-                    {"text": "📊 Yahoo 走勢", "url": f"https://tw.stock.yahoo.com/quote/{code}.TW"}
-                ]
-            ]
+            # 1. 立即通知 (含大戶、量價數據)
+            self._send_instant_notification(event)
             
-            # 1. 立即通知 (帶按鈕)
-            self._send_instant_notification(event, buttons)
-            
-            # 2. A級事件 -> AI Formatter (這裡會再送一次帶法人按鈕的訊息)
+            # 2. A級事件 -> AI Formatter (純法人快照)
             if trigger in ["🔥攻擊", "💣伏擊"]:
                 agent.push_event(event) 
 
@@ -462,20 +441,40 @@ class EventDispatcher:
 
             self.alert_history[alert_key] = time.time()
 
-    def _send_instant_notification(self, event, buttons=None):
+    def _send_instant_notification(self, event):
         emoji = "💣" if "伏擊" in event['trigger'] else "🚀" if "攻擊" in event['trigger'] else "☠️" if "出貨" in event['trigger'] or "跌破" in event['trigger'] else "👀"
+        
+        # 數據格式化 (強制加號)
+        def fmt_num(n): return f"+{n}" if n > 0 else f"{n}"
+        
+        # 計算 P/V
+        pv_pct = round((event['price'] - event['vwap']) / event['vwap'] * 100, 2)
+        
+        net_10m_str = fmt_num(int(event.get('net_10m', 0)))
+        net_1h_str = fmt_num(int(event.get('net_1h', 0)))
+        net_day_str = fmt_num(int(event.get('net_day', 0)))
+        
         msg = (
             f"{emoji} <b>{event['trigger']}偵測：{event['code']} {event['name']}</b>\n"
             f"現價：{event['price']:.2f} ({event['pct']:.2f}%)\n"
-            f"量比：{event['ratio']:.1f}\n"
-            f"🤖 正在快照法人數據..."
+            f"P/V：{fmt_num(pv_pct)}%｜量比 {event['ratio']:.1f}\n"
+            f"10Min 大戶：{net_10m_str} | 1H 大戶：{net_1h_str} | 大戶日：{net_day_str}"
         )
+        
+        # 戰術按鈕
+        buttons = [
+            [
+                {"text": "📈 TradingView (1m)", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{event['code']}&interval=1"},
+                {"text": "📊 Yahoo 走勢", "url": f"https://tw.stock.yahoo.com/quote/{event['code']}.TW"}
+            ]
+        ]
+        
         send_telegram_message(msg, buttons)
 
 dispatcher = EventDispatcher()
 
 # ==========================================
-# 6. Sniper Engine (Multi-Core + Cache V37.4)
+# 6. Sniper Engine (v37.4 Logic Base)
 # ==========================================
 @st.cache_resource
 class SniperEngine:
@@ -490,8 +489,6 @@ class SniperEngine:
         
         self.daily_active_flags = {} 
         self.daily_risk_flags = {} 
-        
-        # V37.4 Update: 資料快取 (容錯用)
         self.last_valid_data = {} 
         
         self.last_reset_date = datetime.now().date()
@@ -542,19 +539,16 @@ class SniperEngine:
         return None
 
     def _fetch_single_stock(self, code):
-        # 預設回傳值 (全空)
         fallback_res = (code, "Unknown", "Unknown", 0, 0, 0, 0, 0, 0, 0, "DATA_ERROR", time.time(), "DATA_ERROR", "B", "NORMAL")
         
         try:
             q = self._fetch_with_retry(code)
             
-            # V37.4 Logic: 如果抓失敗，檢查 Cache
             if not q:
                 if code in self.last_valid_data:
-                    # 回傳快取資料，但標記為 STALE
                     old_data = list(self.last_valid_data[code])
-                    old_data[12] = "STALE" # update data_status
-                    old_data[11] = time.time() # update time to keep alive
+                    old_data[12] = "STALE" 
+                    old_data[11] = time.time()
                     return tuple(old_data)
                 else:
                     return fallback_res
@@ -595,6 +589,7 @@ class SniperEngine:
                 self.vol_queues[code].append((now_ts, delta_net))
                 self.daily_net[code] = self.daily_net.get(code, 0) + delta_net
             
+            # 計算大戶數據 (10m, 1h, day)
             one_hour_ago = now_ts - 3600
             ten_min_ago = now_ts - 600
             
@@ -678,7 +673,6 @@ class SniperEngine:
                 }
                 dispatcher.dispatch(event)
 
-            # 成功抓取，更新 Cache
             result = (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, net_day, raw_signal, now_ts, "DATA_OK", signal_level, risk_status)
             self.last_valid_data[code] = result
             return result
