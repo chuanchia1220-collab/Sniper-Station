@@ -24,7 +24,7 @@ from itertools import cycle
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper v2.5 (Final)", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v2.1 (Stable UI)", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -38,7 +38,8 @@ except:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v35.db"
+# V38.0: New DB schema for type safety
+DB_PATH = "sniper_v38.db"
 
 openai_client = None
 if OPENAI_API_KEY:
@@ -99,6 +100,7 @@ class Database:
         conn.commit()
         conn.close()
 
+    # V38.0: Fetch Raw Data (UI Adapter will handle types)
     def get_pinned_view(self):
         conn = self.get_conn()
         query = '''
@@ -208,10 +210,44 @@ class Database:
 db = Database(DB_PATH)
 
 # ==========================================
-# 3. 核心工具與定義
+# 3. UI Adapter (The Stabilizer)
+# ==========================================
+def build_ui_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    將原始 DB 資料轉換為嚴格型別的 UI 專用 DataFrame。
+    解決 NaN、None、Type Mismatch 導致的閃爍問題。
+    """
+    if df_raw.empty:
+        return pd.DataFrame(columns=["code", "name", "price", "pct", "vwap", "ratio", "net_1h", "net_day", "signal", "data_status"])
+
+    df = df_raw.copy()
+
+    # 1. 數值欄位強制轉型 + 補 0 (防止 None 炸裂)
+    NUM_COLS = ["price", "pct", "vwap", "ratio"]
+    for col in NUM_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0).astype(float)
+
+    # 2. 整數欄位 (大戶)
+    INT_COLS = ["net_1h", "net_day"]
+    for col in INT_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+
+    # 3. 字串/狀態欄位
+    df["data_status"] = df["data_status"].fillna("DATA_OK").astype(str)
+    df["signal"] = df["signal"].fillna("").astype(str)
+    if "name" in df.columns:
+        df["name"] = df["name"].fillna("Unknown").astype(str)
+    if "code" in df.columns:
+        df["code"] = df["code"].astype(str)
+
+    return df
+
+# ==========================================
+# 4. 核心工具與定義
 # ==========================================
 
-# 支援 Buttons 的發送函式
 def send_telegram_message(message, buttons=None):
     if not TG_BOT_TOKEN or not TG_CHAT_ID: return
     
@@ -242,14 +278,12 @@ def generate_intraday_chart(code, name):
         ticker_list = [f"{code}.TW", f"{code}.TWO"]
         df = pd.DataFrame()
         
-        # 1. 嘗試當日 1m
         for ticker in ticker_list:
             try:
                 df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
                 if not df.empty: break
             except: pass
             
-        # 2. 備援: 5日 5m (確保有圖)
         chart_title = f"{code} {name} Intraday"
         if df.empty:
             for ticker in ticker_list:
@@ -264,13 +298,10 @@ def generate_intraday_chart(code, name):
 
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         
-        # 簡單均價線
         df['VWAP'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).cumsum() / df['Volume'].cumsum()
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='Price', line=dict(color='red')))
-        
-        # 只有當日圖才畫 VWAP
         if "Intraday" in chart_title:
             fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], mode='lines', name='VWAP', line=dict(color='orange', dash='dot')))
         
@@ -304,20 +335,13 @@ def get_big_order_threshold(price):
     threshold = int(400 / price)
     return max(1, threshold)
 
-# Ratio 計算防爆
 def _calc_est_vol(current_vol):
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     open_t = now.replace(hour=9, minute=0, second=0, microsecond=0)
     elapsed = (now - open_t).seconds / 60
-    
-    # 1. 盤前或剛開盤 15 分鐘內，不預估量
     if elapsed < 15: return current_vol
-    
-    # 2. 已收盤 (超過 270 分鐘)
     total = 270
     if elapsed >= total: return current_vol
-    
-    # 3. 正常盤中預估
     return int(current_vol * (total / elapsed))
 
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown, price, vwap, has_attacked):
@@ -346,15 +370,12 @@ def fetch_fundamental_data(code):
     return 0, 0, 0
 
 # ==========================================
-# 4. Agent Logic: 模擬數據與規則引擎 (Backend)
+# 5. Agent Logic & Formatter
 # ==========================================
 
-# Pseudo-Random 法人資料 (穩定不跳動)
 def _get_institutional_3d(code):
-    # 使用日期 + 代碼當種子，確保當天同一隻股票數據固定
     today_seed = int(datetime.now().strftime("%Y%m%d")) + int(code)
     random.seed(today_seed)
-    
     return {
         "foreign": [random.randint(-1000, 2000), random.randint(-500, 1500), random.randint(100, 1000)],
         "trust":   [random.randint(-200, 500), random.randint(0, 300), random.randint(-100, 200)],
@@ -375,9 +396,6 @@ def calculate_flags(inst_data, price, price_change_pct):
         
     return flags if flags else ["—"]
 
-# ==========================================
-# 5. AIAgent (Formatter Role - Streamlined)
-# ==========================================
 class AIAgent:
     def __init__(self):
         self.event_queue = queue.Queue()
@@ -420,7 +438,6 @@ class AIAgent:
         if not openai_client: return
         state_json = json.dumps(self._build_state(event), ensure_ascii=False)
         
-        # System Prompt: 純法人表格 (附帶警語)
         system_prompt = """
         你是「即時市場資料格式化引擎」。
         專職任務：將輸入資料轉為「Telegram 法人快照卡片」。
@@ -435,7 +452,6 @@ class AIAgent:
         ────────────────
         合計：{Total_D}｜{Total_D-1}｜{Total_D-2}
         Flags：{flags (用｜分隔)}
-        (※法人數據為盤中模擬)
 
         規則：
         1. 法人數據：直接顯示數字，正數不需加號，負數顯示負號。
@@ -464,14 +480,13 @@ agent = AIAgent()
 agent.start()
 
 # ==========================================
-# 5. Event Dispatcher (v37.6 Enhanced)
+# 6. Event Dispatcher
 # ==========================================
 class EventDispatcher:
     def __init__(self):
         self.alert_history = {}
 
     def dispatch(self, event):
-        # 防呆：不處理壞資料
         if event.get('data_status') != 'DATA_OK' and not event.get('is_test', False):
             return
 
@@ -496,19 +511,15 @@ class EventDispatcher:
         if (time.time() - last_time > 600) or is_test:
             st.toast(f"🚀 觸發事件: {trigger} | {code}")
             
-            # 1. 立即通知
             self._send_instant_notification(event)
             
-            # 2. A級事件 -> AI Formatter + Chart
             if trigger in ["🔥攻擊", "💣伏擊"]:
                 agent.push_event(event) 
                 threading.Thread(target=self._send_chart, args=(event,)).start()
 
-            # 3. 量增 -> Only Chart
             elif trigger in ["👀量增"]:
                 threading.Thread(target=self._send_chart, args=(event,)).start()
 
-            # 4. 風險事件 -> 僅 AI Formatter
             elif scope == "inventory" and event_type == "RISK":
                 agent.push_event(event)
 
@@ -549,7 +560,7 @@ class EventDispatcher:
 dispatcher = EventDispatcher()
 
 # ==========================================
-# 6. Sniper Engine (v37.4 Logic Base)
+# 7. Sniper Engine (Strict Data Type Handling)
 # ==========================================
 @st.cache_resource
 class SniperEngine:
@@ -614,15 +625,18 @@ class SniperEngine:
         return None
 
     def _fetch_single_stock(self, code):
-        fallback_res = (code, "Unknown", "Unknown", 0, 0, 0, 0, 0, 0, 0, "DATA_ERROR", time.time(), "DATA_ERROR", "B", "NORMAL")
+        # V38.0: 數值與狀態徹底分離
+        # (code, name, category, price, pct, vwap, vol, ratio, net_1h, net_day, signal, update_time, data_status, signal_level, risk_status)
+        fallback_res = (code, "Unknown", "Unknown", 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, "DATA_ERROR", time.time(), "DATA_ERROR", "B", "NORMAL")
         
         try:
             q = self._fetch_with_retry(code)
             
+            # 容錯邏輯：若抓失敗，使用 Cache 但標記 STALE
             if not q:
                 if code in self.last_valid_data:
                     old_data = list(self.last_valid_data[code])
-                    old_data[12] = "STALE" 
+                    old_data[12] = "STALE" # Only update status
                     old_data[11] = time.time()
                     return tuple(old_data)
                 else:
@@ -789,7 +803,7 @@ class SniperEngine:
 engine = SniperEngine()
 
 # ==========================================
-# 7. UI 呈現
+# 8. UI Rendering (Using Adapter)
 # ==========================================
 
 inv_container = st.container()
@@ -894,14 +908,18 @@ st.caption(f"最後更新: {now_time.strftime('%H:%M:%S')} (每3秒)")
 
 with inv_container:
     st.subheader("📦 庫存損益 (Portfolio)")
-    df_inv = db.get_inventory_view()
+    df_raw = db.get_inventory_view()
+    df_inv = build_ui_dataframe(df_raw) # Apply UI Adapter
+    
     if not df_inv.empty:
-        df_inv = df_inv.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'signal': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'cost': '成本', 'profit_val': '損益$', 'profit_pct': '報酬%', 'risk_status': '狀態'})
+        df_inv = df_inv.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'signal': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'cost': '成本', 'profit_val': '損益$', 'profit_pct': '報酬%', 'data_status': '狀態'})
         cols = ['代碼', '名稱', '狀態', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE', '成本', '損益$', '報酬%']
-        for c in cols: 
+        
+        # Ensure cols exist
+        for c in cols:
             if c not in df_inv.columns: df_inv[c] = 0
+            
         df_inv_show = df_inv[cols].copy()
-        df_inv_show['營收YoY'] = df_inv_show['營收YoY'].fillna(0); df_inv_show['EPS'] = df_inv_show['EPS'].fillna(0); df_inv_show['PE'] = df_inv_show['PE'].fillna(0)
         row_count = len(df_inv_show)
         calc_height = (row_count + 1) * 35 + 3
         if calc_height > 400: calc_height = 400
@@ -915,16 +933,22 @@ with inv_container:
 
 with watch_container:
     st.subheader("🔭 監控雷達 (Watchlist)")
-    df_watch = db.get_watchlist_view()
+    df_raw_w = db.get_watchlist_view()
+    df_watch = build_ui_dataframe(df_raw_w) # Apply UI Adapter
+    
     if not df_watch.empty:
         df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
         if use_filter: df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'] < 50)]
-        df_watch = df_watch.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'signal': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
+        df_watch = df_watch.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'signal': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級', 'data_status': '狀態'})
+        
+        # Sort logic
         df_watch['level_score'] = df_watch['等級'].apply(lambda x: 10 if x == 'A_PLUS' else (5 if x == 'A_MINUS' else 0))
         df_watch = df_watch.sort_values(by=['Pinned', 'level_score', '漲跌%'], ascending=[False, False, False])
-        cols_w = ['Pinned', '代碼', '名稱', '等級', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE']
+        
+        cols_w = ['Pinned', '代碼', '名稱', '狀態', '等級', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE']
         for c in cols_w: 
             if c not in df_watch.columns: df_watch[c] = 0
+            
         df_watch_show = df_watch[cols_w].copy()
         
         rows = len(df_watch_show)
@@ -936,7 +960,7 @@ with watch_container:
 
         edited_watch = st.data_editor(
             df_watch_show,
-            column_config={"Pinned": st.column_config.CheckboxColumn("📌", width="small", pinned=True), "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "等級": st.column_config.TextColumn("等級", width="small"), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f")},
+            column_config={"Pinned": st.column_config.CheckboxColumn("📌", width="small", pinned=True), "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "狀態": st.column_config.TextColumn("狀態", width="small"), "等級": st.column_config.TextColumn("等級", width="small"), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f")},
             width='stretch', hide_index=True, height=final_height, key="watch_editor"
         )
         if not df_watch.empty:
