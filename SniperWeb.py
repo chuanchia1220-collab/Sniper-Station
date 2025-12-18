@@ -24,7 +24,7 @@ from itertools import cycle
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper v2.5 (UI Sync)", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v3.0 (架構重構)", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -38,7 +38,7 @@ except:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v39.db"
+DB_PATH = "sniper_v40.db"
 
 openai_client = None
 if OPENAI_API_KEY:
@@ -55,7 +55,21 @@ DEFAULT_WATCHLIST = (
 DEFAULT_INVENTORY = """2330,800,1\n2317,105,5"""
 
 # ==========================================
-# 2. 資料庫層 (SQLite)
+# 2. MarketSession (單一事實來源)
+# ==========================================
+class MarketSession:
+    """盤中判斷的唯一來源"""
+    MARKET_OPEN = dt_time(9, 0)
+    MARKET_CLOSE = dt_time(13, 35)
+
+    @staticmethod
+    def is_market_open(now=None):
+        if not now:
+            now = datetime.now(timezone.utc) + timedelta(hours=8)
+        return MarketSession.MARKET_OPEN <= now.time() <= MarketSession.MARKET_CLOSE
+
+# ==========================================
+# 3. 資料庫層 (SQLite)
 # ==========================================
 class Database:
     def __init__(self, db_path):
@@ -68,7 +82,6 @@ class Database:
     def init_db(self):
         conn = self.get_conn()
         c = conn.cursor()
-        # V39.0: Add 'last_alert_time' to avoid spamming
         c.execute('''CREATE TABLE IF NOT EXISTS realtime (
             code TEXT PRIMARY KEY, name TEXT, category TEXT,
             price REAL, pct REAL, vwap REAL, vol REAL, ratio REAL,
@@ -218,12 +231,10 @@ class Database:
 db = Database(DB_PATH)
 
 # ==========================================
-# 3. UI Adapter (The Stabilizer)
+# 4. UI Adapter (The Stabilizer)
 # ==========================================
 def build_ui_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    將原始 DB 資料轉換為嚴格型別的 UI 專用 DataFrame。
-    """
+    """將原始 DB 資料轉換為嚴格型別的 UI 專用 DataFrame"""
     if df_raw.empty:
         return pd.DataFrame(columns=["code", "name", "price", "pct", "vwap", "ratio", "net_1h", "net_10m", "net_day", "signal", "data_status", "last_alert_time"])
 
@@ -249,10 +260,11 @@ def build_ui_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==========================================
-# 4. 核心工具與定義
+# 5. 核心工具與定義
 # ==========================================
 
 def send_telegram_message(message, buttons=None):
+    """唯一 Telegram 發送接口 (僅供 TelegramWorker 使用)"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID: return
     
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -270,6 +282,7 @@ def send_telegram_message(message, buttons=None):
     except: pass
 
 def send_telegram_photo(caption, image_bytes):
+    """唯一 Telegram 圖片發送接口"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
     payload = {"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
@@ -304,6 +317,7 @@ def generate_intraday_chart(code, name):
         
         df['VWAP'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).cumsum() / df['Volume'].cumsum()
 
+        import plotly.graph_objects as go
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='Price', line=dict(color='red')))
         if "Intraday" in chart_title:
@@ -374,10 +388,6 @@ def fetch_fundamental_data(code):
         except: continue
     return 0, 0, 0
 
-# ==========================================
-# 4. Agent Logic: 模擬數據與規則引擎 (Backend)
-# ==========================================
-
 def _get_institutional_3d(code):
     today_seed = int(datetime.now().strftime("%Y%m%d")) + int(code)
     random.seed(today_seed)
@@ -402,7 +412,135 @@ def calculate_flags(inst_data, price, price_change_pct):
     return flags if flags else ["—"]
 
 # ==========================================
-# 5. AIAgent (Formatter Role)
+# 6. NotificationManager (核心控制層)
+# ==========================================
+class NotificationManager:
+    """唯一決定「是否推播」的地方"""
+    def __init__(self):
+        self.notification_queue = queue.Queue()
+        self.cooldown_cache = {}  # {code: last_trigger_time}
+        self.COOLDOWN_SECONDS = 600  # 10分鐘冷卻
+
+    def should_notify(self, event):
+        """決策核心：是否推播"""
+        # Test 事件永遠推
+        if event.get('is_test', False):
+            return True
+        
+        # 非 DATA_OK 不推
+        if event.get('data_status') != 'DATA_OK':
+            return False
+        
+        # 盤後不推 (唯一判斷點)
+        if not MarketSession.is_market_open():
+            return False
+        
+        # 冷卻檢查
+        if self.is_in_cooldown(event):
+            return False
+        
+        return True
+
+    def is_in_cooldown(self, event):
+        code = event['code']
+        trigger = event['trigger']
+        key = f"{code}_{trigger}"
+        
+        if key in self.cooldown_cache:
+            last_time = self.cooldown_cache[key]
+            if time.time() - last_time < self.COOLDOWN_SECONDS:
+                return True
+        
+        return False
+
+    def enqueue(self, event):
+        """接收 Event，決定是否放入推播佇列"""
+        if self.should_notify(event):
+            self.cooldown_cache[f"{event['code']}_{event['trigger']}"] = time.time()
+            self.notification_queue.put(event)
+
+    def get_notification(self, timeout=1):
+        """供 TelegramWorker 取用"""
+        try:
+            return self.notification_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+notification_manager = NotificationManager()
+
+# ==========================================
+# 7. TelegramWorker (唯一推播出口)
+# ==========================================
+class TelegramWorker:
+    """單一 Thread 負責所有 Telegram 推播"""
+    def __init__(self):
+        self.is_running = False
+        self.worker_thread = None
+
+    def start(self):
+        if self.is_running: return
+        self.is_running = True
+        self.worker_thread = threading.Thread(target=self._run, daemon=True)
+        self.worker_thread.start()
+
+    def stop(self):
+        self.is_running = False
+
+    def _run(self):
+        while self.is_running:
+            notification = notification_manager.get_notification(timeout=1)
+            if notification:
+                self._send(notification)
+
+    def _send(self, event):
+        """實際發送邏輯"""
+        emoji = "💣" if "伏擊" in event['trigger'] else "🚀" if "攻擊" in event['trigger'] else "☠️" if "出貨" in event['trigger'] or "跌破" in event['trigger'] else "👀"
+        
+        def fmt_num(n): return f"+{n}" if n > 0 else f"{n}"
+        
+        pv_pct = round((event['price'] - event['vwap']) / event['vwap'] * 100, 2)
+        net_10m_str = fmt_num(int(event.get('net_10m', 0)))
+        net_1h_str = fmt_num(int(event.get('net_1h', 0)))
+        net_day_str = fmt_num(int(event.get('net_day', 0)))
+        
+        msg = (
+            f"{emoji} <b>{event['trigger']}偵測：{event['code']} {event['name']}</b>\n"
+            f"現價：{event['price']:.2f} ({event['pct']:.2f}%)\n"
+            f"P/V：{fmt_num(pv_pct)}%｜量比 {event['ratio']:.1f}\n"
+            f"10Min 大戶：{net_10m_str} | 1H 大戶：{net_1h_str} | 大戶日：{net_day_str}"
+        )
+        
+        buttons = [
+            [
+                {"text": "📈 TradingView (1m)", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{event['code']}&interval=1"},
+                {"text": "📊 Yahoo 走勢", "url": f"https://tw.stock.yahoo.com/quote/{event['code']}.TW"}
+            ]
+        ]
+        
+        send_telegram_message(msg, buttons)
+        
+        # 附加處理
+        if event['trigger'] in ["🔥攻擊", "💣伏擊"]:
+            if openai_client:
+                agent.push_event(event)
+            threading.Thread(target=self._send_chart, args=(event,), daemon=True).start()
+        elif event['trigger'] in ["👀量增"]:
+            threading.Thread(target=self._send_chart, args=(event,), daemon=True).start()
+        elif event['scope'] == "inventory" and event['event_type'] == "RISK":
+            if openai_client:
+                agent.push_event(event)
+
+    def _send_chart(self, event):
+        img_bytes = generate_intraday_chart(event['code'], event['name'])
+        if img_bytes:
+            caption = f"📉 <b>{event['code']} 當日走勢參考 (非預測)</b>\nTrigger: {event['trigger']}"
+            send_telegram_photo(caption, img_bytes)
+
+telegram_worker = TelegramWorker()
+telegram_worker.start()
+
+# ==========================================
+# 8. AIAgent (Formatter Role)
 # ==========================================
 class AIAgent:
     def __init__(self):
@@ -489,498 +627,10 @@ agent = AIAgent()
 agent.start()
 
 # ==========================================
-# 5. Event Dispatcher (Sync with UI)
+# 9. EventDispatcher (僅產生 Event)
 # ==========================================
 class EventDispatcher:
-    def __init__(self):
-        pass # V39.0: Logic moved to UI thread
-
+    """不再直接推播，只負責產生 Event"""
     def dispatch(self, event):
-        # V39.0: Background thread NO LONGER sends messages.
-        # It only updates DB status for UI to pick up.
-        # Except for test events which are manual.
-        if event.get('is_test', False):
-            self._send_instant_notification(event)
-            if event['trigger'] in ["🔥攻擊", "💣伏擊"]:
-                agent.push_event(event) 
-                threading.Thread(target=self._send_chart, args=(event,)).start()
-            elif event['scope'] == "inventory" and event['event_type'] == "RISK":
-                agent.push_event(event)
-
-    def _send_instant_notification(self, event):
-        emoji = "💣" if "伏擊" in event['trigger'] else "🚀" if "攻擊" in event['trigger'] else "☠️" if "出貨" in event['trigger'] or "跌破" in event['trigger'] else "👀"
-        
-        def fmt_num(n): return f"+{n}" if n > 0 else f"{n}"
-        
-        pv_pct = round((event['price'] - event['vwap']) / event['vwap'] * 100, 2)
-        net_10m_str = fmt_num(int(event.get('net_10m', 0)))
-        net_1h_str = fmt_num(int(event.get('net_1h', 0)))
-        net_day_str = fmt_num(int(event.get('net_day', 0)))
-        
-        msg = (
-            f"{emoji} <b>{event['trigger']}偵測：{event['code']} {event['name']}</b>\n"
-            f"現價：{event['price']:.2f} ({event['pct']:.2f}%)\n"
-            f"P/V：{fmt_num(pv_pct)}%｜量比 {event['ratio']:.1f}\n"
-            f"10Min 大戶：{net_10m_str} | 1H 大戶：{net_1h_str} | 大戶日：{net_day_str}"
-        )
-        
-        buttons = [
-            [
-                {"text": "📈 TradingView (1m)", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{event['code']}&interval=1"},
-                {"text": "📊 Yahoo 走勢", "url": f"https://tw.stock.yahoo.com/quote/{event['code']}.TW"}
-            ]
-        ]
-        
-        send_telegram_message(msg, buttons)
-
-    def _send_chart(self, event):
-        img_bytes = generate_intraday_chart(event['code'], event['name'])
-        if img_bytes:
-            caption = f"📉 <b>{event['code']} 當日走勢參考 (非預測)</b>\nTrigger: {event['trigger']}"
-            send_telegram_photo(caption, img_bytes)
-
-dispatcher = EventDispatcher()
-
-# ==========================================
-# 6. Sniper Engine (v37.4 Logic Base)
-# ==========================================
-@st.cache_resource
-class SniperEngine:
-    def __init__(self):
-        self.is_running = False
-        self.targets = []
-        self.inventory_codes = []
-        self.vol_queues = {} 
-        self.daily_net = {} 
-        self.prev_data = {} 
-        self.history_vol = {}
-        
-        self.daily_active_flags = {} 
-        self.daily_risk_flags = {} 
-        self.last_valid_data = {} 
-        
-        self.last_reset_date = datetime.now().date()
-        self.clients = [] 
-        self.client_cycler = None 
-        
-        self._init_clients()
-        self.update_targets()
-
-    def _init_clients(self):
-        if not API_KEYS: return
-        valid_clients = []
-        for key in API_KEYS:
-            try: 
-                client = RestClient(api_key=key)
-                valid_clients.append(client)
-            except: pass
-        self.clients = valid_clients
-        if self.clients:
-            self.client_cycler = cycle(self.clients)
-
-    def update_targets(self):
-        self.targets = db.get_all_targets()
-        self.inventory_codes = db.get_inventory_codes()
-
-    def start(self):
-        if self.is_running: return
-        self.update_targets()
-        self.is_running = True
-        threading.Thread(target=self._run_loop, daemon=True).start()
-
-    def stop(self):
-        self.is_running = False
-
-    def _fetch_with_retry(self, code):
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                client = next(self.client_cycler) if self.client_cycler else None
-                if not client: return None
-                q = client.stock.intraday.quote(symbol=code)
-                return q
-            except Exception as e:
-                if "429" in str(e) or "limit" in str(e).lower():
-                    time.sleep(0.1) 
-                    continue 
-                return None 
-        return None
-
-    def _fetch_single_stock(self, code):
-        fallback_res = (code, "Unknown", "Unknown", 0, 0, 0, 0, 0, 0, 0, "DATA_ERROR", time.time(), "DATA_ERROR", "B", "NORMAL", 0)
-        
-        try:
-            q = self._fetch_with_retry(code)
-            
-            if not q:
-                if code in self.last_valid_data:
-                    old_data = list(self.last_valid_data[code])
-                    old_data[12] = "STALE" 
-                    old_data[11] = time.time()
-                    return tuple(old_data)
-                else:
-                    return fallback_res
-
-            price = q.get('lastPrice', q.get('previousClose', 0))
-            if price is None or price == 0:
-                if code in self.last_valid_data:
-                    old_data = list(self.last_valid_data[code])
-                    old_data[12] = "STALE"
-                    return tuple(old_data)
-                return fallback_res
-
-            pct = q.get('changePercent', 0)
-            vol = q.get('total', {}).get('tradeVolume', 0) * 1000
-            total_val = q.get('total', {}).get('tradeValue', 0)
-            vwap = total_val / vol if vol > 0 else price
-            
-            if code not in self.history_vol: self.history_vol[code] = 1000 
-            
-            base_vol = self.history_vol.get(code, 1000)
-            est_vol = _calc_est_vol(q.get('total', {}).get('tradeVolume', 0))
-            ratio = est_vol / base_vol if base_vol > 0 else 0
-            
-            delta_net = 0
-            if code in self.prev_data:
-                prev_v = self.prev_data[code]['vol']
-                prev_p = self.prev_data[code]['price']
-                delta_v = (vol - prev_v) / 1000
-                threshold = get_big_order_threshold(price)
-                if delta_v >= threshold:
-                    if price >= prev_p: delta_net = int(delta_v)
-                    elif price < prev_p: delta_net = -int(delta_v)
-            
-            self.prev_data[code] = {'vol': vol, 'price': price}
-            now_ts = time.time()
-            if code not in self.vol_queues: self.vol_queues[code] = []
-            if delta_net != 0:
-                self.vol_queues[code].append((now_ts, delta_net))
-                self.daily_net[code] = self.daily_net.get(code, 0) + delta_net
-            
-            # Big Order Calc
-            one_hour_ago = now_ts - 3600
-            ten_min_ago = now_ts - 600
-            
-            self.vol_queues[code] = [x for x in self.vol_queues[code] if x[0] > one_hour_ago]
-            net_1h = sum(x[1] for x in self.vol_queues[code])
-            net_10m = sum(x[1] for x in self.vol_queues[code] if x[0] > ten_min_ago)
-            net_day = self.daily_net.get(code, 0)
-            
-            tgt_pct, tgt_ratio = get_dynamic_thresholds(price)
-            is_bullish = price >= vwap
-            is_breakdown = price < (vwap * 0.99)
-            
-            # V39.0: Strict Time Check (收盤後不計算信號)
-            now = datetime.now(timezone.utc) + timedelta(hours=8)
-            market_close = dt_time(13, 35)
-            is_after_market = now.time() > market_close
-            
-            event_type = "STRATEGY"
-            signal_level = "B"
-            risk_status = "NORMAL"
-            trigger = None
-            raw_signal = "盤整"
-
-            if not is_after_market:
-                if code in self.daily_risk_flags:
-                    risk_status = "RISK_LOCKED"
-                
-                has_active_signal = False
-                if code in self.daily_active_flags and (self.daily_active_flags[code] & {"ATTACK", "AMBUSH"}):
-                    has_active_signal = True
-
-                raw_signal = check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown, price, vwap, has_active_signal)
-                
-                scope = "inventory" if code in self.inventory_codes else "watchlist"
-
-                if scope == "inventory":
-                    if pct <= -2.0:
-                        trigger = "跌破-2%"
-                        event_type = "RISK"
-                        risk_status = "RISK_LOCKED"
-                        if code not in self.daily_risk_flags:
-                            self.daily_risk_flags.setdefault(code, set()).add("BREAKDOWN")
-                        else: trigger = None 
-
-                    elif "出貨" in raw_signal:
-                        trigger = "💀出貨"
-                        event_type = "RISK"
-                        risk_status = "RISK_LOCKED"
-                        if code not in self.daily_risk_flags:
-                            self.daily_risk_flags.setdefault(code, set()).add("DISTRIBUTION")
-                        else: trigger = None
-
-                    elif "攻擊" in raw_signal and not has_active_signal:
-                        trigger = "🔥攻擊"
-                        signal_level = "A_PLUS"
-                        self.daily_active_flags.setdefault(code, set()).add("ATTACK")
-
-                if scope == "watchlist":
-                    if not has_active_signal:
-                        if "攻擊" in raw_signal:
-                            trigger = "🔥攻擊"
-                            signal_level = "A_PLUS"
-                            self.daily_active_flags.setdefault(code, set()).add("ATTACK")
-                        elif "伏擊" in raw_signal:
-                            trigger = "💣伏擊"
-                            signal_level = "A_PLUS"
-                            self.daily_active_flags.setdefault(code, set()).add("AMBUSH")
-                    
-                    if not trigger and "量增" in raw_signal:
-                        trigger = "👀量增"
-                        signal_level = "A_MINUS"
-
-            # V39.0: Background thread only updates DB, no dispatch
-            result = (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, net_day, trigger if trigger else raw_signal, now_ts, "DATA_OK", signal_level, risk_status, net_10m)
-            self.last_valid_data[code] = result
-            return result
-
-        except Exception:
-            if code in self.last_valid_data:
-                old_data = list(self.last_valid_data[code])
-                old_data[12] = "STALE"
-                return tuple(old_data)
-            return fallback_res
-
-    def _run_loop(self):
-        while self.is_running:
-            if not self.targets: time.sleep(1); continue
-            
-            now = datetime.now(timezone.utc) + timedelta(hours=8)
-            if now.date() > self.last_reset_date:
-                self.daily_active_flags = {}
-                self.daily_risk_flags = {}
-                self.last_reset_date = now.date()
-
-            market_open = dt_time(9, 0)
-            market_close = dt_time(13, 35)
-            is_market_open = market_open <= now.time() <= market_close
-            sleep_time = 3.0 if is_market_open else 10
-            
-            batch_data = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                futures = []
-                for code in self.targets:
-                    futures.append(executor.submit(self._fetch_single_stock, code))
-                for future in concurrent.futures.as_completed(futures):
-                    res = future.result()
-                    if res: batch_data.append(res)
-            
-            if batch_data: db.upsert_realtime_batch(batch_data)
-            time.sleep(sleep_time)
-
-engine = SniperEngine()
-
-# ==========================================
-# 7. UI Rendering (Using Adapter & Sync Dispatch)
-# ==========================================
-
-inv_container = st.container()
-st.divider()
-watch_container = st.container()
-
-with st.sidebar:
-    st.title("⚙️ 戰情室設定")
-    mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
-    st.subheader("🔍 濾網設定")
-    use_filter = st.checkbox("只看基本面良好")
-    if use_filter: st.caption("條件：YoY > 0, EPS > 0, PE < 50")
-
-    if mode == "👨‍✈️ 指揮官":
-        with st.expander("📦 庫存管理 (Inventory)", expanded=False):
-            inv_input = st.text_area("庫存清單 (代碼,成本,張數)", DEFAULT_INVENTORY, height=100)
-            if st.button("更新庫存"):
-                db.update_inventory_list(inv_input)
-                engine.update_targets()
-                st.toast("庫存已更新！")
-
-        with st.expander("🔭 監控設定 (Watchlist)", expanded=True):
-            raw_input = st.text_area("新選清單", DEFAULT_WATCHLIST, height=150)
-            if st.button("1. 初始化並更新清單", type="primary"):
-                if not API_KEYS:
-                    st.error("缺 API Key")
-                else:
-                    db.update_watchlist(raw_input)
-                    engine.update_targets()
-                    targets = engine.targets
-                    status = st.status("正在初始化數據 (含基本面)...", expanded=True)
-                    client_iter = cycle(engine.clients) if engine.clients else None
-                    
-                    history_vol = {}
-                    static_list = []
-                    progress_bar = status.progress(0)
-                    for i, code in enumerate(targets):
-                        try:
-                            client = next(client_iter) if client_iter else None
-                            if client:
-                                candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=2)
-                                if candles and 'data' in candles and len(candles['data']) >= 2:
-                                    history_vol[code] = int(candles['data'][-2]['volume']) // 1000
-                                else: history_vol[code] = 1000
-                            else: history_vol[code] = 1000
-                        except: history_vol[code] = 1000
-                        
-                        yoy, eps, pe = fetch_fundamental_data(code)
-                        static_list.append((code, 0, 0, yoy, eps, pe))
-                        progress_bar.progress((i + 1) / len(targets))
-                        time.sleep(0.1)
-                        
-                    engine.history_vol = history_vol
-                    db.upsert_static(static_list)
-                    status.update(label="初始化完成！", state="complete")
-                    
-            if st.checkbox("2. 啟動監控核心", value=engine.is_running):
-                if not engine.is_running: engine.start(); st.toast("核心已啟動")
-            else: engine.stop()
-
-    st.markdown("---")
-    
-    tg_status = "✅" if TG_BOT_TOKEN and TG_CHAT_ID else "❌ Missing"
-    gpt_status = "✅" if OPENAI_API_KEY else "❌ Missing"
-    key_count = len(engine.clients)
-    key_status = f"✅ {key_count} Keys Ready" if key_count > 0 else "❌ No Keys"
-        
-    st.caption(f"Fugle: {key_status}")
-    st.caption(f"Telegram: {tg_status}")
-    st.caption(f"GPT: {gpt_status}")
-
-    st.subheader("🧪 系統測試 (盤後專用)")
-    if st.button("發送測試訊號 (Test Fire 🔥)"):
-        mock_event = {
-            "code": "2330", "name": "台積電 (測試)", "scope": "watchlist", "event_type": "STRATEGY",
-            "trigger": "🔥攻擊", "price": 888.0, "pct": 3.5, "vwap": 870.0, "ratio": 2.5, "net_10m": 150, "net_1h": 500, "net_day": 1200, "timestamp": time.time(),
-            "is_test": True
-        }
-        dispatcher.dispatch(mock_event)
-        st.success("測試「攻擊」訊號已發送！")
-        
-    if st.button("發送測試訊號 (Test Ambush 💣)"):
-        mock_ambush = {
-            "code": "2603", "name": "長榮 (測試)", "scope": "watchlist", "event_type": "STRATEGY",
-            "trigger": "💣伏擊", "price": 155.5, "pct": 0.8, "vwap": 155.0, "ratio": 12.5, "net_10m": 300, "net_1h": 800, "net_day": 1500, "timestamp": time.time(),
-            "is_test": True
-        }
-        dispatcher.dispatch(mock_ambush)
-        st.success("測試「伏擊」訊號已發送！")
-
-    if st.button("發送測試訊號 (Test Risk 💀)"):
-        mock_risk = {
-            "code": "2317", "name": "鴻海 (測試)", "scope": "inventory", "event_type": "RISK",
-            "trigger": "💀出貨", "price": 100.0, "pct": -2.5, "vwap": 103.0, "ratio": 1.8, "net_10m": -100, "net_1h": -300, "net_day": -800, "timestamp": time.time(),
-            "is_test": True
-        }
-        dispatcher.dispatch(mock_risk)
-        st.success("測試「風險」訊號已發送！")
-
-now_time = datetime.now(timezone.utc) + timedelta(hours=8)
-st.caption(f"最後更新: {now_time.strftime('%H:%M:%S')} (每3秒)")
-
-# V39.0: Dispatch Logic moved to UI Thread (Sync Check)
-def check_and_dispatch(df, scope):
-    if df.empty: return
-    
-    # Check for active signals
-    triggered = df[df['signal'].isin(["🔥攻擊", "💣伏擊", "👀量增", "💀出貨", "跌破-2%"])]
-    
-    for _, row in triggered.iterrows():
-        # Prevent spam: Check last alert time (e.g. 10 mins cooldown)
-        if time.time() - row['last_alert_time'] > 600:
-            
-            event = {
-                "code": row['code'],
-                "name": row['name'],
-                "scope": scope,
-                "event_type": "RISK" if row['signal'] in ["💀出貨", "跌破-2%"] else "STRATEGY",
-                "trigger": row['signal'],
-                "price": row['price'],
-                "pct": row['pct'],
-                "vwap": row['vwap'],
-                "ratio": row['ratio'],
-                "net_1h": row['net_1h'],
-                "net_10m": row['net_10m'],
-                "net_day": row['net_day'],
-                "timestamp": time.time(),
-                "data_status": row['data_status']
-            }
-            
-            # Send Notification from UI Thread
-            if event['data_status'] == 'DATA_OK':
-                dispatcher._send_instant_notification(event)
-                if event['trigger'] in ["🔥攻擊", "💣伏擊"]:
-                    agent.push_event(event)
-                    threading.Thread(target=dispatcher._send_chart, args=(event,)).start()
-                elif event['trigger'] in ["👀量增"]:
-                    threading.Thread(target=dispatcher._send_chart, args=(event,)).start()
-                elif scope == "inventory" and event['event_type'] == "RISK":
-                    agent.push_event(event)
-                
-                # Update DB to prevent re-trigger
-                db.update_last_alert_time(row['code'], time.time())
-
-with inv_container:
-    st.subheader("📦 庫存損益 (Portfolio)")
-    df_raw = db.get_inventory_view()
-    df_inv = build_ui_dataframe(df_raw) 
-    
-    if not df_inv.empty:
-        # Check Dispatch
-        check_and_dispatch(df_inv, "inventory")
-        
-        df_inv = df_inv.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'signal': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'cost': '成本', 'profit_val': '損益$', 'profit_pct': '報酬%', 'data_status': '狀態'})
-        cols = ['代碼', '名稱', '狀態', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE', '成本', '損益$', '報酬%']
-        for c in cols:
-            if c not in df_inv.columns: df_inv[c] = 0
-        df_inv_show = df_inv[cols].copy()
-        row_count = len(df_inv_show)
-        calc_height = (row_count + 1) * 35 + 3
-        if calc_height > 400: calc_height = 400
-        
-        st.data_editor(
-            df_inv_show,
-            column_config={"代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "狀態": st.column_config.TextColumn("狀態", width="small"), "成本": st.column_config.NumberColumn("成本", format="%.2f"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f"), "損益$": st.column_config.NumberColumn("損益$", format="%d"), "報酬%": st.column_config.NumberColumn("報酬%", format="%.2f%%"), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f")},
-            width='stretch', hide_index=True, height=calc_height, disabled=True, key="inv_table"
-        )
-    else: st.info("尚無庫存資料，請在左側「指揮官」模式設定。")
-
-with watch_container:
-    st.subheader("🔭 監控雷達 (Watchlist)")
-    df_raw_w = db.get_watchlist_view()
-    df_watch = build_ui_dataframe(df_raw_w) 
-    
-    if not df_watch.empty:
-        # Check Dispatch
-        check_and_dispatch(df_watch, "watchlist")
-    
-        df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
-        if use_filter: df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'] < 50)]
-        df_watch = df_watch.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'signal': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級', 'data_status': '狀態'})
-        
-        df_watch['level_score'] = df_watch['等級'].apply(lambda x: 10 if x == 'A_PLUS' else (5 if x == 'A_MINUS' else 0))
-        df_watch = df_watch.sort_values(by=['Pinned', 'level_score', '漲跌%'], ascending=[False, False, False])
-        
-        cols_w = ['Pinned', '代碼', '名稱', '狀態', '等級', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE']
-        for c in cols_w: 
-            if c not in df_watch.columns: df_watch[c] = 0
-            
-        df_watch_show = df_watch[cols_w].copy()
-        
-        rows = len(df_watch_show)
-        row_height = 35
-        max_rows = 45 
-        calc_height = (rows + 1) * row_height + 5
-        limit_height = (max_rows + 1) * row_height + 5
-        final_height = max(min(calc_height, limit_height), 300)
-
-        edited_watch = st.data_editor(
-            df_watch_show,
-            column_config={"Pinned": st.column_config.CheckboxColumn("📌", width="small", pinned=True), "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "狀態": st.column_config.TextColumn("狀態", width="small"), "等級": st.column_config.TextColumn("等級", width="small"), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f")},
-            width='stretch', hide_index=True, height=final_height, key="watch_editor"
-        )
-        if not df_watch.empty:
-            changes = edited_watch[['代碼', 'Pinned']].set_index('代碼')
-            for index, row in changes.iterrows(): db.update_pinned(index, row['Pinned'])
-    else: st.info("尚無監控資料。")
-
-time.sleep(3)
-st.rerun()
-
+        """將 Event 交給 NotificationManager 決定是否推播"""
+        notification_manager.enqueue(event)
