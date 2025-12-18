@@ -24,7 +24,7 @@ from itertools import cycle
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper v2.5 (Hybrid)", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v2.5 (Final)", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -229,6 +229,62 @@ def send_telegram_message(message, buttons=None):
     try: requests.post(url, data=payload, timeout=5)
     except: pass
 
+def send_telegram_photo(caption, image_bytes):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID: return
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
+    payload = {"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
+    files = {'photo': image_bytes}
+    try: requests.post(url, data=payload, files=files, timeout=10)
+    except: pass
+
+def generate_intraday_chart(code, name):
+    try:
+        ticker_list = [f"{code}.TW", f"{code}.TWO"]
+        df = pd.DataFrame()
+        
+        # 1. 嘗試當日 1m
+        for ticker in ticker_list:
+            try:
+                df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
+                if not df.empty: break
+            except: pass
+            
+        # 2. 備援: 5日 5m (確保有圖)
+        chart_title = f"{code} {name} Intraday"
+        if df.empty:
+            for ticker in ticker_list:
+                try:
+                    df = yf.download(ticker, period="5d", interval="5m", progress=False, auto_adjust=False)
+                    if not df.empty: 
+                        chart_title = f"{code} {name} 5-Day Trend (Backup)"
+                        break
+                except: pass
+
+        if df.empty: return None
+
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        
+        # 簡單均價線
+        df['VWAP'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).cumsum() / df['Volume'].cumsum()
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='Price', line=dict(color='red')))
+        
+        # 只有當日圖才畫 VWAP
+        if "Intraday" in chart_title:
+            fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], mode='lines', name='VWAP', line=dict(color='orange', dash='dot')))
+        
+        fig.update_layout(
+            title=chart_title,
+            xaxis_title="Time", yaxis_title="Price",
+            template="plotly_white",
+            margin=dict(l=20, r=20, t=40, b=20),
+            height=400, width=600
+        )
+        img_bytes = fig.to_image(format="png")
+        return img_bytes
+    except: return None
+
 def get_stock_name(symbol):
     if symbol not in twstock.codes:
         try: twstock.__update_codes()
@@ -248,13 +304,20 @@ def get_big_order_threshold(price):
     threshold = int(400 / price)
     return max(1, threshold)
 
+# Ratio 計算防爆
 def _calc_est_vol(current_vol):
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     open_t = now.replace(hour=9, minute=0, second=0, microsecond=0)
     elapsed = (now - open_t).seconds / 60
-    if elapsed <= 0: return current_vol
+    
+    # 1. 盤前或剛開盤 15 分鐘內，不預估量
+    if elapsed < 15: return current_vol
+    
+    # 2. 已收盤 (超過 270 分鐘)
     total = 270
     if elapsed >= total: return current_vol
+    
+    # 3. 正常盤中預估
     return int(current_vol * (total / elapsed))
 
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown, price, vwap, has_attacked):
@@ -286,7 +349,12 @@ def fetch_fundamental_data(code):
 # 4. Agent Logic: 模擬數據與規則引擎 (Backend)
 # ==========================================
 
+# Pseudo-Random 法人資料 (穩定不跳動)
 def _get_institutional_3d(code):
+    # 使用日期 + 代碼當種子，確保當天同一隻股票數據固定
+    today_seed = int(datetime.now().strftime("%Y%m%d")) + int(code)
+    random.seed(today_seed)
+    
     return {
         "foreign": [random.randint(-1000, 2000), random.randint(-500, 1500), random.randint(100, 1000)],
         "trust":   [random.randint(-200, 500), random.randint(0, 300), random.randint(-100, 200)],
@@ -332,7 +400,6 @@ class AIAgent:
             except Exception: pass
 
     def _build_state(self, event):
-        # 這裡會產生法人數據
         inst_data = _get_institutional_3d(event['code'])
         flags = calculate_flags(inst_data, event['price'], event['pct'])
         return {
@@ -340,14 +407,12 @@ class AIAgent:
                 "code": event['code'],
                 "name": event['name'],
                 "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-                "mode": "standard"
             },
             "institutional": {
                 "foreign": {"D": inst_data['foreign'][0], "D-1": inst_data['foreign'][1], "D-2": inst_data['foreign'][2]},
                 "trust":   {"D": inst_data['trust'][0],   "D-1": inst_data['trust'][1],   "D-2": inst_data['trust'][2]},
                 "dealer":  {"D": inst_data['dealer'][0],  "D-1": inst_data['dealer'][1],  "D-2": inst_data['dealer'][2]}
             },
-            # 這裡我們只傳 Flags，因為大戶數據已經在第一則訊息送出了
             "flags": flags
         }
 
@@ -355,10 +420,9 @@ class AIAgent:
         if not openai_client: return
         state_json = json.dumps(self._build_state(event), ensure_ascii=False)
         
-        # System Prompt: 純法人表格 (移除大戶數據要求)
+        # System Prompt: 純法人表格 (附帶警語)
         system_prompt = """
         你是「即時市場資料格式化引擎」。
-        
         專職任務：將輸入資料轉為「Telegram 法人快照卡片」。
         
         嚴格遵守輸出格式：
@@ -371,6 +435,7 @@ class AIAgent:
         ────────────────
         合計：{Total_D}｜{Total_D-1}｜{Total_D-2}
         Flags：{flags (用｜分隔)}
+        (※法人數據為盤中模擬)
 
         規則：
         1. 法人數據：直接顯示數字，正數不需加號，負數顯示負號。
@@ -386,7 +451,6 @@ class AIAgent:
             )
             ai_output = response.choices[0].message.content
             
-            # 使用帶按鈕的發送函式 (戰術按鈕)
             buttons = [
                 [
                     {"text": "📈 TradingView (1m)", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{event['code']}&interval=1"},
@@ -407,6 +471,10 @@ class EventDispatcher:
         self.alert_history = {}
 
     def dispatch(self, event):
+        # 防呆：不處理壞資料
+        if event.get('data_status') != 'DATA_OK' and not event.get('is_test', False):
+            return
+
         event_type = event['event_type']
         trigger = event['trigger']
         code = event['code']
@@ -428,14 +496,19 @@ class EventDispatcher:
         if (time.time() - last_time > 600) or is_test:
             st.toast(f"🚀 觸發事件: {trigger} | {code}")
             
-            # 1. 立即通知 (含大戶、量價數據)
+            # 1. 立即通知
             self._send_instant_notification(event)
             
-            # 2. A級事件 -> AI Formatter (純法人快照)
+            # 2. A級事件 -> AI Formatter + Chart
             if trigger in ["🔥攻擊", "💣伏擊"]:
                 agent.push_event(event) 
+                threading.Thread(target=self._send_chart, args=(event,)).start()
 
-            # 3. 風險事件 -> 僅 AI 分析
+            # 3. 量增 -> Only Chart
+            elif trigger in ["👀量增"]:
+                threading.Thread(target=self._send_chart, args=(event,)).start()
+
+            # 4. 風險事件 -> 僅 AI Formatter
             elif scope == "inventory" and event_type == "RISK":
                 agent.push_event(event)
 
@@ -444,12 +517,9 @@ class EventDispatcher:
     def _send_instant_notification(self, event):
         emoji = "💣" if "伏擊" in event['trigger'] else "🚀" if "攻擊" in event['trigger'] else "☠️" if "出貨" in event['trigger'] or "跌破" in event['trigger'] else "👀"
         
-        # 數據格式化 (強制加號)
         def fmt_num(n): return f"+{n}" if n > 0 else f"{n}"
         
-        # 計算 P/V
         pv_pct = round((event['price'] - event['vwap']) / event['vwap'] * 100, 2)
-        
         net_10m_str = fmt_num(int(event.get('net_10m', 0)))
         net_1h_str = fmt_num(int(event.get('net_1h', 0)))
         net_day_str = fmt_num(int(event.get('net_day', 0)))
@@ -461,7 +531,6 @@ class EventDispatcher:
             f"10Min 大戶：{net_10m_str} | 1H 大戶：{net_1h_str} | 大戶日：{net_day_str}"
         )
         
-        # 戰術按鈕
         buttons = [
             [
                 {"text": "📈 TradingView (1m)", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{event['code']}&interval=1"},
@@ -470,6 +539,12 @@ class EventDispatcher:
         ]
         
         send_telegram_message(msg, buttons)
+
+    def _send_chart(self, event):
+        img_bytes = generate_intraday_chart(event['code'], event['name'])
+        if img_bytes:
+            caption = f"📉 <b>{event['code']} 當日走勢參考 (非預測)</b>\nTrigger: {event['trigger']}"
+            send_telegram_photo(caption, img_bytes)
 
 dispatcher = EventDispatcher()
 
@@ -589,7 +664,6 @@ class SniperEngine:
                 self.vol_queues[code].append((now_ts, delta_net))
                 self.daily_net[code] = self.daily_net.get(code, 0) + delta_net
             
-            # 計算大戶數據 (10m, 1h, day)
             one_hour_ago = now_ts - 3600
             ten_min_ago = now_ts - 600
             
@@ -669,7 +743,8 @@ class SniperEngine:
                     "net_1h": net_1h,
                     "net_10m": net_10m,
                     "net_day": net_day,
-                    "timestamp": now_ts
+                    "timestamp": now_ts,
+                    "data_status": "DATA_OK"
                 }
                 dispatcher.dispatch(event)
 
