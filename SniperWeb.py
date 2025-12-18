@@ -19,11 +19,12 @@ import queue
 from openai import OpenAI
 from io import BytesIO
 import random
+from itertools import cycle
 
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper v2.5 (Stable)", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v2.5 (Multi-Core)", page_icon="⚔️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -36,6 +37,7 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
+# V37.3 Update: 解析多組 API Key
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
 DB_PATH = "sniper_v35.db"
 
@@ -210,7 +212,6 @@ db = Database(DB_PATH)
 # 3. 核心工具與定義
 # ==========================================
 
-# 支援 Buttons 的發送函式
 def send_telegram_message(message, buttons=None):
     if not TG_BOT_TOKEN or not TG_CHAT_ID: return
     
@@ -282,11 +283,10 @@ def fetch_fundamental_data(code):
     return 0, 0, 0
 
 # ==========================================
-# 4. Agent Logic: 模擬數據與規則引擎 (Backend)
+# 4. Agent Logic: 模擬數據與規則引擎
 # ==========================================
 
 def _get_institutional_3d(code):
-    # 模擬 3 天法人數據 (今日、昨日、前日)
     return {
         "foreign": [random.randint(-1000, 2000), random.randint(-500, 1500), random.randint(100, 1000)],
         "trust":   [random.randint(-200, 500), random.randint(0, 300), random.randint(-100, 200)],
@@ -351,7 +351,6 @@ class AIAgent:
                 "volume_ratio": event['ratio']
             },
             "big_order": {
-                # 這裡傳入的數值會在 Prompt 中被要求強制顯示正負號
                 "10m": event.get('net_10m', 0),
                 "1h": event.get('net_1h', 0),
                 "day": event.get('net_day', 0)
@@ -363,7 +362,6 @@ class AIAgent:
         if not openai_client: return
         state_json = json.dumps(self._build_state(event), ensure_ascii=False)
         
-        # V2.5 System Prompt: 格式化引擎 (Updated V37.1)
         system_prompt = """
         你不是分析師，也不是交易顧問。
         你是「即時市場資料格式化引擎（Market Snapshot Formatter）」。
@@ -402,7 +400,6 @@ class AIAgent:
             )
             ai_output = response.choices[0].message.content
             
-            # 使用帶按鈕的發送函式 (戰術按鈕 - 修正連結)
             buttons = [
                 [
                     {"text": "📈 TradingView (1m)", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{event['code']}&interval=1"},
@@ -416,7 +413,7 @@ agent = AIAgent()
 agent.start()
 
 # ==========================================
-# 5. Event Dispatcher (Tactical Button Ver.)
+# 5. Event Dispatcher
 # ==========================================
 class EventDispatcher:
     def __init__(self):
@@ -444,7 +441,6 @@ class EventDispatcher:
         if (time.time() - last_time > 600) or is_test:
             st.toast(f"🚀 觸發事件: {trigger} | {code}")
             
-            # 產生戰術按鈕 (修正版)
             buttons = [
                 [
                     {"text": "📈 TradingView (1m)", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{code}&interval=1"},
@@ -452,14 +448,11 @@ class EventDispatcher:
                 ]
             ]
             
-            # 1. 立即通知 (帶按鈕)
             self._send_instant_notification(event, buttons)
             
-            # 2. A級事件 -> AI Formatter (這裡會再送一次帶法人按鈕的訊息)
             if trigger in ["🔥攻擊", "💣伏擊"]:
                 agent.push_event(event) 
 
-            # 3. 風險事件 -> 僅 AI 分析
             elif scope == "inventory" and event_type == "RISK":
                 agent.push_event(event)
 
@@ -478,7 +471,7 @@ class EventDispatcher:
 dispatcher = EventDispatcher()
 
 # ==========================================
-# 6. Sniper Engine (Rate Limited V37.2)
+# 6. Sniper Engine (Multi-Core V37.3)
 # ==========================================
 @st.cache_resource
 class SniperEngine:
@@ -495,15 +488,24 @@ class SniperEngine:
         self.daily_risk_flags = {}   
         
         self.last_reset_date = datetime.now().date()
-        self.clients = []
+        self.clients = [] # Client Pool
+        self.client_cycler = None # Iterator
+        
         self._init_clients()
         self.update_targets()
 
+    # V37.3 Update: 多組 API Key 載入
     def _init_clients(self):
         if not API_KEYS: return
+        valid_clients = []
         for key in API_KEYS:
-            try: self.clients.append(RestClient(api_key=key))
+            try: 
+                client = RestClient(api_key=key)
+                valid_clients.append(client)
             except: pass
+        self.clients = valid_clients
+        if self.clients:
+            self.client_cycler = cycle(self.clients) # 建立無限循環迭代器
 
     def update_targets(self):
         self.targets = db.get_all_targets()
@@ -518,12 +520,35 @@ class SniperEngine:
     def stop(self):
         self.is_running = False
 
-    def _fetch_single_stock(self, client, code):
+    # V37.3 Update: 支援重試 (Retry)
+    def _fetch_with_retry(self, code):
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # 1. Round-Robin 取出一個 Client
+                client = next(self.client_cycler) if self.client_cycler else None
+                if not client: return None
+                
+                # 2. 嘗試抓取
+                q = client.stock.intraday.quote(symbol=code)
+                return q
+            except Exception as e:
+                # 如果是 Rate Limit (429)，就換下一個 Client 再試
+                if "429" in str(e) or "limit" in str(e).lower():
+                    time.sleep(0.1) # 短暫冷卻
+                    continue # 換下一個 key
+                return None # 其他錯誤直接放棄
+        return None
+
+    def _fetch_single_stock(self, code):
         try:
-            # V37.2 Throttling: 微秒延遲
-            time.sleep(0.2) 
+            # 使用 Retry 機制
+            q = self._fetch_with_retry(code)
             
-            q = client.stock.intraday.quote(symbol=code)
+            if not q: 
+                # 靜默失敗，不噴錯，避免洗版
+                return (code, "Unknown", "Unknown", 0, 0, 0, 0, 0, 0, 0, "DATA_ERROR", time.time(), "DATA_ERROR", "B", "NORMAL")
+
             price = q.get('lastPrice', q.get('previousClose', 0))
             if price is None or price == 0:
                 return (code, "Unknown", "Unknown", 0, 0, 0, 0, 0, 0, 0, "DATA_ERROR", time.time(), "DATA_ERROR", "B", "NORMAL")
@@ -533,13 +558,8 @@ class SniperEngine:
             total_val = q.get('total', {}).get('tradeValue', 0)
             vwap = total_val / vol if vol > 0 else price
             
-            if code not in self.history_vol:
-                try:
-                    candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=2)
-                    if candles and 'data' in candles and len(candles['data']) >= 2:
-                        self.history_vol[code] = int(candles['data'][-2]['volume']) // 1000
-                    else: self.history_vol[code] = 1000
-                except: self.history_vol[code] = 1000
+            # --- 歷史量 (假設是固定的，這裡簡化) ---
+            if code not in self.history_vol: self.history_vol[code] = 1000 
             
             base_vol = self.history_vol.get(code, 1000)
             est_vol = _calc_est_vol(q.get('total', {}).get('tradeVolume', 0))
@@ -562,13 +582,10 @@ class SniperEngine:
                 self.vol_queues[code].append((now_ts, delta_net))
                 self.daily_net[code] = self.daily_net.get(code, 0) + delta_net
             
-            # 計算 1H 與 10Min 大戶 (修正：新增 10Min 計算)
             one_hour_ago = now_ts - 3600
             ten_min_ago = now_ts - 600
             
-            # 清理過期資料 (保留1小時內)
             self.vol_queues[code] = [x for x in self.vol_queues[code] if x[0] > one_hour_ago]
-            
             net_1h = sum(x[1] for x in self.vol_queues[code])
             net_10m = sum(x[1] for x in self.vol_queues[code] if x[0] > ten_min_ago)
             net_day = self.daily_net.get(code, 0)
@@ -642,19 +659,14 @@ class SniperEngine:
                     "vwap": vwap,
                     "ratio": ratio,
                     "net_1h": net_1h,
-                    "net_10m": net_10m, # 新增 10m 數據
+                    "net_10m": net_10m,
                     "net_day": net_day,
                     "timestamp": now_ts
                 }
                 dispatcher.dispatch(event)
 
             return (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, net_day, raw_signal, now_ts, "DATA_OK", signal_level, risk_status)
-        except Exception as e:
-            error_event = {
-                "code": code, "scope": "system", "event_type": "SYSTEM",
-                "trigger": f"DATA_ERROR: {str(e)}", "timestamp": time.time()
-            }
-            dispatcher.dispatch(error_event)
+        except Exception:
             return (code, "Unknown", "Unknown", 0, 0, 0, 0, 0, 0, 0, "DATA_ERROR", time.time(), "DATA_ERROR", "B", "NORMAL")
 
     def _run_loop(self):
@@ -670,17 +682,15 @@ class SniperEngine:
             market_open = dt_time(9, 0)
             market_close = dt_time(13, 35)
             is_market_open = market_open <= now.time() <= market_close
-            
-            # V37.2 Throttling: 增加冷卻時間 (0.5s -> 3.0s)
             sleep_time = 3.0 if is_market_open else 10
             
             batch_data = []
-            # V37.2 Throttling: 降低併發數 (5 -> 2)
+            # 保持 2 workers 穩定輸出
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 futures = []
-                for i, code in enumerate(self.targets):
-                    client = self.clients[i % len(self.clients)] if self.clients else None
-                    if client: futures.append(executor.submit(self._fetch_single_stock, client, code))
+                for code in self.targets:
+                    # 這裡不再傳入 client，改由內部 pool 自動輪替
+                    futures.append(executor.submit(self._fetch_single_stock, code))
                 for future in concurrent.futures.as_completed(futures):
                     res = future.result()
                     if res: batch_data.append(res)
@@ -723,21 +733,29 @@ with st.sidebar:
                     engine.update_targets()
                     targets = engine.targets
                     status = st.status("正在初始化數據 (含基本面)...", expanded=True)
-                    client = RestClient(api_key=API_KEYS[0])
+                    # 初始化時也使用多 key 輪替
+                    client_iter = cycle(engine.clients) if engine.clients else None
+                    
                     history_vol = {}
                     static_list = []
                     progress_bar = status.progress(0)
                     for i, code in enumerate(targets):
                         try:
-                            candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=2)
-                            if candles and 'data' in candles and len(candles['data']) >= 2:
-                                history_vol[code] = int(candles['data'][-2]['volume']) // 1000
+                            # 輪替 client 抓歷史資料
+                            client = next(client_iter) if client_iter else None
+                            if client:
+                                candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=2)
+                                if candles and 'data' in candles and len(candles['data']) >= 2:
+                                    history_vol[code] = int(candles['data'][-2]['volume']) // 1000
+                                else: history_vol[code] = 1000
                             else: history_vol[code] = 1000
                         except: history_vol[code] = 1000
+                        
                         yoy, eps, pe = fetch_fundamental_data(code)
                         static_list.append((code, 0, 0, yoy, eps, pe))
                         progress_bar.progress((i + 1) / len(targets))
                         time.sleep(0.1)
+                        
                     engine.history_vol = history_vol
                     db.upsert_static(static_list)
                     status.update(label="初始化完成！", state="complete")
@@ -750,15 +768,20 @@ with st.sidebar:
     
     tg_status = "✅" if TG_BOT_TOKEN and TG_CHAT_ID else "❌ Missing"
     gpt_status = "✅" if OPENAI_API_KEY else "❌ Missing"
-    if tg_status == "✅": tg_display = f"{tg_status} ({TG_BOT_TOKEN[:4]}...)"
-    else: tg_display = tg_status
+    
+    # 顯示目前有幾組 API Key
+    key_count = len(engine.clients)
+    if key_count > 0:
+        key_status = f"✅ {key_count} Keys Ready"
+    else:
+        key_status = "❌ No Keys"
         
-    st.caption(f"Telegram: {tg_display}")
+    st.caption(f"Fugle: {key_status}")
+    st.caption(f"Telegram: {tg_status}")
     st.caption(f"GPT: {gpt_status}")
 
     st.subheader("🧪 系統測試 (盤後專用)")
     if st.button("發送測試訊號 (Test Fire 🔥)"):
-        # Mock Attack
         mock_event = {
             "code": "2330", "name": "台積電 (測試)", "scope": "watchlist", "event_type": "STRATEGY",
             "trigger": "🔥攻擊", "price": 888.0, "pct": 3.5, "vwap": 870.0, "ratio": 2.5, "net_10m": 150, "net_1h": 500, "net_day": 1200, "timestamp": time.time(),
@@ -768,7 +791,6 @@ with st.sidebar:
         st.success("測試「攻擊」訊號已發送！")
         
     if st.button("發送測試訊號 (Test Ambush 💣)"):
-        # Mock Ambush
         mock_ambush = {
             "code": "2603", "name": "長榮 (測試)", "scope": "watchlist", "event_type": "STRATEGY",
             "trigger": "💣伏擊", "price": 155.5, "pct": 0.8, "vwap": 155.0, "ratio": 12.5, "net_10m": 300, "net_1h": 800, "net_day": 1500, "timestamp": time.time(),
@@ -778,7 +800,6 @@ with st.sidebar:
         st.success("測試「伏擊」訊號已發送！")
 
     if st.button("發送測試訊號 (Test Risk 💀)"):
-        # Mock Risk
         mock_risk = {
             "code": "2317", "name": "鴻海 (測試)", "scope": "inventory", "event_type": "RISK",
             "trigger": "💀出貨", "price": 100.0, "pct": -2.5, "vwap": 103.0, "ratio": 1.8, "net_10m": -100, "net_1h": -300, "net_day": -800, "timestamp": time.time(),
