@@ -38,7 +38,7 @@ except:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v38.db"
+DB_PATH = "sniper_v39.db"
 
 openai_client = None
 if OPENAI_API_KEY:
@@ -983,3 +983,4 @@ with watch_container:
 
 time.sleep(3)
 st.rerun()
+
