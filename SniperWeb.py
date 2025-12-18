@@ -23,7 +23,7 @@ import random
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper v2.5 (Trend Buttons)", page_icon="🔘", layout="wide")
+st.set_page_config(page_title="Sniper v2.5 (Stable)", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -478,7 +478,7 @@ class EventDispatcher:
 dispatcher = EventDispatcher()
 
 # ==========================================
-# 6. Sniper Engine
+# 6. Sniper Engine (Rate Limited V37.2)
 # ==========================================
 @st.cache_resource
 class SniperEngine:
@@ -520,6 +520,9 @@ class SniperEngine:
 
     def _fetch_single_stock(self, client, code):
         try:
+            # V37.2 Throttling: 微秒延遲
+            time.sleep(0.2) 
+            
             q = client.stock.intraday.quote(symbol=code)
             price = q.get('lastPrice', q.get('previousClose', 0))
             if price is None or price == 0:
@@ -667,10 +670,13 @@ class SniperEngine:
             market_open = dt_time(9, 0)
             market_close = dt_time(13, 35)
             is_market_open = market_open <= now.time() <= market_close
-            sleep_time = 0.5 if is_market_open else 10
+            
+            # V37.2 Throttling: 增加冷卻時間 (0.5s -> 3.0s)
+            sleep_time = 3.0 if is_market_open else 10
             
             batch_data = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            # V37.2 Throttling: 降低併發數 (5 -> 2)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 futures = []
                 for i, code in enumerate(self.targets):
                     client = self.clients[i % len(self.clients)] if self.clients else None
