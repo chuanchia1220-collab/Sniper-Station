@@ -24,7 +24,7 @@ from itertools import cycle
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper v2.1 (Stable UI)", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v2.5 (UI Sync)", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -38,7 +38,6 @@ except:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-# V38.0: New DB schema for type safety
 DB_PATH = "sniper_v38.db"
 
 openai_client = None
@@ -69,13 +68,16 @@ class Database:
     def init_db(self):
         conn = self.get_conn()
         c = conn.cursor()
+        # V39.0: Add 'last_alert_time' to avoid spamming
         c.execute('''CREATE TABLE IF NOT EXISTS realtime (
             code TEXT PRIMARY KEY, name TEXT, category TEXT,
             price REAL, pct REAL, vwap REAL, vol REAL, ratio REAL,
-            net_1h REAL, net_day REAL, signal TEXT, update_time REAL,
+            net_1h REAL, net_10m REAL, net_day REAL, 
+            signal TEXT, update_time REAL,
             data_status TEXT DEFAULT 'DATA_OK',
             signal_level TEXT DEFAULT 'B',
-            risk_status TEXT DEFAULT 'NORMAL'
+            risk_status TEXT DEFAULT 'NORMAL',
+            last_alert_time REAL DEFAULT 0
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS static_info (
             code TEXT PRIMARY KEY, win REAL, ret REAL, yoy REAL, eps REAL, pe REAL
@@ -94,18 +96,24 @@ class Database:
         c = conn.cursor()
         c.executemany('''
             INSERT OR REPLACE INTO realtime 
-            (code, name, category, price, pct, vwap, vol, ratio, net_1h, net_day, signal, update_time, data_status, signal_level, risk_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (code, name, category, price, pct, vwap, vol, ratio, net_1h, net_day, signal, update_time, data_status, signal_level, risk_status, net_10m)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', data_list)
         conn.commit()
         conn.close()
+        
+    def update_last_alert_time(self, code, timestamp):
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('UPDATE realtime SET last_alert_time = ? WHERE code = ?', (timestamp, code))
+        conn.commit()
+        conn.close()
 
-    # V38.0: Fetch Raw Data (UI Adapter will handle types)
     def get_pinned_view(self):
         conn = self.get_conn()
         query = '''
             SELECT p.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.signal,
-            r.net_1h, r.net_day, s.yoy, s.eps, s.pe, 1 as is_pinned, r.data_status, r.risk_status
+            r.net_1h, r.net_10m, r.net_day, s.yoy, s.eps, s.pe, 1 as is_pinned, r.data_status, r.risk_status, r.last_alert_time
             FROM pinned p
             LEFT JOIN realtime r ON p.code = r.code
             LEFT JOIN static_info s ON p.code = s.code
@@ -118,11 +126,11 @@ class Database:
         conn = self.get_conn()
         query = '''
             SELECT i.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.signal,
-            r.net_1h, r.net_day, s.yoy, s.eps, s.pe, i.cost, i.qty,
+            r.net_1h, r.net_10m, r.net_day, s.yoy, s.eps, s.pe, i.cost, i.qty,
             (r.price - i.cost) * i.qty * 1000 as profit_val,
             (r.price - i.cost) / i.cost * 100 as profit_pct,
             CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned,
-            r.data_status, r.risk_status
+            r.data_status, r.risk_status, r.last_alert_time
             FROM inventory i
             LEFT JOIN realtime r ON i.code = r.code
             LEFT JOIN static_info s ON i.code = s.code
@@ -136,9 +144,9 @@ class Database:
         conn = self.get_conn()
         query = '''
             SELECT w.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.signal, 
-            r.net_1h, r.net_day, s.yoy, s.eps, s.pe,
+            r.net_1h, r.net_10m, r.net_day, s.yoy, s.eps, s.pe,
             CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned,
-            r.data_status, r.risk_status, r.signal_level
+            r.data_status, r.risk_status, r.signal_level, r.last_alert_time
             FROM watchlist w
             LEFT JOIN realtime r ON w.code = r.code
             LEFT JOIN static_info s ON w.code = s.code
@@ -215,26 +223,22 @@ db = Database(DB_PATH)
 def build_ui_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
     將原始 DB 資料轉換為嚴格型別的 UI 專用 DataFrame。
-    解決 NaN、None、Type Mismatch 導致的閃爍問題。
     """
     if df_raw.empty:
-        return pd.DataFrame(columns=["code", "name", "price", "pct", "vwap", "ratio", "net_1h", "net_day", "signal", "data_status"])
+        return pd.DataFrame(columns=["code", "name", "price", "pct", "vwap", "ratio", "net_1h", "net_10m", "net_day", "signal", "data_status", "last_alert_time"])
 
     df = df_raw.copy()
 
-    # 1. 數值欄位強制轉型 + 補 0 (防止 None 炸裂)
-    NUM_COLS = ["price", "pct", "vwap", "ratio"]
+    NUM_COLS = ["price", "pct", "vwap", "ratio", "last_alert_time"]
     for col in NUM_COLS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0).astype(float)
 
-    # 2. 整數欄位 (大戶)
-    INT_COLS = ["net_1h", "net_day"]
+    INT_COLS = ["net_1h", "net_10m", "net_day"]
     for col in INT_COLS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
-    # 3. 字串/狀態欄位
     df["data_status"] = df["data_status"].fillna("DATA_OK").astype(str)
     df["signal"] = df["signal"].fillna("").astype(str)
     if "name" in df.columns:
@@ -339,6 +343,7 @@ def _calc_est_vol(current_vol):
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     open_t = now.replace(hour=9, minute=0, second=0, microsecond=0)
     elapsed = (now - open_t).seconds / 60
+    
     if elapsed < 15: return current_vol
     total = 270
     if elapsed >= total: return current_vol
@@ -370,7 +375,7 @@ def fetch_fundamental_data(code):
     return 0, 0, 0
 
 # ==========================================
-# 5. Agent Logic & Formatter
+# 4. Agent Logic: 模擬數據與規則引擎 (Backend)
 # ==========================================
 
 def _get_institutional_3d(code):
@@ -396,6 +401,9 @@ def calculate_flags(inst_data, price, price_change_pct):
         
     return flags if flags else ["—"]
 
+# ==========================================
+# 5. AIAgent (Formatter Role)
+# ==========================================
 class AIAgent:
     def __init__(self):
         self.event_queue = queue.Queue()
@@ -452,6 +460,7 @@ class AIAgent:
         ────────────────
         合計：{Total_D}｜{Total_D-1}｜{Total_D-2}
         Flags：{flags (用｜分隔)}
+        (※法人數據為盤中模擬)
 
         規則：
         1. 法人數據：直接顯示數字，正數不需加號，負數顯示負號。
@@ -480,50 +489,23 @@ agent = AIAgent()
 agent.start()
 
 # ==========================================
-# 6. Event Dispatcher
+# 5. Event Dispatcher (Sync with UI)
 # ==========================================
 class EventDispatcher:
     def __init__(self):
-        self.alert_history = {}
+        pass # V39.0: Logic moved to UI thread
 
     def dispatch(self, event):
-        if event.get('data_status') != 'DATA_OK' and not event.get('is_test', False):
-            return
-
-        event_type = event['event_type']
-        trigger = event['trigger']
-        code = event['code']
-        scope = event['scope']
-
-        if event_type == "SYSTEM":
-            alert_key = f"{code}_SYSTEM"
-            last_time = self.alert_history.get(alert_key, 0)
-            if time.time() - last_time > 3600:
-                send_telegram_message(f"⚠️ <b>系統異常報告</b>\n{code}: {trigger}")
-                self.alert_history[alert_key] = time.time()
-            return
-
-        alert_key = f"{code}_{trigger}"
-        last_time = self.alert_history.get(alert_key, 0)
-        
-        is_test = event.get('is_test', False)
-        
-        if (time.time() - last_time > 600) or is_test:
-            st.toast(f"🚀 觸發事件: {trigger} | {code}")
-            
+        # V39.0: Background thread NO LONGER sends messages.
+        # It only updates DB status for UI to pick up.
+        # Except for test events which are manual.
+        if event.get('is_test', False):
             self._send_instant_notification(event)
-            
-            if trigger in ["🔥攻擊", "💣伏擊"]:
+            if event['trigger'] in ["🔥攻擊", "💣伏擊"]:
                 agent.push_event(event) 
                 threading.Thread(target=self._send_chart, args=(event,)).start()
-
-            elif trigger in ["👀量增"]:
-                threading.Thread(target=self._send_chart, args=(event,)).start()
-
-            elif scope == "inventory" and event_type == "RISK":
+            elif event['scope'] == "inventory" and event['event_type'] == "RISK":
                 agent.push_event(event)
-
-            self.alert_history[alert_key] = time.time()
 
     def _send_instant_notification(self, event):
         emoji = "💣" if "伏擊" in event['trigger'] else "🚀" if "攻擊" in event['trigger'] else "☠️" if "出貨" in event['trigger'] or "跌破" in event['trigger'] else "👀"
@@ -560,7 +542,7 @@ class EventDispatcher:
 dispatcher = EventDispatcher()
 
 # ==========================================
-# 7. Sniper Engine (Strict Data Type Handling)
+# 6. Sniper Engine (v37.4 Logic Base)
 # ==========================================
 @st.cache_resource
 class SniperEngine:
@@ -625,18 +607,15 @@ class SniperEngine:
         return None
 
     def _fetch_single_stock(self, code):
-        # V38.0: 數值與狀態徹底分離
-        # (code, name, category, price, pct, vwap, vol, ratio, net_1h, net_day, signal, update_time, data_status, signal_level, risk_status)
-        fallback_res = (code, "Unknown", "Unknown", 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, "DATA_ERROR", time.time(), "DATA_ERROR", "B", "NORMAL")
+        fallback_res = (code, "Unknown", "Unknown", 0, 0, 0, 0, 0, 0, 0, "DATA_ERROR", time.time(), "DATA_ERROR", "B", "NORMAL", 0)
         
         try:
             q = self._fetch_with_retry(code)
             
-            # 容錯邏輯：若抓失敗，使用 Cache 但標記 STALE
             if not q:
                 if code in self.last_valid_data:
                     old_data = list(self.last_valid_data[code])
-                    old_data[12] = "STALE" # Only update status
+                    old_data[12] = "STALE" 
                     old_data[11] = time.time()
                     return tuple(old_data)
                 else:
@@ -678,6 +657,7 @@ class SniperEngine:
                 self.vol_queues[code].append((now_ts, delta_net))
                 self.daily_net[code] = self.daily_net.get(code, 0) + delta_net
             
+            # Big Order Calc
             one_hour_ago = now_ts - 3600
             ten_min_ago = now_ts - 600
             
@@ -690,79 +670,68 @@ class SniperEngine:
             is_bullish = price >= vwap
             is_breakdown = price < (vwap * 0.99)
             
+            # V39.0: Strict Time Check (收盤後不計算信號)
+            now = datetime.now(timezone.utc) + timedelta(hours=8)
+            market_close = dt_time(13, 35)
+            is_after_market = now.time() > market_close
+            
             event_type = "STRATEGY"
             signal_level = "B"
             risk_status = "NORMAL"
-            
-            if code in self.daily_risk_flags:
-                risk_status = "RISK_LOCKED"
-            
-            has_active_signal = False
-            if code in self.daily_active_flags and (self.daily_active_flags[code] & {"ATTACK", "AMBUSH"}):
-                has_active_signal = True
-
-            raw_signal = check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown, price, vwap, has_active_signal)
-            
-            scope = "inventory" if code in self.inventory_codes else "watchlist"
             trigger = None
+            raw_signal = "盤整"
 
-            if scope == "inventory":
-                if pct <= -2.0:
-                    trigger = "跌破-2%"
-                    event_type = "RISK"
+            if not is_after_market:
+                if code in self.daily_risk_flags:
                     risk_status = "RISK_LOCKED"
-                    if code not in self.daily_risk_flags:
-                        self.daily_risk_flags.setdefault(code, set()).add("BREAKDOWN")
-                    else: trigger = None 
+                
+                has_active_signal = False
+                if code in self.daily_active_flags and (self.daily_active_flags[code] & {"ATTACK", "AMBUSH"}):
+                    has_active_signal = True
 
-                elif "出貨" in raw_signal:
-                    trigger = "💀出貨"
-                    event_type = "RISK"
-                    risk_status = "RISK_LOCKED"
-                    if code not in self.daily_risk_flags:
-                        self.daily_risk_flags.setdefault(code, set()).add("DISTRIBUTION")
-                    else: trigger = None
+                raw_signal = check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown, price, vwap, has_active_signal)
+                
+                scope = "inventory" if code in self.inventory_codes else "watchlist"
 
-                elif "攻擊" in raw_signal and not has_active_signal:
-                    trigger = "🔥攻擊"
-                    signal_level = "A_PLUS"
-                    self.daily_active_flags.setdefault(code, set()).add("ATTACK")
+                if scope == "inventory":
+                    if pct <= -2.0:
+                        trigger = "跌破-2%"
+                        event_type = "RISK"
+                        risk_status = "RISK_LOCKED"
+                        if code not in self.daily_risk_flags:
+                            self.daily_risk_flags.setdefault(code, set()).add("BREAKDOWN")
+                        else: trigger = None 
 
-            if scope == "watchlist":
-                if not has_active_signal:
-                    if "攻擊" in raw_signal:
+                    elif "出貨" in raw_signal:
+                        trigger = "💀出貨"
+                        event_type = "RISK"
+                        risk_status = "RISK_LOCKED"
+                        if code not in self.daily_risk_flags:
+                            self.daily_risk_flags.setdefault(code, set()).add("DISTRIBUTION")
+                        else: trigger = None
+
+                    elif "攻擊" in raw_signal and not has_active_signal:
                         trigger = "🔥攻擊"
                         signal_level = "A_PLUS"
                         self.daily_active_flags.setdefault(code, set()).add("ATTACK")
-                    elif "伏擊" in raw_signal:
-                        trigger = "💣伏擊"
-                        signal_level = "A_PLUS"
-                        self.daily_active_flags.setdefault(code, set()).add("AMBUSH")
-                
-                if not trigger and "量增" in raw_signal:
-                    trigger = "👀量增"
-                    signal_level = "A_MINUS"
 
-            if trigger:
-                event = {
-                    "code": code,
-                    "name": get_stock_name(code),
-                    "scope": scope,
-                    "event_type": event_type,
-                    "trigger": trigger,
-                    "price": price,
-                    "pct": pct,
-                    "vwap": vwap,
-                    "ratio": ratio,
-                    "net_1h": net_1h,
-                    "net_10m": net_10m,
-                    "net_day": net_day,
-                    "timestamp": now_ts,
-                    "data_status": "DATA_OK"
-                }
-                dispatcher.dispatch(event)
+                if scope == "watchlist":
+                    if not has_active_signal:
+                        if "攻擊" in raw_signal:
+                            trigger = "🔥攻擊"
+                            signal_level = "A_PLUS"
+                            self.daily_active_flags.setdefault(code, set()).add("ATTACK")
+                        elif "伏擊" in raw_signal:
+                            trigger = "💣伏擊"
+                            signal_level = "A_PLUS"
+                            self.daily_active_flags.setdefault(code, set()).add("AMBUSH")
+                    
+                    if not trigger and "量增" in raw_signal:
+                        trigger = "👀量增"
+                        signal_level = "A_MINUS"
 
-            result = (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, net_day, raw_signal, now_ts, "DATA_OK", signal_level, risk_status)
+            # V39.0: Background thread only updates DB, no dispatch
+            result = (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, net_day, trigger if trigger else raw_signal, now_ts, "DATA_OK", signal_level, risk_status, net_10m)
             self.last_valid_data[code] = result
             return result
 
@@ -803,7 +772,7 @@ class SniperEngine:
 engine = SniperEngine()
 
 # ==========================================
-# 8. UI Rendering (Using Adapter)
+# 7. UI Rendering (Using Adapter & Sync Dispatch)
 # ==========================================
 
 inv_container = st.container()
@@ -906,19 +875,61 @@ with st.sidebar:
 now_time = datetime.now(timezone.utc) + timedelta(hours=8)
 st.caption(f"最後更新: {now_time.strftime('%H:%M:%S')} (每3秒)")
 
+# V39.0: Dispatch Logic moved to UI Thread (Sync Check)
+def check_and_dispatch(df, scope):
+    if df.empty: return
+    
+    # Check for active signals
+    triggered = df[df['signal'].isin(["🔥攻擊", "💣伏擊", "👀量增", "💀出貨", "跌破-2%"])]
+    
+    for _, row in triggered.iterrows():
+        # Prevent spam: Check last alert time (e.g. 10 mins cooldown)
+        if time.time() - row['last_alert_time'] > 600:
+            
+            event = {
+                "code": row['code'],
+                "name": row['name'],
+                "scope": scope,
+                "event_type": "RISK" if row['signal'] in ["💀出貨", "跌破-2%"] else "STRATEGY",
+                "trigger": row['signal'],
+                "price": row['price'],
+                "pct": row['pct'],
+                "vwap": row['vwap'],
+                "ratio": row['ratio'],
+                "net_1h": row['net_1h'],
+                "net_10m": row['net_10m'],
+                "net_day": row['net_day'],
+                "timestamp": time.time(),
+                "data_status": row['data_status']
+            }
+            
+            # Send Notification from UI Thread
+            if event['data_status'] == 'DATA_OK':
+                dispatcher._send_instant_notification(event)
+                if event['trigger'] in ["🔥攻擊", "💣伏擊"]:
+                    agent.push_event(event)
+                    threading.Thread(target=dispatcher._send_chart, args=(event,)).start()
+                elif event['trigger'] in ["👀量增"]:
+                    threading.Thread(target=dispatcher._send_chart, args=(event,)).start()
+                elif scope == "inventory" and event['event_type'] == "RISK":
+                    agent.push_event(event)
+                
+                # Update DB to prevent re-trigger
+                db.update_last_alert_time(row['code'], time.time())
+
 with inv_container:
     st.subheader("📦 庫存損益 (Portfolio)")
     df_raw = db.get_inventory_view()
-    df_inv = build_ui_dataframe(df_raw) # Apply UI Adapter
+    df_inv = build_ui_dataframe(df_raw) 
     
     if not df_inv.empty:
+        # Check Dispatch
+        check_and_dispatch(df_inv, "inventory")
+        
         df_inv = df_inv.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'signal': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'cost': '成本', 'profit_val': '損益$', 'profit_pct': '報酬%', 'data_status': '狀態'})
         cols = ['代碼', '名稱', '狀態', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE', '成本', '損益$', '報酬%']
-        
-        # Ensure cols exist
         for c in cols:
             if c not in df_inv.columns: df_inv[c] = 0
-            
         df_inv_show = df_inv[cols].copy()
         row_count = len(df_inv_show)
         calc_height = (row_count + 1) * 35 + 3
@@ -934,14 +945,16 @@ with inv_container:
 with watch_container:
     st.subheader("🔭 監控雷達 (Watchlist)")
     df_raw_w = db.get_watchlist_view()
-    df_watch = build_ui_dataframe(df_raw_w) # Apply UI Adapter
+    df_watch = build_ui_dataframe(df_raw_w) 
     
     if not df_watch.empty:
+        # Check Dispatch
+        check_and_dispatch(df_watch, "watchlist")
+    
         df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
         if use_filter: df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'] < 50)]
         df_watch = df_watch.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'signal': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級', 'data_status': '狀態'})
         
-        # Sort logic
         df_watch['level_score'] = df_watch['等級'].apply(lambda x: 10 if x == 'A_PLUS' else (5 if x == 'A_MINUS' else 0))
         df_watch = df_watch.sort_values(by=['Pinned', 'level_score', '漲跌%'], ascending=[False, False, False])
         
