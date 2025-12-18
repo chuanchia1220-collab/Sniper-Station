@@ -24,7 +24,7 @@ from itertools import cycle
 # ==========================================
 # 1. 基礎設定 & 參數
 # ==========================================
-st.set_page_config(page_title="Sniper v2.5 (Multi-Core)", page_icon="⚔️", layout="wide")
+st.set_page_config(page_title="Sniper v2.5 (Cache)", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -37,7 +37,6 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# V37.3 Update: 解析多組 API Key
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
 DB_PATH = "sniper_v35.db"
 
@@ -212,6 +211,7 @@ db = Database(DB_PATH)
 # 3. 核心工具與定義
 # ==========================================
 
+# 支援 Buttons 的發送函式
 def send_telegram_message(message, buttons=None):
     if not TG_BOT_TOKEN or not TG_CHAT_ID: return
     
@@ -283,7 +283,7 @@ def fetch_fundamental_data(code):
     return 0, 0, 0
 
 # ==========================================
-# 4. Agent Logic: 模擬數據與規則引擎
+# 4. Agent Logic: 模擬數據與規則引擎 (Backend)
 # ==========================================
 
 def _get_institutional_3d(code):
@@ -413,7 +413,7 @@ agent = AIAgent()
 agent.start()
 
 # ==========================================
-# 5. Event Dispatcher
+# 5. Event Dispatcher (Tactical Button Ver.)
 # ==========================================
 class EventDispatcher:
     def __init__(self):
@@ -441,6 +441,7 @@ class EventDispatcher:
         if (time.time() - last_time > 600) or is_test:
             st.toast(f"🚀 觸發事件: {trigger} | {code}")
             
+            # 產生戰術按鈕 (修正版)
             buttons = [
                 [
                     {"text": "📈 TradingView (1m)", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{code}&interval=1"},
@@ -448,11 +449,14 @@ class EventDispatcher:
                 ]
             ]
             
+            # 1. 立即通知 (帶按鈕)
             self._send_instant_notification(event, buttons)
             
+            # 2. A級事件 -> AI Formatter (這裡會再送一次帶法人按鈕的訊息)
             if trigger in ["🔥攻擊", "💣伏擊"]:
                 agent.push_event(event) 
 
+            # 3. 風險事件 -> 僅 AI 分析
             elif scope == "inventory" and event_type == "RISK":
                 agent.push_event(event)
 
@@ -471,7 +475,7 @@ class EventDispatcher:
 dispatcher = EventDispatcher()
 
 # ==========================================
-# 6. Sniper Engine (Multi-Core V37.3)
+# 6. Sniper Engine (Multi-Core + Cache V37.4)
 # ==========================================
 @st.cache_resource
 class SniperEngine:
@@ -485,16 +489,18 @@ class SniperEngine:
         self.history_vol = {}
         
         self.daily_active_flags = {} 
-        self.daily_risk_flags = {}   
+        self.daily_risk_flags = {} 
+        
+        # V37.4 Update: 資料快取 (容錯用)
+        self.last_valid_data = {} 
         
         self.last_reset_date = datetime.now().date()
-        self.clients = [] # Client Pool
-        self.client_cycler = None # Iterator
+        self.clients = [] 
+        self.client_cycler = None 
         
         self._init_clients()
         self.update_targets()
 
-    # V37.3 Update: 多組 API Key 載入
     def _init_clients(self):
         if not API_KEYS: return
         valid_clients = []
@@ -505,7 +511,7 @@ class SniperEngine:
             except: pass
         self.clients = valid_clients
         if self.clients:
-            self.client_cycler = cycle(self.clients) # 建立無限循環迭代器
+            self.client_cycler = cycle(self.clients)
 
     def update_targets(self):
         self.targets = db.get_all_targets()
@@ -520,45 +526,52 @@ class SniperEngine:
     def stop(self):
         self.is_running = False
 
-    # V37.3 Update: 支援重試 (Retry)
     def _fetch_with_retry(self, code):
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                # 1. Round-Robin 取出一個 Client
                 client = next(self.client_cycler) if self.client_cycler else None
                 if not client: return None
-                
-                # 2. 嘗試抓取
                 q = client.stock.intraday.quote(symbol=code)
                 return q
             except Exception as e:
-                # 如果是 Rate Limit (429)，就換下一個 Client 再試
                 if "429" in str(e) or "limit" in str(e).lower():
-                    time.sleep(0.1) # 短暫冷卻
-                    continue # 換下一個 key
-                return None # 其他錯誤直接放棄
+                    time.sleep(0.1) 
+                    continue 
+                return None 
         return None
 
     def _fetch_single_stock(self, code):
+        # 預設回傳值 (全空)
+        fallback_res = (code, "Unknown", "Unknown", 0, 0, 0, 0, 0, 0, 0, "DATA_ERROR", time.time(), "DATA_ERROR", "B", "NORMAL")
+        
         try:
-            # 使用 Retry 機制
             q = self._fetch_with_retry(code)
             
-            if not q: 
-                # 靜默失敗，不噴錯，避免洗版
-                return (code, "Unknown", "Unknown", 0, 0, 0, 0, 0, 0, 0, "DATA_ERROR", time.time(), "DATA_ERROR", "B", "NORMAL")
+            # V37.4 Logic: 如果抓失敗，檢查 Cache
+            if not q:
+                if code in self.last_valid_data:
+                    # 回傳快取資料，但標記為 STALE
+                    old_data = list(self.last_valid_data[code])
+                    old_data[12] = "STALE" # update data_status
+                    old_data[11] = time.time() # update time to keep alive
+                    return tuple(old_data)
+                else:
+                    return fallback_res
 
             price = q.get('lastPrice', q.get('previousClose', 0))
             if price is None or price == 0:
-                return (code, "Unknown", "Unknown", 0, 0, 0, 0, 0, 0, 0, "DATA_ERROR", time.time(), "DATA_ERROR", "B", "NORMAL")
+                if code in self.last_valid_data:
+                    old_data = list(self.last_valid_data[code])
+                    old_data[12] = "STALE"
+                    return tuple(old_data)
+                return fallback_res
 
             pct = q.get('changePercent', 0)
             vol = q.get('total', {}).get('tradeVolume', 0) * 1000
             total_val = q.get('total', {}).get('tradeValue', 0)
             vwap = total_val / vol if vol > 0 else price
             
-            # --- 歷史量 (假設是固定的，這裡簡化) ---
             if code not in self.history_vol: self.history_vol[code] = 1000 
             
             base_vol = self.history_vol.get(code, 1000)
@@ -665,9 +678,17 @@ class SniperEngine:
                 }
                 dispatcher.dispatch(event)
 
-            return (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, net_day, raw_signal, now_ts, "DATA_OK", signal_level, risk_status)
+            # 成功抓取，更新 Cache
+            result = (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, net_day, raw_signal, now_ts, "DATA_OK", signal_level, risk_status)
+            self.last_valid_data[code] = result
+            return result
+
         except Exception:
-            return (code, "Unknown", "Unknown", 0, 0, 0, 0, 0, 0, 0, "DATA_ERROR", time.time(), "DATA_ERROR", "B", "NORMAL")
+            if code in self.last_valid_data:
+                old_data = list(self.last_valid_data[code])
+                old_data[12] = "STALE"
+                return tuple(old_data)
+            return fallback_res
 
     def _run_loop(self):
         while self.is_running:
@@ -685,11 +706,9 @@ class SniperEngine:
             sleep_time = 3.0 if is_market_open else 10
             
             batch_data = []
-            # 保持 2 workers 穩定輸出
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 futures = []
                 for code in self.targets:
-                    # 這裡不再傳入 client，改由內部 pool 自動輪替
                     futures.append(executor.submit(self._fetch_single_stock, code))
                 for future in concurrent.futures.as_completed(futures):
                     res = future.result()
@@ -733,7 +752,6 @@ with st.sidebar:
                     engine.update_targets()
                     targets = engine.targets
                     status = st.status("正在初始化數據 (含基本面)...", expanded=True)
-                    # 初始化時也使用多 key 輪替
                     client_iter = cycle(engine.clients) if engine.clients else None
                     
                     history_vol = {}
@@ -741,7 +759,6 @@ with st.sidebar:
                     progress_bar = status.progress(0)
                     for i, code in enumerate(targets):
                         try:
-                            # 輪替 client 抓歷史資料
                             client = next(client_iter) if client_iter else None
                             if client:
                                 candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=2)
@@ -768,13 +785,8 @@ with st.sidebar:
     
     tg_status = "✅" if TG_BOT_TOKEN and TG_CHAT_ID else "❌ Missing"
     gpt_status = "✅" if OPENAI_API_KEY else "❌ Missing"
-    
-    # 顯示目前有幾組 API Key
     key_count = len(engine.clients)
-    if key_count > 0:
-        key_status = f"✅ {key_count} Keys Ready"
-    else:
-        key_status = "❌ No Keys"
+    key_status = f"✅ {key_count} Keys Ready" if key_count > 0 else "❌ No Keys"
         
     st.caption(f"Fugle: {key_status}")
     st.caption(f"Telegram: {tg_status}")
