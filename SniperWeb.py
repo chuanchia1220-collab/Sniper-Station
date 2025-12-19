@@ -156,12 +156,26 @@ db = Database(DB_PATH)
 # 4. Utilities
 # ==========================================
 def fetch_fundamental_data(code):
-    for suffix in ['.TW', '.TWO']:
-        try:
-            info = yf.Ticker(f"{code}{suffix}").info
-            if 'symbol' in info:
-                return (info.get('revenueGrowth', 0) or 0) * 100, info.get('trailingEps', 0) or 0, info.get('trailingPE', 0) or 0
-        except: continue
+    # 1. 透過 twstock 智能判斷上市/上櫃，決定正確後綴
+    suffix = ".TW"  # 預設上市
+    try:
+        if code in twstock.codes:
+            # 如果是上櫃，改用 .TWO
+            if twstock.codes[code].market == '上櫃':
+                suffix = ".TWO"
+    except:
+        pass
+    
+    # 2. 精準抓取，不再盲目迴圈測試，避免 404 錯誤 Log
+    try:
+        ticker = yf.Ticker(f"{code}{suffix}")
+        info = ticker.info
+        if info and 'symbol' in info:
+            return (info.get('revenueGrowth', 0) or 0) * 100, info.get('trailingEps', 0) or 0, info.get('trailingPE', 0) or 0
+    except: 
+        pass
+        
+    # 3. 如果失敗，回傳 0
     return 0, 0, 0
 
 def get_stock_name(symbol):
@@ -467,4 +481,5 @@ with watch_container:
     else: st.info("尚無監控資料。")
 
 # FIXED: Removed Sleep/Rerun Loop entirely (Passive UI)
+
 
