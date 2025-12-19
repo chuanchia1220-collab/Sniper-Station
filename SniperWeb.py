@@ -203,109 +203,47 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is
     return "盤整"
 
 # ==========================================
-# 5. Notification (Clean & Safe)
+# 5. Notification
 # ==========================================
 class NotificationManager:
     COOLDOWN_SECONDS = 600
-
     def __init__(self):
         self._queue = queue.Queue()
         self._cooldowns = {}
         threading.Thread(target=self._worker_loop, daemon=True).start()
 
     def should_notify(self, event: SniperEvent) -> bool:
-        if event.is_test:
-            return True
-
-        if event.data_status != "DATA_OK":
-            return False
-
-        if not MarketSession.is_market_open():
-            return False
-
+        if event.is_test: return True
+        if event.data_status != 'DATA_OK' or not MarketSession.is_market_open(): return False
         key = f"{event.code}_{event.trigger}"
-        last_ts = self._cooldowns.get(key, 0)
-        if time.time() - last_ts < self.COOLDOWN_SECONDS:
-            return False
-
+        if time.time() - self._cooldowns.get(key, 0) < self.COOLDOWN_SECONDS: return False
         return True
 
     def enqueue(self, event: SniperEvent):
-        if not self.should_notify(event):
-            return
-
-        if not event.is_test:
-            self._cooldowns[f"{event.code}_{event.trigger}"] = time.time()
-
-        self._queue.put(event)
+        if self.should_notify(event):
+            if not event.is_test: self._cooldowns[f"{event.code}_{event.trigger}"] = time.time()
+            self._queue.put(event)
 
     def _worker_loop(self):
         while True:
             event = self._queue.get()
-            try:
-                self._send_telegram(event)
-            finally:
-                self._queue.task_done()
+            self._send_telegram(event)
+            self._queue.task_done()
 
     def _send_telegram(self, event: SniperEvent):
-        if not TG_BOT_TOKEN or not TG_CHAT_ID:
-            return
-
-        # === Emoji 判斷 ===
-        if "伏擊" in event.trigger:
-            emoji = "💣"
-        elif "攻擊" in event.trigger:
-            emoji = "🚀"
-        elif "出貨" in event.trigger:
-            emoji = "☠️"
-        else:
-            emoji = "🔔"
-
-        # === 小工具 ===
-        def fmt(n: int) -> str:
-            return f"+{n}" if n > 0 else str(n)
-
-        up_dn = "UP" if event.pct >= 0 else "DN"
-
-        # === 訊息本體 ===
-        msg = (
-            f"{emoji} <b>{event.trigger}：{event.code} {event.name}</b>\n\n"
-            f"現價：{event.price:.2f} ({event.pct:.2f}% {up_dn})　"
-            f"均價：{event.vwap:.2f}\n\n"
-            f"大戶10M：{fmt(event.net_10m)}　"
-            f"大戶1H：{fmt(event.net_1h)}　"
-            f"大戶(日)：{fmt(event.net_day)}"
-        )
-
-        # === 按鈕 ===
-        buttons = [[
-            {
-                "text": "📈 TradingView",
-                "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{event.code}&interval=1"
-            },
-            {
-                "text": "📊 Yahoo",
-                "url": f"https://tw.stock.yahoo.com/quote/{event.code}.TW"
-            }
-        ]]
-
-        payload = {
-            "chat_id": TG_CHAT_ID,
-            "text": msg,
-            "parse_mode": "HTML",
-            "reply_markup": json.dumps({
-                "inline_keyboard": buttons
-            })
-        }
-
+        if not TG_BOT_TOKEN or not TG_CHAT_ID: return
+        emoji = "💣" if "伏擊" in event.trigger else "🚀" if "攻擊" in event.trigger else "☠️"
+        msg = (f"{emoji} <b>{event.trigger}：{event.code} {event.name}</b>\n"
+               f"現價：{event.price:.2f} ({event.pct:.2f}%)\n"
+               f"量比：{event.ratio:.1f} | 10分大戶：{event.net_10m}")
+        buttons = [[{"text": "📈 TradingView", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{event.code}&interval=1"},
+                    {"text": "📊 Yahoo", "url": f"https://tw.stock.yahoo.com/quote/{event.code}.TW"}]]
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                data=payload,
-                timeout=5
-            )
-        except Exception:
-            pass
+            requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage", 
+                          data={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML", "reply_markup": json.dumps({"inline_keyboard": buttons})}, timeout=5)
+        except: pass
+
+notification_manager = NotificationManager()
 
 # ==========================================
 # 6. Engine (Fixed: No Cache, Passive Loop)
@@ -543,6 +481,4 @@ with watch_container:
     else: st.info("尚無監控資料。")
 
 # FIXED: Removed Sleep/Rerun Loop entirely (Passive UI)
-
-
 
