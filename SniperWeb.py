@@ -230,10 +230,9 @@ class NotificationManager:
             self._send_telegram(event)
             self._queue.task_done()
 
-def _send_telegram(self, event: SniperEvent):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID: 
-        return
-    emoji = "💣" if "伏擊" in event.trigger else "🚀" if "攻擊" in event.trigger else "☠️"
+    def _send_telegram(self, event: SniperEvent):
+        if not TG_BOT_TOKEN or not TG_CHAT_ID: return
+        emoji = "💣" if "伏擊" in event.trigger else "🚀" if "攻擊" in event.trigger else "☠️"
 
     up_dn = "UP" if event.pct >= 0 else "DN"
 
@@ -490,7 +489,4 @@ with watch_container:
     else: st.info("尚無監控資料。")
 
 # FIXED: Removed Sleep/Rerun Loop entirely (Passive UI)
-
-
-
 
