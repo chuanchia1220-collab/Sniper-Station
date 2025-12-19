@@ -232,10 +232,18 @@ class NotificationManager:
 
     def _send_telegram(self, event: SniperEvent):
         if not TG_BOT_TOKEN or not TG_CHAT_ID: return
-        emoji = "💣" if "伏擊" in event.trigger else "🚀" if "攻擊" in event.trigger else "☠️"
-        msg = (f"{emoji} <b>{event.trigger}：{event.code} {event.name}</b>\n"
-               f"現價：{event.price:.2f} ({event.pct:.2f}%)\n"
-               f"量比：{event.ratio:.1f} | 10分大戶：{event.net_10m}")
+emoji = "💣" if "伏擊" in event.trigger else "🚀" if "攻擊" in event.trigger else "☠️"
+
+up_dn = "UP" if event.pct >= 0 else "DN"
+
+msg = (
+    f"{emoji} <b>訊號：{event.code} {event.name}</b>\n\n"
+    f"現價：{event.price:.2f} ({event.pct:.2f}% {up_dn})　"
+    f"均價：{event.vwap:.2f}\n\n"
+    f"大戶10M：{event.net_10m:+d}　"
+    f"大戶1H：{event.net_1h:+d}　"
+    f"大戶(日)：{event.net_day:+d}"
+)
         buttons = [[{"text": "📈 TradingView", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{event.code}&interval=1"},
                     {"text": "📊 Yahoo", "url": f"https://tw.stock.yahoo.com/quote/{event.code}.TW"}]]
         try:
@@ -481,5 +489,6 @@ with watch_container:
     else: st.info("尚無監控資料。")
 
 # FIXED: Removed Sleep/Rerun Loop entirely (Passive UI)
+
 
 
