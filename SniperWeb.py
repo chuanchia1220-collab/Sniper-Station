@@ -337,10 +337,14 @@ class SniperEngine:
             db.upsert_realtime_batch(batch)
             time.sleep(3 if MarketSession.is_market_open(now) else 10)
 
-# FIXED: Init Engine in Session State (No Cache)
-if "engine" not in st.session_state:
-    st.session_state.engine = SniperEngine()
-engine = st.session_state.engine
+# ==========================================
+# FIXED: Init Engine (Force Refresh for v4.2)
+# ==========================================
+# 使用新 Key 'sniper_engine_core' 強制避開舊版殘留的 session_state
+if "sniper_engine_core" not in st.session_state:
+    st.session_state.sniper_engine_core = SniperEngine()
+
+engine = st.session_state.sniper_engine_core
 
 # ==========================================
 # 7. UI
@@ -463,3 +467,4 @@ with watch_container:
     else: st.info("尚無監控資料。")
 
 # FIXED: Removed Sleep/Rerun Loop entirely (Passive UI)
+
