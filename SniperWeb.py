@@ -10,7 +10,7 @@ from itertools import cycle
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.10 MaxWidth", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.12 Hotfix", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -122,7 +122,8 @@ class Database:
 
     def get_watchlist_view(self):
         conn = self._get_conn()
-        query = '''SELECT w.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.signal as event_label, r.net_1h, r.net_day, s.yoy, s.eps, s.pe, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM watchlist w LEFT JOIN realtime r ON w.code = r.code LEFT JOIN static_info s ON w.code = s.code LEFT JOIN pinned p ON w.code = p.code'''
+        # FIXED: Added r.net_10m to prevent KeyError
+        query = '''SELECT w.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.signal as event_label, r.net_10m, r.net_1h, r.net_day, s.yoy, s.eps, s.pe, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM watchlist w LEFT JOIN realtime r ON w.code = r.code LEFT JOIN static_info s ON w.code = s.code LEFT JOIN pinned p ON w.code = p.code'''
         df = pd.read_sql(query, conn)
         conn.close(); return df
 
@@ -315,7 +316,7 @@ class SniperEngine:
             if event_label:
                 self.active_flags[code] = True
                 if "出貨" in event_label: self.daily_risk_flags[code] = True
-                ev = SniperEvent(code, get_stock_name(code), scope, "STRATEGY", event_label, price, pct, vwap, ratio, net_1h, net_10m, net_day)
+                ev = SniperEvent(code, get_stock_name(code), scope, "STRATEGY", event_label, price, pct, vwap, ratio, net_10m, net_1h, net_day)
                 self._dispatch_event(ev)
 
             return (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m)
@@ -359,7 +360,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.10")
+    st.title("⚙️ 戰情室 v5.12")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -419,6 +420,22 @@ with st.sidebar:
         })
         st.toast("測試訊號已發送")
 
+# --- HTML Coloring Helper ---
+def color_num(val, pos_color="#ff4d4f", neg_color="#2ecc71", default="#e0e0e0"):
+    try:
+        v = float(val.replace("%", "").replace(",", ""))
+        if v > 0: return f"<span style='color:{pos_color}'>{val}</span>"
+        elif v < 0: return f"<span style='color:{neg_color}'>{val}</span>"
+        else: return f"<span style='color:{default}'>{val}</span>"
+    except: return val
+
+def color_ratio(val):
+    try:
+        v = float(val)
+        if v > 10: return f"<span style='color:#ff4d4f'>{v:.1f}</span>"
+        return f"{v:.1f}"
+    except: return val
+
 # --- Safe Fragment Fallback ---
 try:
     from streamlit import fragment
@@ -440,7 +457,7 @@ def render_live_dashboard():
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     st.caption(f"⚡ Live Refresh: {now.strftime('%H:%M:%S')} (Rate: 1.5s)")
     
-    # --- Part 1: Inventory (Top) ---
+    # --- Part 1: Inventory (Top - Editor Mode) ---
     st.subheader("📦 庫存損益")
     df_inv = db.get_inventory_view()
     if not df_inv.empty:
@@ -463,7 +480,7 @@ def render_live_dashboard():
 
     st.markdown("---")
 
-    # --- Part 2: Watchlist (Bottom) ---
+    # --- Part 2: Watchlist (Bottom - HTML Render Mode) ---
     st.subheader("🔭 監控雷達")
     df_watch = db.get_watchlist_view()
     if not df_watch.empty:
@@ -474,26 +491,42 @@ def render_live_dashboard():
 
         if use_filter: df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'] < 50)]
         
-        df_watch = df_watch.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'event_label': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
-        df_watch['level_score'] = df_watch['等級'].apply(lambda x: 10 if x == 'A_PLUS' else (5 if x == 'A_MINUS' else 0))
-        df_watch = df_watch.sort_values(by=['Pinned', 'level_score', '漲跌%'], ascending=[False, False, False])
-        cols_w = ['Pinned', '代碼', '名稱', '等級', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE']
-        for c in cols_w: 
-            if c not in df_watch.columns: df_watch[c] = 0
-        df_watch_show = df_watch[cols_w].copy()
+        # FIXED: Rename 'ratio' to '量比' here to match later usage
+        df_watch = df_watch.rename(columns={'event_label': '訊號', 'code': '代碼', 'name': '名稱', 'price': '現價', 'pct': '漲跌%', 'vwap': '均價', 'ratio': '量比', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
         
-        # Dynamic Height Calculation: (Min(Rows, 45) + 1 Header) * 35px
-        calc_height = (min(len(df_watch_show), 45) + 1) * 35
-
-        edited_watch = st.data_editor(
-            df_watch_show,
-            column_config={"Pinned": st.column_config.CheckboxColumn("📌", width="small", pinned=True), "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "等級": st.column_config.TextColumn("等級", width="small"), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f")},
-            use_container_width=True, hide_index=True, key="watch_editor_live",
-            height=calc_height
+        # 1. Color Price & Pct
+        df_watch['現價'] = df_watch['現價'].apply(lambda x: color_num(f"{x:.2f}"))
+        df_watch['漲跌%'] = df_watch['漲跌%'].apply(lambda x: color_num(f"{x:.2f}%"))
+        
+        # 2. Color Ratio (Now safe because column is renamed)
+        df_watch['量比'] = df_watch['量比'].apply(color_ratio)
+        
+        # 3. Combined Big Player Column with Coloring
+        df_watch['大戶'] = df_watch.apply(
+            lambda x: f"{color_num(str(int(x['net_10m'])))} / {color_num(str(int(x['net_1h'])))} / {color_num(str(int(x['net_day'])))}", 
+            axis=1
         )
-        if not df_watch.empty:
-            changes = edited_watch[['代碼', 'Pinned']].set_index('代碼')
-            for index, row in changes.iterrows(): db.update_pinned(index, row['Pinned'])
+        
+        # 4. Pinned Column (Visual Only)
+        df_watch['📌'] = df_watch['Pinned'].apply(lambda x: "📌" if x else "")
+
+        # Select & Order Columns
+        cols_html = ['📌', '代碼', '名稱', '等級', '現價', '漲跌%', '均價', '量比', '訊號', '大戶', '營收YoY', 'EPS', 'PE']
+        df_html = df_watch[cols_html].copy()
+        
+        # HTML Table Styling
+        st.markdown(
+            f"""
+            <style>
+                table {{ width: 100%; border-collapse: collapse; }}
+                th {{ text-align: left; background-color: #262730; color: white; padding: 8px; }}
+                td {{ padding: 8px; border-bottom: 1px solid #444; }}
+                tr:hover {{ background-color: #2e2e2e; }}
+            </style>
+            {df_html.to_html(escape=False, index=False)}
+            """, 
+            unsafe_allow_html=True
+        )
     else: st.info("尚無監控資料")
 
 # Render the fragment (Auto-refreshed section)
