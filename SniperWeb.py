@@ -10,7 +10,7 @@ from itertools import cycle
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v4.4 Architecture", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v4.2 Final", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -22,7 +22,7 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v44.db"
+DB_PATH = "sniper_v42.db"
 DEFAULT_WATCHLIST = "3035 3037 2368 2383 6274 8046 3189 3324 3017 3653 2421 3483 3081 3163 4979 4908 3363 4977 6442 2356 3231 2382 6669 2317 2330 2454 2303 6781 4931 3533"
 DEFAULT_INVENTORY = """2330,800,1\n2317,105,5"""
 
@@ -156,18 +156,26 @@ db = Database(DB_PATH)
 # 4. Utilities
 # ==========================================
 def fetch_fundamental_data(code):
-    suffix = ".TW"
+    # 1. 透過 twstock 智能判斷上市/上櫃，決定正確後綴
+    suffix = ".TW"  # 預設上市
     try:
         if code in twstock.codes:
-            if twstock.codes[code].market == '上櫃': suffix = ".TWO"
-    except: pass
+            # 如果是上櫃，改用 .TWO
+            if twstock.codes[code].market == '上櫃':
+                suffix = ".TWO"
+    except:
+        pass
     
+    # 2. 精準抓取，不再盲目迴圈測試，避免 404 錯誤 Log
     try:
         ticker = yf.Ticker(f"{code}{suffix}")
         info = ticker.info
         if info and 'symbol' in info:
             return (info.get('revenueGrowth', 0) or 0) * 100, info.get('trailingEps', 0) or 0, info.get('trailingPE', 0) or 0
-    except: pass
+    except: 
+        pass
+        
+    # 3. 如果失敗，回傳 0
     return 0, 0, 0
 
 def get_stock_name(symbol):
@@ -206,6 +214,7 @@ class NotificationManager:
 
     def should_notify(self, event: SniperEvent) -> bool:
         if event.is_test: return True
+        if event.data_status != 'DATA_OK' or not MarketSession.is_market_open(): return False
         key = f"{event.code}_{event.trigger}"
         if time.time() - self._cooldowns.get(key, 0) < self.COOLDOWN_SECONDS: return False
         return True
@@ -218,26 +227,15 @@ class NotificationManager:
     def _worker_loop(self):
         while True:
             event = self._queue.get()
-            # FIXED: Add error handling to prevent thread crash
-            try:
-                self._send_telegram(event)
-            except Exception as e:
-                print(f"[TG ERROR] {e}")
-            finally:
-                self._queue.task_done()
+            self._send_telegram(event)
+            self._queue.task_done()
 
     def _send_telegram(self, event: SniperEvent):
         if not TG_BOT_TOKEN or not TG_CHAT_ID: return
-        
         emoji = "💣" if "伏擊" in event.trigger else "🚀" if "攻擊" in event.trigger else "☠️"
-        
-        def fmt_num(n): return f"+{int(n)}" if n > 0 else f"{int(n)}"
-        up_dn = "UP" if event.pct >= 0 else "DN"
-        
         msg = (f"{emoji} <b>{event.trigger}：{event.code} {event.name}</b>\n"
-               f"現價：{event.price:.2f} ({event.pct:.2f}% {up_dn})　均價：{event.vwap:.2f}\n"
-               f"大戶10M：{fmt_num(event.net_10m)}　大戶1H：{fmt_num(event.net_1h)}　大戶(日)：{fmt_num(event.net_day)}")
-        
+               f"現價：{event.price:.2f} ({event.pct:.2f}%)\n"
+               f"量比：{event.ratio:.1f} | 10分大戶：{event.net_10m}")
         buttons = [[{"text": "📈 TradingView", "url": f"https://www.tradingview.com/chart/?symbol=TWSE%3A{event.code}&interval=1"},
                     {"text": "📊 Yahoo", "url": f"https://tw.stock.yahoo.com/quote/{event.code}.TW"}]]
         try:
@@ -248,7 +246,7 @@ class NotificationManager:
 notification_manager = NotificationManager()
 
 # ==========================================
-# 6. Engine
+# 6. Engine (Fixed: No Cache, Passive Loop)
 # ==========================================
 class SniperEngine:
     def __init__(self):
@@ -278,10 +276,6 @@ class SniperEngine:
         threading.Thread(target=self._run_loop, daemon=True).start()
 
     def stop(self): self.running = False
-
-    # FIXED: Helper method for decoupling dispatch logic
-    def _dispatch_event(self, ev: SniperEvent):
-        notification_manager.enqueue(ev)
 
     def _fetch_stock(self, code):
         try:
@@ -318,7 +312,7 @@ class SniperEngine:
             net_day = self.daily_net.get(code, 0)
             
             tgt_pct, tgt_ratio = get_dynamic_thresholds(price)
-            raw_signal = check_signal(pct, price >= vwap, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown=price < vwap*0.99, price=price, vwap=vwap, has_attacked=code in self.active_flags)
+            raw_signal = check_signal(pct, price >= vwap, net_day, net_1h, ratio, tgt_pct, tgt_ratio, price < vwap*0.99, price, vwap, code in self.active_flags)
             
             trigger = None
             scope = "inventory" if code in self.inventory_codes else "watchlist"
@@ -331,8 +325,7 @@ class SniperEngine:
                 self.active_flags[code] = True
                 if "出貨" in trigger: self.daily_risk_flags[code] = True
                 ev = SniperEvent(code, get_stock_name(code), scope, "STRATEGY", trigger, price, pct, ratio, net_1h, net_10m, net_day)
-                # FIXED: Use decoupled dispatch method
-                self._dispatch_event(ev)
+                notification_manager.enqueue(ev)
 
             res = (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, net_day, raw_signal, now_ts, "DATA_OK", "B", "NORMAL", net_10m)
             self.last_valid_data[code] = res
@@ -345,10 +338,8 @@ class SniperEngine:
             if now.date() > self.last_reset:
                 self.active_flags = {}; self.daily_risk_flags = {}; self.last_reset = now.date()
             
-            # FIXED: Read DB directly for dynamic updates
-            targets = db.get_all_codes()
-            self.inventory_codes = db.get_inventory_codes()
-            
+            # FIXED: Use internal targets state instead of DB query in loop
+            targets = self.targets
             if not targets: time.sleep(2); continue
             
             batch = []
@@ -361,8 +352,9 @@ class SniperEngine:
             time.sleep(3 if MarketSession.is_market_open(now) else 10)
 
 # ==========================================
-# Init Engine (Force Refresh for v4.2)
+# FIXED: Init Engine (Force Refresh for v4.2)
 # ==========================================
+# 使用新 Key 'sniper_engine_core' 強制避開舊版殘留的 session_state
 if "sniper_engine_core" not in st.session_state:
     st.session_state.sniper_engine_core = SniperEngine()
 
@@ -372,7 +364,6 @@ engine = st.session_state.sniper_engine_core
 # 7. UI
 # ==========================================
 
-# LegacyDispatcher: used for UI / manual test only
 class LegacyDispatcher:
     def dispatch(self, event_dict):
         ev = SniperEvent(
@@ -391,7 +382,7 @@ st.divider()
 watch_container = st.container()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室設定 (Hybrid v4.4)")
+    st.title("⚙️ 戰情室設定 (Hybrid v4.2)")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -423,6 +414,7 @@ with st.sidebar:
                     db.upsert_static(static_list)
                     status.update(label="初始化完成！", state="complete")
             
+            # FIXED: Command-style Buttons instead of Checkbox
             col_a, col_b = st.columns(2)
             with col_a:
                 if st.button("🟢 啟動監控核心", disabled=engine.running):
@@ -487,3 +479,6 @@ with watch_container:
             changes = edited_watch[['代碼', 'Pinned']].set_index('代碼')
             for index, row in changes.iterrows(): db.update_pinned(index, row['Pinned'])
     else: st.info("尚無監控資料。")
+
+# FIXED: Removed Sleep/Rerun Loop entirely (Passive UI)
+
