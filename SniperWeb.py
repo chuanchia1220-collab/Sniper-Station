@@ -10,7 +10,7 @@ from itertools import cycle
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.16 FatalFix", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.17 VolFix", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -22,7 +22,8 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v59.db"
+# [DB UPDATE] New schema for volume history
+DB_PATH = "sniper_v60.db"
 DEFAULT_WATCHLIST = "3035 3037 2368 2383 6274 8046 3189 3324 3017 3653 2421 3483 3081 3163 4979 4908 3363 4977 6442 2356 3231 2382 6669 2317 2330 2454 2303 6781 4931 3533"
 DEFAULT_INVENTORY = """2330,800,1\n2317,105,5"""
 
@@ -55,7 +56,7 @@ class MarketSession:
         return MarketSession.MARKET_OPEN <= now.time() <= MarketSession.MARKET_CLOSE
 
 # ==========================================
-# 3. Database (Async Write)
+# 3. Database (Async Write + Volume Support)
 # ==========================================
 class Database:
     def __init__(self, db_path):
@@ -73,7 +74,8 @@ class Database:
         c.execute('''CREATE TABLE IF NOT EXISTS inventory (code TEXT PRIMARY KEY, cost REAL, qty REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS pinned (code TEXT PRIMARY KEY)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, win REAL, ret REAL, yoy REAL, eps REAL, pe REAL)''')
+        # [DB UPDATE] Added avg_vol column
+        c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, win REAL, ret REAL, yoy REAL, eps REAL, pe REAL, avg_vol REAL DEFAULT 5000)''')
         conn.commit(); conn.close()
 
     def _writer_loop(self):
@@ -99,7 +101,8 @@ class Database:
         self.write_queue.put(('executemany', sql, data_list))
 
     def upsert_static(self, data_list):
-        sql = 'INSERT OR REPLACE INTO static_info (code, win, ret, yoy, eps, pe) VALUES (?, ?, ?, ?, ?, ?)'
+        # [DB UPDATE] Insert avg_vol
+        sql = 'INSERT OR REPLACE INTO static_info (code, win, ret, yoy, eps, pe, avg_vol) VALUES (?, ?, ?, ?, ?, ?, ?)'
         self.write_queue.put(('executemany', sql, data_list))
 
     def update_pinned(self, code, is_pinned):
@@ -142,10 +145,17 @@ class Database:
         c.execute('SELECT code FROM inventory')
         rows = c.fetchall(); conn.close(); return [r[0] for r in rows]
 
+    def get_volume_map(self):
+        """Fetch average volumes for Engine init"""
+        conn = self._get_conn(); c = conn.cursor()
+        c.execute('SELECT code, avg_vol FROM static_info')
+        rows = c.fetchall(); conn.close()
+        return {r[0]: r[1] for r in rows if r[1] > 0}
+
 db = Database(DB_PATH)
 
 # ==========================================
-# 4. Utilities (Safe Formatting)
+# 4. Utilities (Robust + Volume)
 # ==========================================
 def format_number(x, decimals=2, *, pos_color="#ff4d4f", neg_color="#2ecc71", zero_color="#e0e0e0", threshold=None, threshold_color="#ff4d4f", suffix=""):
     try:
@@ -170,9 +180,14 @@ def fetch_fundamental_data(code):
         ticker = yf.Ticker(f"{code}{suffix}")
         info = ticker.info
         if info and 'symbol' in info:
-            return (info.get('revenueGrowth', 0) or 0) * 100, info.get('trailingEps', 0) or 0, info.get('trailingPE', 0) or 0
+            # [LOGIC UPDATE] Get average volume (default to 5000 if missing)
+            avg_vol = info.get('averageVolume', 5000) or 5000
+            yoy = (info.get('revenueGrowth', 0) or 0) * 100
+            eps = info.get('trailingEps', 0) or 0
+            pe = info.get('trailingPE', 0) or 0
+            return yoy, eps, pe, avg_vol
     except: pass
-    return 0, 0, 0
+    return 0, 0, 0, 5000
 
 def get_stock_name(symbol):
     try: return twstock.codes[symbol].name if symbol in twstock.codes else symbol
@@ -255,7 +270,7 @@ class NotificationManager:
 notification_manager = NotificationManager()
 
 # ==========================================
-# 6. Engine (High Performance & Keyword Fix)
+# 6. Engine (Volume Aware)
 # ==========================================
 class SniperEngine:
     def __init__(self):
@@ -264,7 +279,7 @@ class SniperEngine:
         self.client_cycle = cycle(self.clients) if self.clients else None
         self.targets = []
         self.inventory_codes = []
-        self.vol_history = {}
+        self.vol_history = {} # Stores avg_vol
         self.daily_net = {}
         self.vol_queues = {}
         self.prev_data = {}
@@ -276,6 +291,8 @@ class SniperEngine:
     def update_targets(self):
         self.targets = db.get_all_codes()
         self.inventory_codes = db.get_inventory_codes()
+        # [LOGIC UPDATE] Pre-load volume history from DB
+        self.vol_history = db.get_volume_map()
 
     def start(self):
         if self.running: return
@@ -298,9 +315,12 @@ class SniperEngine:
             pct = q.get('changePercent', 0)
             vol = q.get('total', {}).get('tradeVolume', 0) * 1000
             vwap = (q.get('total', {}).get('tradeValue', 0) / vol) if vol > 0 else price
-            if code not in self.vol_history: self.vol_history[code] = 1000
+            
+            # [LOGIC UPDATE] Use loaded avg_vol or safe fallback (5000)
+            base_vol = self.vol_history.get(code, 5000) 
             est_vol = _calc_est_vol(q.get('total', {}).get('tradeVolume', 0))
-            ratio = est_vol / self.vol_history.get(code, 1000)
+            ratio = est_vol / base_vol if base_vol > 0 else 0
+            
             delta_net = 0
             if code in self.prev_data:
                 d_v = (vol - self.prev_data[code]['vol']) / 1000
@@ -328,20 +348,11 @@ class SniperEngine:
             if event_label:
                 self.active_flags[code] = True
                 if "出貨" in event_label: self.daily_risk_flags[code] = True
-                # [CRITICAL FIX] Use keyword arguments to prevent order mismatch
                 ev = SniperEvent(
-                    code=code, 
-                    name=get_stock_name(code), 
-                    scope=scope, 
-                    event_kind="STRATEGY", 
-                    event_label=event_label, 
-                    price=price, 
-                    pct=pct, 
-                    vwap=vwap, 
-                    ratio=ratio, 
-                    net_10m=net_10m, # Correctly mapped
-                    net_1h=net_1h,   # Correctly mapped
-                    net_day=net_day
+                    code=code, name=get_stock_name(code), scope=scope, 
+                    event_kind="STRATEGY", event_label=event_label, 
+                    price=price, pct=pct, vwap=vwap, ratio=ratio, 
+                    net_10m=net_10m, net_1h=net_1h, net_day=net_day
                 )
                 self._dispatch_event(ev)
 
@@ -374,29 +385,19 @@ engine = st.session_state.sniper_engine_core
 # ==========================================
 class LegacyDispatcher:
     def dispatch(self, event_dict):
-        # [CRITICAL FIX] Use keyword arguments
         ev = SniperEvent(
-            code=event_dict['code'], 
-            name=event_dict['name'], 
-            scope=event_dict['scope'],
-            event_kind=event_dict.get('event_kind', 'TEST'), 
-            event_label=event_dict['event_label'], 
-            price=event_dict['price'], 
-            pct=event_dict['pct'], 
-            vwap=event_dict.get('vwap', 0), 
-            ratio=event_dict['ratio'], 
-            net_10m=event_dict['net_10m'],
-            net_1h=event_dict['net_1h'], 
-            net_day=event_dict['net_day'], 
-            timestamp=event_dict['timestamp'], 
-            is_test=event_dict.get('is_test', False)
+            code=event_dict['code'], name=event_dict['name'], scope=event_dict['scope'],
+            event_kind=event_dict.get('event_kind', 'TEST'), event_label=event_dict['event_label'], 
+            price=event_dict['price'], pct=event_dict['pct'], vwap=event_dict.get('vwap', 0), 
+            ratio=event_dict['ratio'], net_1h=event_dict['net_1h'], net_10m=event_dict['net_10m'], 
+            net_day=event_dict['net_day'], timestamp=event_dict['timestamp'], is_test=event_dict.get('is_test', False)
         )
         notification_manager.enqueue(ev)
 
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.16")
+    st.title("⚙️ 戰情室 v5.17")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -420,12 +421,13 @@ with st.sidebar:
                     time.sleep(0.5)
                     engine.update_targets()
                     targets = engine.targets
-                    status = st.status("正在初始化數據 (含基本面)...", expanded=True)
+                    status = st.status("正在初始化數據 (含基本面與均量)...", expanded=True)
                     static_list = []
                     progress_bar = status.progress(0)
                     for i, code in enumerate(targets):
-                        yoy, eps, pe = fetch_fundamental_data(code)
-                        static_list.append((code, 0, 0, yoy, eps, pe))
+                        # [LOGIC UPDATE] Capture avg_vol
+                        yoy, eps, pe, avg_vol = fetch_fundamental_data(code)
+                        static_list.append((code, 0, 0, yoy, eps, pe, avg_vol))
                         progress_bar.progress((i + 1) / len(targets))
                     db.upsert_static(static_list)
                     status.update(label="初始化完成！", state="complete")
@@ -513,17 +515,14 @@ def render_live_dashboard():
 
         df_watch['yoy'] = df_watch['yoy'].fillna(0)
         df_watch['eps'] = df_watch['eps'].fillna(0)
-        # [CRITICAL FIX] Leave PE as NaN for filtering, don't use 999
-
+        
         if use_filter: 
-            # [CRITICAL FIX] Use notna() instead of magic number filter
             df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'].notna()) & (df_watch['pe'] < 50)]
         
         df_watch = df_watch.rename(columns={'event_label': '訊號', 'code': '代碼', 'name': '名稱', 'price': '現價', 'pct': '漲跌%', 'vwap': '均價', 'ratio': '量比', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
         
         # Format Data
         df_watch['現價'] = df_watch['現價'].apply(lambda x: format_number(x, decimals=2))
-        # [CRITICAL FIX] Added VWAP formatting
         df_watch['均價'] = df_watch['均價'].apply(lambda x: format_number(x, decimals=2))
         df_watch['漲跌%'] = df_watch['漲跌%'].apply(lambda x: format_number(x, decimals=2, suffix="%"))
         df_watch['量比'] = df_watch['量比'].apply(lambda x: format_number(x, decimals=1, threshold=10))
@@ -544,7 +543,7 @@ def render_live_dashboard():
             table.custom-table { width: 100%; border-collapse: collapse; }
             table.custom-table th { text-align: left; background-color: #262730; color: white; padding: 8px; }
             table.custom-table td { padding: 8px; border-bottom: 1px solid #444; }
-            table.custom-table tr:hover { background-color: #2e2e2e; }
+            table.custom-table tr:hover { background-color: ##FFF3BF; }
             </style>
         """, unsafe_allow_html=True)
 
