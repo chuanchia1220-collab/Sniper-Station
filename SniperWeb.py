@@ -10,7 +10,7 @@ from itertools import cycle
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.8 Layout", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.9 Stable", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -22,7 +22,7 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v58.db"
+DB_PATH = "sniper_v59.db"
 DEFAULT_WATCHLIST = "3035 3037 2368 2383 6274 8046 3189 3324 3017 3653 2421 3483 3081 3163 4979 4908 3363 4977 6442 2356 3231 2382 6669 2317 2330 2454 2303 6781 4931 3533"
 DEFAULT_INVENTORY = """2330,800,1\n2317,105,5"""
 
@@ -343,7 +343,7 @@ if "sniper_engine_core" not in st.session_state:
 engine = st.session_state.sniper_engine_core
 
 # ==========================================
-# 7. UI (Partial Refresh & Layout)
+# 7. UI (Layout & Fragments)
 # ==========================================
 class LegacyDispatcher:
     def dispatch(self, event_dict):
@@ -359,7 +359,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.8")
+    st.title("⚙️ 戰情室 v5.9")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -368,9 +368,12 @@ with st.sidebar:
         with st.expander("📦 庫存管理 (Inventory)", expanded=False):
             inv_input = st.text_area("庫存清單 (代碼,成本,張數)", DEFAULT_INVENTORY, height=100)
             if st.button("更新庫存"):
+                # FIXED: Force Wait & Rerun
                 db.update_inventory_list(inv_input)
+                time.sleep(0.5)
                 engine.update_targets()
                 st.toast("庫存已更新！")
+                st.rerun()
 
         with st.expander("🔭 監控設定 (Watchlist)", expanded=True):
             raw_input = st.text_area("新選清單", DEFAULT_WATCHLIST, height=150)
@@ -378,6 +381,8 @@ with st.sidebar:
                 if not API_KEYS: st.error("缺 API Key")
                 else:
                     db.update_watchlist(raw_input)
+                    # FIXED: Force Wait & Rerun
+                    time.sleep(0.5)
                     engine.update_targets()
                     targets = engine.targets
                     status = st.status("正在初始化數據 (含基本面)...", expanded=True)
@@ -389,16 +394,19 @@ with st.sidebar:
                         progress_bar.progress((i + 1) / len(targets))
                     db.upsert_static(static_list)
                     status.update(label="初始化完成！", state="complete")
+                    st.rerun()
             
             col_a, col_b = st.columns(2)
             with col_a:
                 if st.button("🟢 啟動監控", disabled=engine.running):
                     engine.start()
                     st.toast("核心已啟動")
+                    st.rerun()
             with col_b:
                 if st.button("🔴 停止監控", disabled=not engine.running):
                     engine.stop()
                     st.toast("核心已停止")
+                    st.rerun()
 
     st.markdown("---")
     st.caption(f"Engine: {'🟢 RUNNING' if engine.running else '🔴 STOPPED'}")
@@ -476,7 +484,7 @@ def render_live_dashboard():
             if c not in df_watch.columns: df_watch[c] = 0
         df_watch_show = df_watch[cols_w].copy()
         
-        # Dynamic Height: Max 45 rows
+        # Dynamic Height Calculation: (Min(Rows, 45) + 1 Header) * 35px
         calc_height = (min(len(df_watch_show), 45) + 1) * 35
 
         edited_watch = st.data_editor(
