@@ -10,7 +10,7 @@ from itertools import cycle
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.0 Unified", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.5 Spec", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -22,17 +22,22 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v50.db"
+DB_PATH = "sniper_v55.db"
 DEFAULT_WATCHLIST = "3035 3037 2368 2383 6274 8046 3189 3324 3017 3653 2421 3483 3081 3163 4979 4908 3363 4977 6442 2356 3231 2382 6669 2317 2330 2454 2303 6781 4931 3533"
 DEFAULT_INVENTORY = """2330,800,1\n2317,105,5"""
 
 @dataclass
 class SniperEvent:
+    """
+    Single Source of Truth for Events.
+    - event_kind: SYSTEM | STRATEGY | TEST
+    - event_label: 攻擊 | 伏擊 | 出貨 | 量增 | 跌破 | 漲停
+    """
     code: str
     name: str
     scope: str
-    event_kind: str      # SYSTEM / STRATEGY / TEST
-    event_label: str     # 攻擊 / 伏擊 / 量增 / 跌破
+    event_kind: str
+    event_label: str
     price: float
     pct: float
     vwap: float
@@ -55,7 +60,7 @@ class MarketSession:
         return MarketSession.MARKET_OPEN <= now.time() <= MarketSession.MARKET_CLOSE
 
 # ==========================================
-# 3. Database (Mapped to New Spec)
+# 3. Database
 # ==========================================
 class Database:
     def __init__(self, db_path):
@@ -67,7 +72,7 @@ class Database:
 
     def _init_db(self):
         conn = self._get_conn(); c = conn.cursor()
-        # Realtime (Schema keeps 'signal' column for compatibility, mapped logically)
+        # Realtime: 'signal' column stores 'raw_state' (e.g., 盤整, 價強)
         c.execute('''CREATE TABLE IF NOT EXISTS realtime (code TEXT PRIMARY KEY, name TEXT, category TEXT, price REAL, pct REAL, vwap REAL, vol REAL, ratio REAL, net_1h REAL, net_10m REAL, net_day REAL, signal TEXT, update_time REAL, data_status TEXT DEFAULT 'DATA_OK', signal_level TEXT DEFAULT 'B', risk_status TEXT DEFAULT 'NORMAL')''')
         c.execute('''CREATE TABLE IF NOT EXISTS inventory (code TEXT PRIMARY KEY, cost REAL, qty REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
@@ -78,7 +83,6 @@ class Database:
     def upsert_realtime_batch(self, data_list):
         if not data_list: return
         conn = self._get_conn(); c = conn.cursor()
-        # Mapped: event_label is stored in 'signal' column
         c.executemany('''INSERT OR REPLACE INTO realtime (code, name, category, price, pct, vwap, vol, ratio, net_1h, net_day, signal, update_time, data_status, signal_level, risk_status, net_10m) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', data_list)
         conn.commit(); conn.close()
 
@@ -95,7 +99,7 @@ class Database:
 
     def get_watchlist_view(self):
         conn = self._get_conn()
-        # Alias signal as event_label
+        # raw_state (stored in signal column) is aliased for UI display
         query = '''
             SELECT w.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.signal as event_label, 
             r.net_1h, r.net_day, s.yoy, s.eps, s.pe,
@@ -111,7 +115,6 @@ class Database:
 
     def get_inventory_view(self):
         conn = self._get_conn()
-        # Alias signal as event_label
         query = '''
             SELECT i.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.signal as event_label,
             r.net_1h, r.net_day, s.yoy, s.eps, s.pe, i.cost, i.qty,
@@ -197,7 +200,7 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is
     return "盤整"
 
 # ==========================================
-# 5. Notification (Unified)
+# 5. Notification
 # ==========================================
 class NotificationManager:
     COOLDOWN_SECONDS = 600
@@ -217,13 +220,16 @@ class NotificationManager:
 
     def should_notify(self, event: SniperEvent) -> bool:
         if event.is_test: return True
-        key = f"{event.code}_{event.event_label}"
+        if not MarketSession.is_market_open(): return False
+        
+        # Spec: Cooldown based on Code + Scope + EventLabel
+        key = f"{event.code}_{event.scope}_{event.event_label}"
         if time.time() - self._cooldowns.get(key, 0) < self.COOLDOWN_SECONDS: return False
         return True
 
     def enqueue(self, event: SniperEvent):
         if self.should_notify(event):
-            if not event.is_test: self._cooldowns[f"{event.code}_{event.event_label}"] = time.time()
+            if not event.is_test: self._cooldowns[f"{event.code}_{event.scope}_{event.event_label}"] = time.time()
             self._queue.put(event)
 
     def _worker_loop(self):
@@ -241,9 +247,14 @@ class NotificationManager:
         
         emoji = self.EMOJI_MAP.get(event.event_label, "📌")
         up_dn = "UP" if event.pct >= 0 else "DN"
+        market_label = "上市"
+        try:
+            if event.code in twstock.codes:
+                market_label = twstock.codes[event.code].market
+        except: pass
         
         msg = (
-            f"<b>{emoji} {event.event_label}｜{event.code} {event.name}</b>\n"
+            f"<b>{emoji} {event.event_label}｜{event.code} {event.name} ({market_label})</b>\n"
             f"現價：{event.price:.2f} ({event.pct:.2f}% {up_dn})　均價：{event.vwap:.2f}\n"
             f"大戶10M：{event.net_10m}　大戶1H：{event.net_1h}　大戶(日)：{event.net_day}"
         )
@@ -276,6 +287,7 @@ class SniperEngine:
         self.daily_risk_flags = {}
         self.last_reset = datetime.now().date()
         self.last_valid_data = {}
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 
     def update_targets(self):
         self.targets = db.get_all_codes()
@@ -327,30 +339,32 @@ class SniperEngine:
             net_day = self.daily_net.get(code, 0)
             
             tgt_pct, tgt_ratio = get_dynamic_thresholds(price)
-            # Clean text signal (No Emoji)
-            raw_label = check_signal(pct, price >= vwap, net_day, net_1h, ratio, tgt_pct, tgt_ratio, price < vwap*0.99, price, vwap, code in self.active_flags)
             
-            label = None
+            # --- Logic: Raw State (市場狀態) ---
+            # Rename raw_signal -> raw_state
+            raw_state = check_signal(pct, price >= vwap, net_day, net_1h, ratio, tgt_pct, tgt_ratio, price < vwap*0.99, price, vwap, code in self.active_flags)
+            
+            # --- Logic: Event Detection (事件觸發) ---
+            event_label = None
             scope = "inventory" if code in self.inventory_codes else "watchlist"
             
-            if "攻擊" in raw_label and code not in self.active_flags: label = "攻擊"
-            elif "伏擊" in raw_label: label = "伏擊"
-            elif "出貨" in raw_label and code not in self.daily_risk_flags and scope == "inventory": label = "出貨"
+            if "攻擊" in raw_state and code not in self.active_flags: event_label = "攻擊"
+            elif "伏擊" in raw_state: event_label = "伏擊"
+            elif "出貨" in raw_state and code not in self.daily_risk_flags and scope == "inventory": event_label = "出貨"
 
-            if label:
+            if event_label:
                 self.active_flags[code] = True
-                if "出貨" in label: self.daily_risk_flags[code] = True
+                if "出貨" in event_label: self.daily_risk_flags[code] = True
                 
-                # New Event Spec
                 ev = SniperEvent(
                     code=code, 
                     name=get_stock_name(code), 
                     scope=scope, 
-                    event_kind="STRATEGY", # 統一種類
-                    event_label=label,     # 統一標籤 (無Emoji)
+                    event_kind="STRATEGY", 
+                    event_label=event_label,     
                     price=price, 
                     pct=pct, 
-                    vwap=vwap,             # Added vwap
+                    vwap=vwap,             
                     ratio=ratio, 
                     net_1h=net_1h, 
                     net_10m=net_10m, 
@@ -358,8 +372,8 @@ class SniperEngine:
                 )
                 self._dispatch_event(ev)
 
-            # Store Clean Label in DB (mapped to 'signal' column)
-            res = (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, net_day, raw_label, now_ts, "DATA_OK", "B", "NORMAL", net_10m)
+            # Store Raw State in DB ('signal' column)
+            res = (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m)
             self.last_valid_data[code] = res
             return res
         except: return None
@@ -376,10 +390,9 @@ class SniperEngine:
             if not targets: time.sleep(2); continue
             
             batch = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                futures = [executor.submit(self._fetch_stock, c) for c in targets]
-                for f in concurrent.futures.as_completed(futures):
-                    if f.result(): batch.append(f.result())
+            futures = [self.executor.submit(self._fetch_stock, c) for c in targets]
+            for f in concurrent.futures.as_completed(futures):
+                if f.result(): batch.append(f.result())
             
             db.upsert_realtime_batch(batch)
             time.sleep(3 if MarketSession.is_market_open(now) else 10)
@@ -396,19 +409,19 @@ engine = st.session_state.sniper_engine_core
 # 7. UI
 # ==========================================
 
-# LegacyDispatcher: used for UI / manual test only
+# LegacyDispatcher: Enforces Event Spec
 class LegacyDispatcher:
     def dispatch(self, event_dict):
-        # Convert dict to New Event Spec
+        # Strict mapping: requires event_label
         ev = SniperEvent(
             code=event_dict['code'], 
             name=event_dict['name'], 
             scope=event_dict['scope'],
-            event_kind=event_dict.get('event_kind', 'TEST'), # Default kind
-            event_label=event_dict.get('event_label', event_dict.get('trigger', '測試')), # Map old trigger
+            event_kind=event_dict.get('event_kind', 'TEST'), 
+            event_label=event_dict['event_label'],  # No fallback, must provide label
             price=event_dict['price'], 
             pct=event_dict['pct'], 
-            vwap=event_dict.get('vwap', 0), # Ensure vwap
+            vwap=event_dict.get('vwap', 0), 
             ratio=event_dict['ratio'],
             net_1h=event_dict['net_1h'], 
             net_10m=event_dict['net_10m'], 
@@ -425,7 +438,7 @@ st.divider()
 watch_container = st.container()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室設定 (Unified v5.0)")
+    st.title("⚙️ 戰情室設定 (Unified v5.5)")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -472,10 +485,10 @@ with st.sidebar:
     
     st.subheader("🧪 系統測試")
     if st.button("發送測試訊號 (Test Fire 🔥)"):
-        # Updated to new spec
+        # Updated to new spec with required event_label
         dispatcher.dispatch({
             "code": "2330", "name": "台積電 (測試)", "scope": "watchlist", 
-            "event_kind": "TEST", "event_label": "攻擊",  # Clean Label
+            "event_kind": "TEST", "event_label": "攻擊",  
             "price": 888.0, "pct": 3.5, "vwap": 870.0, "ratio": 2.5, "net_10m": 150, "net_1h": 500, "net_day": 1200, 
             "timestamp": time.time(), "is_test": True
         })
@@ -488,7 +501,6 @@ with inv_container:
     st.subheader("📦 庫存損益 (Portfolio)")
     df_inv = db.get_inventory_view()
     if not df_inv.empty:
-        # Map DB column 'event_label' (aliased from signal) to UI '訊號'
         df_inv = df_inv.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'event_label': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'cost': '成本', 'profit_val': '損益$', 'profit_pct': '報酬%', 'risk_status': '狀態'})
         cols = ['代碼', '名稱', '狀態', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE', '成本', '損益$', '報酬%']
         for c in cols: 
@@ -508,7 +520,6 @@ with watch_container:
     if not df_watch.empty:
         df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
         if use_filter: df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'] < 50)]
-        # Map DB column 'event_label' (aliased from signal) to UI '訊號'
         df_watch = df_watch.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'event_label': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
         df_watch['level_score'] = df_watch['等級'].apply(lambda x: 10 if x == 'A_PLUS' else (5 if x == 'A_MINUS' else 0))
         df_watch = df_watch.sort_values(by=['Pinned', 'level_score', '漲跌%'], ascending=[False, False, False])
@@ -526,3 +537,22 @@ with watch_container:
             changes = edited_watch[['代碼', 'Pinned']].set_index('代碼')
             for index, row in changes.iterrows(): db.update_pinned(index, row['Pinned'])
     else: st.info("尚無監控資料。")
+
+# ==========================================
+# UI Auto Refresh (Non-Blocking)
+# ==========================================
+REFRESH_INTERVAL = 3
+now_ts = time.time()
+
+if "last_ui_refresh" not in st.session_state:
+    st.session_state.last_ui_refresh = now_ts
+
+if engine.running:
+    if now_ts - st.session_state.last_ui_refresh >= REFRESH_INTERVAL:
+        st.session_state.last_ui_refresh = now_ts
+        st.rerun()
+else:
+    # Slow heartbeat when stopped
+    if now_ts - st.session_state.last_ui_refresh >= 1:
+        st.session_state.last_ui_refresh = now_ts
+        st.rerun()
