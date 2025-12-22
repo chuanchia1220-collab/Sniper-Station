@@ -10,7 +10,7 @@ from itertools import cycle
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.14 Safe", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.16 FatalFix", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -147,29 +147,14 @@ db = Database(DB_PATH)
 # ==========================================
 # 4. Utilities (Safe Formatting)
 # ==========================================
-def format_number(
-    x,
-    decimals=2,
-    *,
-    pos_color="#ff4d4f",   # 紅
-    neg_color="#2ecc71",   # 綠
-    zero_color="#e0e0e0",  # 灰
-    threshold=None,
-    threshold_color="#ff4d4f",
-    suffix=""
-):
+def format_number(x, decimals=2, *, pos_color="#ff4d4f", neg_color="#2ecc71", zero_color="#e0e0e0", threshold=None, threshold_color="#ff4d4f", suffix=""):
     try:
-        if pd.isna(x) or x == "": return ""
+        if pd.isna(x) or x == "" or x is None: return ""
         if isinstance(x, str) and "<span" in x: return x
-        
         val = float(str(x).replace(",", "").replace("%", ""))
-        
         if decimals == 0: text = f"{int(val)}{suffix}"
         else: text = f"{val:.{decimals}f}{suffix}"
-
-        if threshold is not None and val >= threshold:
-            return f"<span style='color:{threshold_color}'>{text}</span>"
-
+        if threshold is not None and val >= threshold: return f"<span style='color:{threshold_color}'>{text}</span>"
         if val > 0: return f"<span style='color:{pos_color}'>{text}</span>"
         elif val < 0: return f"<span style='color:{neg_color}'>{text}</span>"
         else: return f"<span style='color:{zero_color}'>{text}</span>"
@@ -270,7 +255,7 @@ class NotificationManager:
 notification_manager = NotificationManager()
 
 # ==========================================
-# 6. Engine (High Performance)
+# 6. Engine (High Performance & Keyword Fix)
 # ==========================================
 class SniperEngine:
     def __init__(self):
@@ -343,7 +328,21 @@ class SniperEngine:
             if event_label:
                 self.active_flags[code] = True
                 if "出貨" in event_label: self.daily_risk_flags[code] = True
-                ev = SniperEvent(code, get_stock_name(code), scope, "STRATEGY", event_label, price, pct, vwap, ratio, net_1h, net_10m, net_day)
+                # [CRITICAL FIX] Use keyword arguments to prevent order mismatch
+                ev = SniperEvent(
+                    code=code, 
+                    name=get_stock_name(code), 
+                    scope=scope, 
+                    event_kind="STRATEGY", 
+                    event_label=event_label, 
+                    price=price, 
+                    pct=pct, 
+                    vwap=vwap, 
+                    ratio=ratio, 
+                    net_10m=net_10m, # Correctly mapped
+                    net_1h=net_1h,   # Correctly mapped
+                    net_day=net_day
+                )
                 self._dispatch_event(ev)
 
             return (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m)
@@ -375,19 +374,29 @@ engine = st.session_state.sniper_engine_core
 # ==========================================
 class LegacyDispatcher:
     def dispatch(self, event_dict):
+        # [CRITICAL FIX] Use keyword arguments
         ev = SniperEvent(
-            code=event_dict['code'], name=event_dict['name'], scope=event_dict['scope'],
-            event_kind=event_dict.get('event_kind', 'TEST'), event_label=event_dict['event_label'], 
-            price=event_dict['price'], pct=event_dict['pct'], vwap=event_dict.get('vwap', 0), 
-            ratio=event_dict['ratio'], net_1h=event_dict['net_1h'], net_10m=event_dict['net_10m'], 
-            net_day=event_dict['net_day'], timestamp=event_dict['timestamp'], is_test=event_dict.get('is_test', False)
+            code=event_dict['code'], 
+            name=event_dict['name'], 
+            scope=event_dict['scope'],
+            event_kind=event_dict.get('event_kind', 'TEST'), 
+            event_label=event_dict['event_label'], 
+            price=event_dict['price'], 
+            pct=event_dict['pct'], 
+            vwap=event_dict.get('vwap', 0), 
+            ratio=event_dict['ratio'], 
+            net_10m=event_dict['net_10m'],
+            net_1h=event_dict['net_1h'], 
+            net_day=event_dict['net_day'], 
+            timestamp=event_dict['timestamp'], 
+            is_test=event_dict.get('is_test', False)
         )
         notification_manager.enqueue(ev)
 
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.14")
+    st.title("⚙️ 戰情室 v5.16")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -497,59 +506,52 @@ def render_live_dashboard():
     if not df_watch.empty:
         df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
         
-        # FIXED: Ensure all critical columns exist and are 0-filled
+        # Ensure Critical Columns
         for col in ['net_10m', 'net_1h', 'net_day']:
             if col not in df_watch.columns: df_watch[col] = 0
             df_watch[col] = df_watch[col].fillna(0)
 
         df_watch['yoy'] = df_watch['yoy'].fillna(0)
         df_watch['eps'] = df_watch['eps'].fillna(0)
-        df_watch['pe'] = df_watch['pe'].fillna(999)
+        # [CRITICAL FIX] Leave PE as NaN for filtering, don't use 999
 
-        if use_filter: df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'] < 50)]
+        if use_filter: 
+            # [CRITICAL FIX] Use notna() instead of magic number filter
+            df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'].notna()) & (df_watch['pe'] < 50)]
         
         df_watch = df_watch.rename(columns={'event_label': '訊號', 'code': '代碼', 'name': '名稱', 'price': '現價', 'pct': '漲跌%', 'vwap': '均價', 'ratio': '量比', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
         
-        # 1. Color Price & Pct
+        # Format Data
         df_watch['現價'] = df_watch['現價'].apply(lambda x: format_number(x, decimals=2))
+        # [CRITICAL FIX] Added VWAP formatting
+        df_watch['均價'] = df_watch['均價'].apply(lambda x: format_number(x, decimals=2))
         df_watch['漲跌%'] = df_watch['漲跌%'].apply(lambda x: format_number(x, decimals=2, suffix="%"))
-        
-        # 2. Color Ratio
         df_watch['量比'] = df_watch['量比'].apply(lambda x: format_number(x, decimals=1, threshold=10))
         
-        # 3. Combined Big Player Column with Safe Display
         def format_big_player(row):
-            # If all zero (likely init), show dash
             if row['net_10m'] == 0 and row['net_1h'] == 0 and row['net_day'] == 0:
                 return "<span style='color:#e0e0e0'>-- / -- / --</span>"
-            return (
-                f"{format_number(row['net_10m'], decimals=0)} / "
-                f"{format_number(row['net_1h'], decimals=0)} / "
-                f"{format_number(row['net_day'], decimals=0)}"
-            )
-        df_watch['大戶'] = df_watch.apply(format_big_player, axis=1)
+            return f"{format_number(row['net_10m'], decimals=0)} / {format_number(row['net_1h'], decimals=0)} / {format_number(row['net_day'], decimals=0)}"
         
-        # 4. Pinned Column
+        df_watch['大戶'] = df_watch.apply(format_big_player, axis=1)
         df_watch['📌'] = df_watch['Pinned'].apply(lambda x: "📌" if x else "")
 
-        # Select & Order Columns
         cols_html = ['📌', '代碼', '名稱', '等級', '現價', '漲跌%', '均價', '量比', '訊號', '大戶', '營收YoY', 'EPS', 'PE']
         df_html = df_watch[cols_html].copy()
         
-        # HTML Table Styling
-        st.markdown(
-            f"""
+        st.markdown("""
             <style>
-                table {{ width: 100%; border-collapse: collapse; }}
-                th {{ text-align: left; background-color: #262730; color: white; padding: 8px; }}
-                td {{ padding: 8px; border-bottom: 1px solid #444; }}
-                tr:hover {{ background-color: #2e2e2e; }}
+            table.custom-table { width: 100%; border-collapse: collapse; }
+            table.custom-table th { text-align: left; background-color: #262730; color: white; padding: 8px; }
+            table.custom-table td { padding: 8px; border-bottom: 1px solid #444; }
+            table.custom-table tr:hover { background-color: #2e2e2e; }
             </style>
-            {df_html.to_html(escape=False, index=False)}
-            """, 
-            unsafe_allow_html=True
-        )
+        """, unsafe_allow_html=True)
+
+        html_str = df_html.to_html(escape=False, index=False, classes="custom-table")
+        st.markdown(html_str, unsafe_allow_html=True)
+
     else: st.info("尚無監控資料")
 
-# Render the fragment (Auto-refreshed section)
+# Render the fragment
 render_live_dashboard()
