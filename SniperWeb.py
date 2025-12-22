@@ -10,7 +10,7 @@ from itertools import cycle
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.12 Hotfix", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.13 Fix", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -122,7 +122,6 @@ class Database:
 
     def get_watchlist_view(self):
         conn = self._get_conn()
-        # FIXED: Added r.net_10m to prevent KeyError
         query = '''SELECT w.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.signal as event_label, r.net_10m, r.net_1h, r.net_day, s.yoy, s.eps, s.pe, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM watchlist w LEFT JOIN realtime r ON w.code = r.code LEFT JOIN static_info s ON w.code = s.code LEFT JOIN pinned p ON w.code = p.code'''
         df = pd.read_sql(query, conn)
         conn.close(); return df
@@ -146,8 +145,52 @@ class Database:
 db = Database(DB_PATH)
 
 # ==========================================
-# 4. Utilities
+# 4. Utilities (Safe Formatting)
 # ==========================================
+def format_number(
+    x,
+    decimals=2,
+    *,
+    pos_color="#ff4d4f",   # 紅
+    neg_color="#2ecc71",   # 綠
+    zero_color="#e0e0e0",  # 灰
+    threshold=None,
+    threshold_color="#ff4d4f",
+    suffix=""
+):
+    """
+    統一數值格式與上色：自動處理 None / NaN / 已是字串
+    """
+    try:
+        if pd.isna(x) or x == "":
+            return ""
+
+        # 已經是 HTML（避免 rerun 二次包色）
+        if isinstance(x, str) and "<span" in x:
+            return x
+
+        val = float(str(x).replace(",", "").replace("%", ""))
+        
+        # 格式化數字字串
+        if decimals == 0:
+            text = f"{int(val)}{suffix}"
+        else:
+            text = f"{val:.{decimals}f}{suffix}"
+
+        # threshold 優先 (例如量比 > 10)
+        if threshold is not None and val >= threshold:
+            return f"<span style='color:{threshold_color}'>{text}</span>"
+
+        if val > 0:
+            return f"<span style='color:{pos_color}'>{text}</span>"
+        elif val < 0:
+            return f"<span style='color:{neg_color}'>{text}</span>"
+        else:
+            return f"<span style='color:{zero_color}'>{text}</span>"
+
+    except Exception:
+        return str(x)
+
 def fetch_fundamental_data(code):
     suffix = ".TW"
     try:
@@ -316,7 +359,7 @@ class SniperEngine:
             if event_label:
                 self.active_flags[code] = True
                 if "出貨" in event_label: self.daily_risk_flags[code] = True
-                ev = SniperEvent(code, get_stock_name(code), scope, "STRATEGY", event_label, price, pct, vwap, ratio, net_10m, net_1h, net_day)
+                ev = SniperEvent(code, get_stock_name(code), scope, "STRATEGY", event_label, price, pct, vwap, ratio, net_1h, net_10m, net_day)
                 self._dispatch_event(ev)
 
             return (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m)
@@ -360,7 +403,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.12")
+    st.title("⚙️ 戰情室 v5.13")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -419,22 +462,6 @@ with st.sidebar:
             "timestamp": time.time(), "is_test": True
         })
         st.toast("測試訊號已發送")
-
-# --- HTML Coloring Helper ---
-def color_num(val, pos_color="#ff4d4f", neg_color="#2ecc71", default="#e0e0e0"):
-    try:
-        v = float(val.replace("%", "").replace(",", ""))
-        if v > 0: return f"<span style='color:{pos_color}'>{val}</span>"
-        elif v < 0: return f"<span style='color:{neg_color}'>{val}</span>"
-        else: return f"<span style='color:{default}'>{val}</span>"
-    except: return val
-
-def color_ratio(val):
-    try:
-        v = float(val)
-        if v > 10: return f"<span style='color:#ff4d4f'>{v:.1f}</span>"
-        return f"{v:.1f}"
-    except: return val
 
 # --- Safe Fragment Fallback ---
 try:
@@ -495,15 +522,15 @@ def render_live_dashboard():
         df_watch = df_watch.rename(columns={'event_label': '訊號', 'code': '代碼', 'name': '名稱', 'price': '現價', 'pct': '漲跌%', 'vwap': '均價', 'ratio': '量比', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
         
         # 1. Color Price & Pct
-        df_watch['現價'] = df_watch['現價'].apply(lambda x: color_num(f"{x:.2f}"))
-        df_watch['漲跌%'] = df_watch['漲跌%'].apply(lambda x: color_num(f"{x:.2f}%"))
+        df_watch['現價'] = df_watch['現價'].apply(lambda x: format_number(x, decimals=2))
+        df_watch['漲跌%'] = df_watch['漲跌%'].apply(lambda x: format_number(x, decimals=2, suffix="%"))
         
         # 2. Color Ratio (Now safe because column is renamed)
-        df_watch['量比'] = df_watch['量比'].apply(color_ratio)
+        df_watch['量比'] = df_watch['量比'].apply(lambda x: format_number(x, decimals=1, threshold=10))
         
-        # 3. Combined Big Player Column with Coloring
+        # 3. Combined Big Player Column with Safe Coloring
         df_watch['大戶'] = df_watch.apply(
-            lambda x: f"{color_num(str(int(x['net_10m'])))} / {color_num(str(int(x['net_1h'])))} / {color_num(str(int(x['net_day'])))}", 
+            lambda x: f"{format_number(x['net_10m'], decimals=0)} / {format_number(x['net_1h'], decimals=0)} / {format_number(x['net_day'], decimals=0)}", 
             axis=1
         )
         
