@@ -10,7 +10,7 @@ from itertools import cycle
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.5 Spec", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.7 Pro", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -22,17 +22,12 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v55.db"
+DB_PATH = "sniper_v57.db"
 DEFAULT_WATCHLIST = "3035 3037 2368 2383 6274 8046 3189 3324 3017 3653 2421 3483 3081 3163 4979 4908 3363 4977 6442 2356 3231 2382 6669 2317 2330 2454 2303 6781 4931 3533"
 DEFAULT_INVENTORY = """2330,800,1\n2317,105,5"""
 
 @dataclass
 class SniperEvent:
-    """
-    Single Source of Truth for Events.
-    - event_kind: SYSTEM | STRATEGY | TEST
-    - event_label: 攻擊 | 伏擊 | 出貨 | 量增 | 跌破 | 漲停
-    """
     code: str
     name: str
     scope: str
@@ -60,19 +55,21 @@ class MarketSession:
         return MarketSession.MARKET_OPEN <= now.time() <= MarketSession.MARKET_CLOSE
 
 # ==========================================
-# 3. Database
+# 3. Database (Async Write Queue)
 # ==========================================
 class Database:
     def __init__(self, db_path):
         self.db_path = db_path
+        self.write_queue = queue.Queue()
         self._init_db()
+        # Start dedicated writer thread
+        threading.Thread(target=self._writer_loop, daemon=True).start()
 
     def _get_conn(self): 
         return sqlite3.connect(self.db_path, check_same_thread=False)
 
     def _init_db(self):
         conn = self._get_conn(); c = conn.cursor()
-        # Realtime: 'signal' column stores 'raw_state' (e.g., 盤整, 價強)
         c.execute('''CREATE TABLE IF NOT EXISTS realtime (code TEXT PRIMARY KEY, name TEXT, category TEXT, price REAL, pct REAL, vwap REAL, vol REAL, ratio REAL, net_1h REAL, net_10m REAL, net_day REAL, signal TEXT, update_time REAL, data_status TEXT DEFAULT 'DATA_OK', signal_level TEXT DEFAULT 'B', risk_status TEXT DEFAULT 'NORMAL')''')
         c.execute('''CREATE TABLE IF NOT EXISTS inventory (code TEXT PRIMARY KEY, cost REAL, qty REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
@@ -80,70 +77,82 @@ class Database:
         c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, win REAL, ret REAL, yoy REAL, eps REAL, pe REAL)''')
         conn.commit(); conn.close()
 
+    def _writer_loop(self):
+        """Dedicated thread to handle all DB writes to prevent locking."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        while True:
+            try:
+                # Batch commit every 10 items or 0.1s
+                tasks = []
+                try:
+                    tasks.append(self.write_queue.get(timeout=0.1))
+                except queue.Empty:
+                    continue
+                
+                # Drain queue
+                while not self.write_queue.empty() and len(tasks) < 50:
+                    tasks.append(self.write_queue.get())
+
+                for task_type, sql, args in tasks:
+                    try:
+                        if task_type == 'executemany':
+                            cursor.executemany(sql, args)
+                        else:
+                            cursor.execute(sql, args)
+                    except Exception as e:
+                        print(f"DB Write Error: {e}")
+                
+                conn.commit()
+                
+                for _ in tasks:
+                    self.write_queue.task_done()
+                    
+            except Exception as e:
+                print(f"DB Writer Loop Error: {e}")
+                time.sleep(1)
+
+    # --- Async Write Methods ---
     def upsert_realtime_batch(self, data_list):
         if not data_list: return
-        conn = self._get_conn(); c = conn.cursor()
-        c.executemany('''INSERT OR REPLACE INTO realtime (code, name, category, price, pct, vwap, vol, ratio, net_1h, net_day, signal, update_time, data_status, signal_level, risk_status, net_10m) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', data_list)
-        conn.commit(); conn.close()
+        sql = '''INSERT OR REPLACE INTO realtime (code, name, category, price, pct, vwap, vol, ratio, net_1h, net_day, signal, update_time, data_status, signal_level, risk_status, net_10m) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'''
+        self.write_queue.put(('executemany', sql, data_list))
 
     def upsert_static(self, data_list):
-        conn = self._get_conn(); c = conn.cursor()
-        c.executemany('INSERT OR REPLACE INTO static_info (code, win, ret, yoy, eps, pe) VALUES (?, ?, ?, ?, ?, ?)', data_list)
-        conn.commit(); conn.close()
+        sql = 'INSERT OR REPLACE INTO static_info (code, win, ret, yoy, eps, pe) VALUES (?, ?, ?, ?, ?, ?)'
+        self.write_queue.put(('executemany', sql, data_list))
 
     def update_pinned(self, code, is_pinned):
-        conn = self._get_conn(); c = conn.cursor()
-        if is_pinned: c.execute('INSERT OR IGNORE INTO pinned (code) VALUES (?)', (code,))
-        else: c.execute('DELETE FROM pinned WHERE code = ?', (code,))
-        conn.commit(); conn.close()
+        if is_pinned: self.write_queue.put(('execute', 'INSERT OR IGNORE INTO pinned (code) VALUES (?)', (code,)))
+        else: self.write_queue.put(('execute', 'DELETE FROM pinned WHERE code = ?', (code,)))
 
+    def update_inventory_list(self, inventory_text):
+        self.write_queue.put(('execute', 'DELETE FROM inventory', ()))
+        for line in inventory_text.split('\n'):
+            parts = line.split(',')
+            if len(parts) >= 2:
+                try: 
+                    self.write_queue.put(('execute', 'INSERT OR REPLACE INTO inventory (code, cost, qty) VALUES (?, ?, ?)', (parts[0].strip(), float(parts[1].strip()), float(parts[2].strip()) if len(parts) > 2 else 1.0)))
+                except: pass
+
+    def update_watchlist(self, codes_text):
+        self.write_queue.put(('execute', 'DELETE FROM watchlist', ()))
+        targets = [t.strip() for t in codes_text.split() if t.strip()]
+        for t in targets: self.write_queue.put(('execute', 'INSERT OR REPLACE INTO watchlist (code) VALUES (?)', (t,)))
+        return targets
+
+    # --- Sync Read Methods (Safe for concurrent read) ---
     def get_watchlist_view(self):
         conn = self._get_conn()
-        # raw_state (stored in signal column) is aliased for UI display
-        query = '''
-            SELECT w.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.signal as event_label, 
-            r.net_1h, r.net_day, s.yoy, s.eps, s.pe,
-            CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned,
-            r.data_status, r.risk_status, r.signal_level
-            FROM watchlist w
-            LEFT JOIN realtime r ON w.code = r.code
-            LEFT JOIN static_info s ON w.code = s.code
-            LEFT JOIN pinned p ON w.code = p.code
-        '''
+        query = '''SELECT w.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.signal as event_label, r.net_1h, r.net_day, s.yoy, s.eps, s.pe, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM watchlist w LEFT JOIN realtime r ON w.code = r.code LEFT JOIN static_info s ON w.code = s.code LEFT JOIN pinned p ON w.code = p.code'''
         df = pd.read_sql(query, conn)
         conn.close(); return df
 
     def get_inventory_view(self):
         conn = self._get_conn()
-        query = '''
-            SELECT i.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.signal as event_label,
-            r.net_1h, r.net_day, s.yoy, s.eps, s.pe, i.cost, i.qty,
-            (r.price - i.cost) * i.qty * 1000 as profit_val,
-            (r.price - i.cost) / i.cost * 100 as profit_pct,
-            CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned,
-            r.data_status, r.risk_status
-            FROM inventory i
-            LEFT JOIN realtime r ON i.code = r.code
-            LEFT JOIN static_info s ON i.code = s.code
-            LEFT JOIN pinned p ON i.code = p.code
-        '''
+        query = '''SELECT i.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.signal as event_label, r.net_1h, r.net_day, s.yoy, s.eps, s.pe, i.cost, i.qty, (r.price - i.cost) * i.qty * 1000 as profit_val, (r.price - i.cost) / i.cost * 100 as profit_pct, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status FROM inventory i LEFT JOIN realtime r ON i.code = r.code LEFT JOIN static_info s ON i.code = s.code LEFT JOIN pinned p ON i.code = p.code'''
         df = pd.read_sql(query, conn)
         conn.close(); return df
-
-    def update_inventory_list(self, inventory_text):
-        conn = self._get_conn(); c = conn.cursor(); c.execute('DELETE FROM inventory')
-        for line in inventory_text.split('\n'):
-            parts = line.split(',')
-            if len(parts) >= 2:
-                try: c.execute('INSERT OR REPLACE INTO inventory (code, cost, qty) VALUES (?, ?, ?)', (parts[0].strip(), float(parts[1].strip()), float(parts[2].strip()) if len(parts) > 2 else 1.0))
-                except: pass
-        conn.commit(); conn.close()
-
-    def update_watchlist(self, codes_text):
-        conn = self._get_conn(); c = conn.cursor(); c.execute('DELETE FROM watchlist')
-        targets = [t.strip() for t in codes_text.split() if t.strip()]
-        for t in targets: c.execute('INSERT OR REPLACE INTO watchlist (code) VALUES (?)', (t,))
-        conn.commit(); conn.close(); return targets
 
     def get_all_codes(self):
         conn = self._get_conn(); c = conn.cursor()
@@ -166,7 +175,6 @@ def fetch_fundamental_data(code):
         if code in twstock.codes:
             if twstock.codes[code].market == '上櫃': suffix = ".TWO"
     except: pass
-    
     try:
         ticker = yf.Ticker(f"{code}{suffix}")
         info = ticker.info
@@ -187,7 +195,10 @@ def get_dynamic_thresholds(price):
 def _calc_est_vol(current_vol):
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     elapsed = (now - now.replace(hour=9, minute=0, second=0, microsecond=0)).seconds / 60
-    return int(current_vol * (270 / elapsed)) if 0 < elapsed < 270 else current_vol
+    # Add cap to avoid extreme values in early market
+    if elapsed < 1: return current_vol
+    est = int(current_vol * (270 / elapsed)) if elapsed < 270 else current_vol
+    return est # Logic can be enhanced with max cap if needed
 
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown, price, vwap, has_attacked):
     if pct >= 9.5: return "漲停"
@@ -200,17 +211,14 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is
     return "盤整"
 
 # ==========================================
-# 5. Notification
+# 5. Notification (Rate Limit + Reset)
 # ==========================================
 class NotificationManager:
     COOLDOWN_SECONDS = 600
+    RATE_LIMIT_DELAY = 1.0 # Min seconds between messages
+    
     EMOJI_MAP = {
-        "攻擊": "🚀",
-        "伏擊": "💣",
-        "量增": "👀",
-        "出貨": "💀",
-        "跌破": "⚠️",
-        "漲停": "👑"
+        "攻擊": "🚀", "伏擊": "💣", "量增": "👀", "出貨": "💀", "跌破": "⚠️", "漲停": "👑"
     }
 
     def __init__(self):
@@ -218,11 +226,12 @@ class NotificationManager:
         self._cooldowns = {}
         threading.Thread(target=self._worker_loop, daemon=True).start()
 
+    def reset_daily_state(self):
+        self._cooldowns.clear()
+
     def should_notify(self, event: SniperEvent) -> bool:
         if event.is_test: return True
         if not MarketSession.is_market_open(): return False
-        
-        # Spec: Cooldown based on Code + Scope + EventLabel
         key = f"{event.code}_{event.scope}_{event.event_label}"
         if time.time() - self._cooldowns.get(key, 0) < self.COOLDOWN_SECONDS: return False
         return True
@@ -237,6 +246,7 @@ class NotificationManager:
             event = self._queue.get()
             try:
                 self._send_telegram(event)
+                time.sleep(self.RATE_LIMIT_DELAY) # Rate limiting
             except Exception as e:
                 print(f"[TG ERROR] {e}")
             finally:
@@ -249,8 +259,7 @@ class NotificationManager:
         up_dn = "UP" if event.pct >= 0 else "DN"
         market_label = "上市"
         try:
-            if event.code in twstock.codes:
-                market_label = twstock.codes[event.code].market
+            if event.code in twstock.codes: market_label = twstock.codes[event.code].market
         except: pass
         
         msg = (
@@ -269,7 +278,7 @@ class NotificationManager:
 notification_manager = NotificationManager()
 
 # ==========================================
-# 6. Engine
+# 6. Engine (Robustness & API Rotation)
 # ==========================================
 class SniperEngine:
     def __init__(self):
@@ -278,7 +287,8 @@ class SniperEngine:
         self.client_cycle = cycle(self.clients) if self.clients else None
         self.targets = []
         self.inventory_codes = []
-        # Analysis Memory
+        
+        # In-memory states
         self.vol_history = {}
         self.daily_net = {}
         self.vol_queues = {}
@@ -287,7 +297,9 @@ class SniperEngine:
         self.daily_risk_flags = {}
         self.last_reset = datetime.now().date()
         self.last_valid_data = {}
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        
+        # Thread Pool (Persistent)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
     def update_targets(self):
         self.targets = db.get_all_codes()
@@ -304,11 +316,28 @@ class SniperEngine:
     def _dispatch_event(self, ev: SniperEvent):
         notification_manager.enqueue(ev)
 
-    def _fetch_stock(self, code):
+    def _fetch_stock_with_retry(self, code):
+        """Robust fetch with API key rotation on 429"""
+        if not self.clients: return None
+        
+        max_retries = len(self.clients) # Try all keys at most once per stock
+        for _ in range(max_retries):
+            client = next(self.client_cycle)
+            try:
+                q = client.stock.intraday.quote(symbol=code)
+                return q
+            except Exception as e:
+                if "429" in str(e) or "limit" in str(e).lower():
+                    time.sleep(0.1)
+                    continue # Try next key
+                return None # Other errors, abort
+        return None
+
+    def _process_stock(self, code):
         try:
-            client = next(self.client_cycle) if self.client_cycle else None
-            if not client: return None
-            q = client.stock.intraday.quote(symbol=code)
+            q = self._fetch_stock_with_retry(code)
+            if not q: return None
+            
             price = q.get('lastPrice', 0)
             if not price: return None
             
@@ -333,18 +362,15 @@ class SniperEngine:
                 self.vol_queues[code].append((now_ts, delta_net))
                 self.daily_net[code] = self.daily_net.get(code, 0) + delta_net
             
+            # Clean old queue data
             self.vol_queues[code] = [x for x in self.vol_queues[code] if x[0] > now_ts - 3600]
             net_1h = sum(x[1] for x in self.vol_queues[code])
             net_10m = sum(x[1] for x in self.vol_queues[code] if x[0] > now_ts - 600)
             net_day = self.daily_net.get(code, 0)
             
             tgt_pct, tgt_ratio = get_dynamic_thresholds(price)
-            
-            # --- Logic: Raw State (市場狀態) ---
-            # Rename raw_signal -> raw_state
             raw_state = check_signal(pct, price >= vwap, net_day, net_1h, ratio, tgt_pct, tgt_ratio, price < vwap*0.99, price, vwap, code in self.active_flags)
             
-            # --- Logic: Event Detection (事件觸發) ---
             event_label = None
             scope = "inventory" if code in self.inventory_codes else "watchlist"
             
@@ -372,7 +398,6 @@ class SniperEngine:
                 )
                 self._dispatch_event(ev)
 
-            # Store Raw State in DB ('signal' column)
             res = (code, get_stock_name(code), "一般", price, pct, vwap, vol, ratio, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m)
             self.last_valid_data[code] = res
             return res
@@ -381,8 +406,15 @@ class SniperEngine:
     def _run_loop(self):
         while self.running:
             now = datetime.now(timezone.utc) + timedelta(hours=8)
+            # Daily Reset Logic
             if now.date() > self.last_reset:
-                self.active_flags = {}; self.daily_risk_flags = {}; self.last_reset = now.date()
+                self.active_flags = {}
+                self.daily_risk_flags = {}
+                self.daily_net = {}
+                self.prev_data = {}
+                self.vol_queues = {}
+                notification_manager.reset_daily_state()
+                self.last_reset = now.date()
             
             targets = db.get_all_codes()
             self.inventory_codes = db.get_inventory_codes()
@@ -390,7 +422,7 @@ class SniperEngine:
             if not targets: time.sleep(2); continue
             
             batch = []
-            futures = [self.executor.submit(self._fetch_stock, c) for c in targets]
+            futures = [self.executor.submit(self._process_stock, c) for c in targets]
             for f in concurrent.futures.as_completed(futures):
                 if f.result(): batch.append(f.result())
             
@@ -406,44 +438,28 @@ if "sniper_engine_core" not in st.session_state:
 engine = st.session_state.sniper_engine_core
 
 # ==========================================
-# 7. UI
+# 7. UI (Partial Refresh)
 # ==========================================
 
-# LegacyDispatcher: Enforces Event Spec
 class LegacyDispatcher:
     def dispatch(self, event_dict):
-        # Strict mapping: requires event_label
         ev = SniperEvent(
-            code=event_dict['code'], 
-            name=event_dict['name'], 
-            scope=event_dict['scope'],
-            event_kind=event_dict.get('event_kind', 'TEST'), 
-            event_label=event_dict['event_label'],  # No fallback, must provide label
-            price=event_dict['price'], 
-            pct=event_dict['pct'], 
-            vwap=event_dict.get('vwap', 0), 
-            ratio=event_dict['ratio'],
-            net_1h=event_dict['net_1h'], 
-            net_10m=event_dict['net_10m'], 
-            net_day=event_dict['net_day'],
-            timestamp=event_dict['timestamp'], 
-            is_test=event_dict.get('is_test', False)
+            code=event_dict['code'], name=event_dict['name'], scope=event_dict['scope'],
+            event_kind=event_dict.get('event_kind', 'TEST'), event_label=event_dict['event_label'], 
+            price=event_dict['price'], pct=event_dict['pct'], vwap=event_dict.get('vwap', 0), 
+            ratio=event_dict['ratio'], net_1h=event_dict['net_1h'], net_10m=event_dict['net_10m'], 
+            net_day=event_dict['net_day'], timestamp=event_dict['timestamp'], is_test=event_dict.get('is_test', False)
         )
         notification_manager.enqueue(ev)
 
 dispatcher = LegacyDispatcher()
 
-inv_container = st.container()
-st.divider()
-watch_container = st.container()
-
 with st.sidebar:
-    st.title("⚙️ 戰情室設定 (Unified v5.5)")
+    st.title("⚙️ 戰情室 v5.7")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
-    if use_filter: st.caption("條件：YoY > 0, EPS > 0, PE < 50")
-
+    
     if mode == "👨‍✈️ 指揮官":
         with st.expander("📦 庫存管理 (Inventory)", expanded=False):
             inv_input = st.text_area("庫存清單 (代碼,成本,張數)", DEFAULT_INVENTORY, height=100)
@@ -472,87 +488,98 @@ with st.sidebar:
             
             col_a, col_b = st.columns(2)
             with col_a:
-                if st.button("🟢 啟動監控核心", disabled=engine.running):
+                if st.button("🟢 啟動監控", disabled=engine.running):
                     engine.start()
                     st.toast("核心已啟動")
             with col_b:
-                if st.button("🔴 停止監控核心", disabled=not engine.running):
+                if st.button("🔴 停止監控", disabled=not engine.running):
                     engine.stop()
                     st.toast("核心已停止")
 
     st.markdown("---")
-    st.caption(f"Engine Running: {'✅' if engine.running else '❌'}")
+    st.caption(f"Engine: {'🟢 RUNNING' if engine.running else '🔴 STOPPED'}")
     
     st.subheader("🧪 系統測試")
-    if st.button("發送測試訊號 (Test Fire 🔥)"):
-        # Updated to new spec with required event_label
+    if st.button("🔥 測試攻擊"):
         dispatcher.dispatch({
             "code": "2330", "name": "台積電 (測試)", "scope": "watchlist", 
             "event_kind": "TEST", "event_label": "攻擊",  
             "price": 888.0, "pct": 3.5, "vwap": 870.0, "ratio": 2.5, "net_10m": 150, "net_1h": 500, "net_day": 1200, 
             "timestamp": time.time(), "is_test": True
         })
-        st.success("已發送")
+        st.toast("測試訊號已發送")
 
-now_time = datetime.now(timezone.utc) + timedelta(hours=8)
-st.caption(f"最後更新: {now_time.strftime('%H:%M:%S')}")
+# --- Safe Fragment Implementation (Fallback for older streamlit) ---
+try:
+    from streamlit import fragment
+except ImportError:
+    # Fallback decorator if fragment is not available
+    def fragment(run_every=None):
+        def decorator(func):
+            def wrapper(*args, **kwargs):
+                if run_every:
+                    if "last_frag_run" not in st.session_state: st.session_state.last_frag_run = time.time()
+                    if time.time() - st.session_state.last_frag_run >= run_every:
+                        st.session_state.last_frag_run = time.time()
+                        st.rerun()
+                return func(*args, **kwargs)
+            return wrapper
+        return decorator
 
-with inv_container:
-    st.subheader("📦 庫存損益 (Portfolio)")
-    df_inv = db.get_inventory_view()
-    if not df_inv.empty:
-        df_inv = df_inv.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'event_label': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'cost': '成本', 'profit_val': '損益$', 'profit_pct': '報酬%', 'risk_status': '狀態'})
-        cols = ['代碼', '名稱', '狀態', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE', '成本', '損益$', '報酬%']
-        for c in cols: 
-            if c not in df_inv.columns: df_inv[c] = 0
-        df_inv_show = df_inv[cols].copy()
-        
-        st.data_editor(
-            df_inv_show,
-            column_config={"代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "狀態": st.column_config.TextColumn("狀態", width="small"), "成本": st.column_config.NumberColumn("成本", format="%.2f"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f"), "損益$": st.column_config.NumberColumn("損益$", format="%d"), "報酬%": st.column_config.NumberColumn("報酬%", format="%.2f%%"), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f")},
-            width='stretch', hide_index=True, disabled=True, key="inv_table"
-        )
-    else: st.info("尚無庫存資料，請在左側「指揮官」模式設定。")
+@fragment(run_every=1.5)
+def render_live_dashboard():
+    now = datetime.now(timezone.utc) + timedelta(hours=8)
+    st.caption(f"⚡ Live Refresh: {now.strftime('%H:%M:%S')} (Rate: 1.5s)")
+    
+    tab1, tab2 = st.tabs(["📦 庫存損益", "🔭 監控雷達"])
+    
+    with tab1:
+        df_inv = db.get_inventory_view()
+        if not df_inv.empty:
+            df_inv = df_inv.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'event_label': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'cost': '成本', 'profit_val': '損益$', 'profit_pct': '報酬%', 'risk_status': '狀態'})
+            cols = ['代碼', '名稱', '狀態', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE', '成本', '損益$', '報酬%']
+            for c in cols: 
+                if c not in df_inv.columns: df_inv[c] = 0
+            df_inv_show = df_inv[cols].copy()
+            
+            # NaN handling
+            for col in ['營收YoY', 'EPS', 'PE']:
+                df_inv_show[col] = df_inv_show[col].fillna(0)
 
-with watch_container:
-    st.subheader("🔭 監控雷達 (Watchlist)")
-    df_watch = db.get_watchlist_view()
-    if not df_watch.empty:
-        df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
-        if use_filter: df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'] < 50)]
-        df_watch = df_watch.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'event_label': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
-        df_watch['level_score'] = df_watch['等級'].apply(lambda x: 10 if x == 'A_PLUS' else (5 if x == 'A_MINUS' else 0))
-        df_watch = df_watch.sort_values(by=['Pinned', 'level_score', '漲跌%'], ascending=[False, False, False])
-        cols_w = ['Pinned', '代碼', '名稱', '等級', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE']
-        for c in cols_w: 
-            if c not in df_watch.columns: df_watch[c] = 0
-        df_watch_show = df_watch[cols_w].copy()
-        
-        edited_watch = st.data_editor(
-            df_watch_show,
-            column_config={"Pinned": st.column_config.CheckboxColumn("📌", width="small", pinned=True), "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "等級": st.column_config.TextColumn("等級", width="small"), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f")},
-            width='stretch', hide_index=True, key="watch_editor"
-        )
+            st.data_editor(
+                df_inv_show,
+                column_config={"代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "狀態": st.column_config.TextColumn("狀態", width="small"), "成本": st.column_config.NumberColumn("成本", format="%.2f"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f"), "損益$": st.column_config.NumberColumn("損益$", format="%d"), "報酬%": st.column_config.NumberColumn("報酬%", format="%.2f%%"), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f")},
+                width='stretch', hide_index=True, disabled=True, key="inv_table_live"
+            )
+        else: st.info("尚無庫存資料")
+
+    with tab2:
+        df_watch = db.get_watchlist_view()
         if not df_watch.empty:
-            changes = edited_watch[['代碼', 'Pinned']].set_index('代碼')
-            for index, row in changes.iterrows(): db.update_pinned(index, row['Pinned'])
-    else: st.info("尚無監控資料。")
+            df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
+            # NaN Handling for Filter
+            df_watch['yoy'] = df_watch['yoy'].fillna(0)
+            df_watch['eps'] = df_watch['eps'].fillna(0)
+            df_watch['pe'] = df_watch['pe'].fillna(999)
 
-# ==========================================
-# UI Auto Refresh (Non-Blocking)
-# ==========================================
-REFRESH_INTERVAL = 3
-now_ts = time.time()
+            if use_filter: df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'] < 50)]
+            
+            df_watch = df_watch.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'event_label': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
+            df_watch['level_score'] = df_watch['等級'].apply(lambda x: 10 if x == 'A_PLUS' else (5 if x == 'A_MINUS' else 0))
+            df_watch = df_watch.sort_values(by=['Pinned', 'level_score', '漲跌%'], ascending=[False, False, False])
+            cols_w = ['Pinned', '代碼', '名稱', '等級', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE']
+            for c in cols_w: 
+                if c not in df_watch.columns: df_watch[c] = 0
+            df_watch_show = df_watch[cols_w].copy()
+            
+            edited_watch = st.data_editor(
+                df_watch_show,
+                column_config={"Pinned": st.column_config.CheckboxColumn("📌", width="small", pinned=True), "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "等級": st.column_config.TextColumn("等級", width="small"), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f")},
+                width='stretch', hide_index=True, key="watch_editor_live"
+            )
+            if not df_watch.empty:
+                changes = edited_watch[['代碼', 'Pinned']].set_index('代碼')
+                for index, row in changes.iterrows(): db.update_pinned(index, row['Pinned'])
+        else: st.info("尚無監控資料")
 
-if "last_ui_refresh" not in st.session_state:
-    st.session_state.last_ui_refresh = now_ts
-
-if engine.running:
-    if now_ts - st.session_state.last_ui_refresh >= REFRESH_INTERVAL:
-        st.session_state.last_ui_refresh = now_ts
-        st.rerun()
-else:
-    # Slow heartbeat when stopped
-    if now_ts - st.session_state.last_ui_refresh >= 1:
-        st.session_state.last_ui_refresh = now_ts
-        st.rerun()
+render_live_dashboard()
