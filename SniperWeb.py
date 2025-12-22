@@ -543,7 +543,7 @@ def render_live_dashboard():
             table.custom-table { width: 100%; border-collapse: collapse; }
             table.custom-table th { text-align: left; background-color: #262730; color: white; padding: 8px; }
             table.custom-table td { padding: 8px; border-bottom: 1px solid #444; }
-            table.custom-table tr:hover { background-color: ##FFF3BF; }
+            table.custom-table tr:hover { background-color: #FFF3BF; }
             </style>
         """, unsafe_allow_html=True)
 
@@ -554,3 +554,4 @@ def render_live_dashboard():
 
 # Render the fragment
 render_live_dashboard()
+
