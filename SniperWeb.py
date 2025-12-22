@@ -10,7 +10,7 @@ from itertools import cycle
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.9 Stable", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.10 MaxWidth", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -359,7 +359,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.9")
+    st.title("⚙️ 戰情室 v5.10")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -368,7 +368,6 @@ with st.sidebar:
         with st.expander("📦 庫存管理 (Inventory)", expanded=False):
             inv_input = st.text_area("庫存清單 (代碼,成本,張數)", DEFAULT_INVENTORY, height=100)
             if st.button("更新庫存"):
-                # FIXED: Force Wait & Rerun
                 db.update_inventory_list(inv_input)
                 time.sleep(0.5)
                 engine.update_targets()
@@ -381,7 +380,6 @@ with st.sidebar:
                 if not API_KEYS: st.error("缺 API Key")
                 else:
                     db.update_watchlist(raw_input)
-                    # FIXED: Force Wait & Rerun
                     time.sleep(0.5)
                     engine.update_targets()
                     targets = engine.targets
@@ -459,7 +457,7 @@ def render_live_dashboard():
         st.data_editor(
             df_inv_show,
             column_config={"代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "狀態": st.column_config.TextColumn("狀態", width="small"), "成本": st.column_config.NumberColumn("成本", format="%.2f"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f"), "損益$": st.column_config.NumberColumn("損益$", format="%d"), "報酬%": st.column_config.NumberColumn("報酬%", format="%.2f%%"), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f")},
-            width='stretch', hide_index=True, disabled=True, key="inv_table_live"
+            use_container_width=True, hide_index=True, disabled=True, key="inv_table_live"
         )
     else: st.info("尚無庫存資料")
 
@@ -490,7 +488,7 @@ def render_live_dashboard():
         edited_watch = st.data_editor(
             df_watch_show,
             column_config={"Pinned": st.column_config.CheckboxColumn("📌", width="small", pinned=True), "代碼": st.column_config.TextColumn("代碼", width="small", pinned=True), "名稱": st.column_config.TextColumn("名稱", pinned=True), "等級": st.column_config.TextColumn("等級", width="small"), "營收YoY": st.column_config.NumberColumn("營收YoY", format="%.1f%%"), "EPS": st.column_config.NumberColumn("EPS", format="%.2f"), "PE": st.column_config.NumberColumn("PE", format="%.1f"), "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"), "現價": st.column_config.NumberColumn("現價", format="%.2f"), "均價": st.column_config.NumberColumn("均價", format="%.2f"), "量比": st.column_config.NumberColumn("量比", format="%.1f")},
-            width='stretch', hide_index=True, key="watch_editor_live",
+            use_container_width=True, hide_index=True, key="watch_editor_live",
             height=calc_height
         )
         if not df_watch.empty:
