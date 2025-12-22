@@ -10,7 +10,7 @@ from itertools import cycle
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.13 Fix", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.14 Safe", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -158,38 +158,22 @@ def format_number(
     threshold_color="#ff4d4f",
     suffix=""
 ):
-    """
-    統一數值格式與上色：自動處理 None / NaN / 已是字串
-    """
     try:
-        if pd.isna(x) or x == "":
-            return ""
-
-        # 已經是 HTML（避免 rerun 二次包色）
-        if isinstance(x, str) and "<span" in x:
-            return x
-
+        if pd.isna(x) or x == "": return ""
+        if isinstance(x, str) and "<span" in x: return x
+        
         val = float(str(x).replace(",", "").replace("%", ""))
         
-        # 格式化數字字串
-        if decimals == 0:
-            text = f"{int(val)}{suffix}"
-        else:
-            text = f"{val:.{decimals}f}{suffix}"
+        if decimals == 0: text = f"{int(val)}{suffix}"
+        else: text = f"{val:.{decimals}f}{suffix}"
 
-        # threshold 優先 (例如量比 > 10)
         if threshold is not None and val >= threshold:
             return f"<span style='color:{threshold_color}'>{text}</span>"
 
-        if val > 0:
-            return f"<span style='color:{pos_color}'>{text}</span>"
-        elif val < 0:
-            return f"<span style='color:{neg_color}'>{text}</span>"
-        else:
-            return f"<span style='color:{zero_color}'>{text}</span>"
-
-    except Exception:
-        return str(x)
+        if val > 0: return f"<span style='color:{pos_color}'>{text}</span>"
+        elif val < 0: return f"<span style='color:{neg_color}'>{text}</span>"
+        else: return f"<span style='color:{zero_color}'>{text}</span>"
+    except: return str(x)
 
 def fetch_fundamental_data(code):
     suffix = ".TW"
@@ -403,7 +387,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.13")
+    st.title("⚙️ 戰情室 v5.14")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -512,29 +496,40 @@ def render_live_dashboard():
     df_watch = db.get_watchlist_view()
     if not df_watch.empty:
         df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
+        
+        # FIXED: Ensure all critical columns exist and are 0-filled
+        for col in ['net_10m', 'net_1h', 'net_day']:
+            if col not in df_watch.columns: df_watch[col] = 0
+            df_watch[col] = df_watch[col].fillna(0)
+
         df_watch['yoy'] = df_watch['yoy'].fillna(0)
         df_watch['eps'] = df_watch['eps'].fillna(0)
         df_watch['pe'] = df_watch['pe'].fillna(999)
 
         if use_filter: df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'] < 50)]
         
-        # FIXED: Rename 'ratio' to '量比' here to match later usage
         df_watch = df_watch.rename(columns={'event_label': '訊號', 'code': '代碼', 'name': '名稱', 'price': '現價', 'pct': '漲跌%', 'vwap': '均價', 'ratio': '量比', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
         
         # 1. Color Price & Pct
         df_watch['現價'] = df_watch['現價'].apply(lambda x: format_number(x, decimals=2))
         df_watch['漲跌%'] = df_watch['漲跌%'].apply(lambda x: format_number(x, decimals=2, suffix="%"))
         
-        # 2. Color Ratio (Now safe because column is renamed)
+        # 2. Color Ratio
         df_watch['量比'] = df_watch['量比'].apply(lambda x: format_number(x, decimals=1, threshold=10))
         
-        # 3. Combined Big Player Column with Safe Coloring
-        df_watch['大戶'] = df_watch.apply(
-            lambda x: f"{format_number(x['net_10m'], decimals=0)} / {format_number(x['net_1h'], decimals=0)} / {format_number(x['net_day'], decimals=0)}", 
-            axis=1
-        )
+        # 3. Combined Big Player Column with Safe Display
+        def format_big_player(row):
+            # If all zero (likely init), show dash
+            if row['net_10m'] == 0 and row['net_1h'] == 0 and row['net_day'] == 0:
+                return "<span style='color:#e0e0e0'>-- / -- / --</span>"
+            return (
+                f"{format_number(row['net_10m'], decimals=0)} / "
+                f"{format_number(row['net_1h'], decimals=0)} / "
+                f"{format_number(row['net_day'], decimals=0)}"
+            )
+        df_watch['大戶'] = df_watch.apply(format_big_player, axis=1)
         
-        # 4. Pinned Column (Visual Only)
+        # 4. Pinned Column
         df_watch['📌'] = df_watch['Pinned'].apply(lambda x: "📌" if x else "")
 
         # Select & Order Columns
