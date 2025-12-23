@@ -10,7 +10,7 @@ from itertools import cycle
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.22 VolRescue", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.23 Final", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -172,24 +172,22 @@ def format_number(x, decimals=2, *, pos_color="#ff4d4f", neg_color="#2ecc71", ze
 
 def fetch_yesterday_volume_hybrid(client, code):
     """
-    [RESURRECTION] Hybrid Strategy: Fugle -> Yahoo -> Fail
+    [HYBRID] Fugle -> Yahoo -> Fail
     Returns Yesterday's Volume in LOTS (Shares/1000)
     """
-    # 1. Try Fugle (Most Accurate)
     try:
+        # Fugle
         candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=2)
         if candles and 'data' in candles and len(candles['data']) >= 2:
             return int(candles['data'][-2]['volume']) // 1000
     except: pass
 
-    # 2. Try Yahoo (Fallback)
     try:
+        # Yahoo
         suffix = ".TW"
         if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
-        # Use simple history fetch
         hist = yf.Ticker(f"{code}{suffix}").history(period="5d")
         if not hist.empty and len(hist) >= 2:
-            # Yahoo volume is shares
             return int(hist.iloc[-2]['Volume']) // 1000
     except: pass
     
@@ -349,8 +347,6 @@ class SniperEngine:
                 
                 # Try fetch
                 try:
-                    # Use a separate client cycle or just new client to avoid conflict?
-                    # Here we reuse the cycle but very slowly
                     client = next(self.client_cycle) if self.client_cycle else None
                     if client:
                         vol = fetch_yesterday_volume_hybrid(client, code)
@@ -372,10 +368,10 @@ class SniperEngine:
             client = next(self.client_cycle) if self.client_cycle else None
             if not client: return None
             
-            # [LOGIC] Only use cache. If 0, it means backfiller hasn't caught up yet.
+            # [LOGIC] Use cache or 500 fallback. 
+            # Never overwrite cache with 0. 
+            # Cache is populated by background worker or init.
             base_vol = self.base_vol_cache.get(code, 0)
-            
-            # Temporary fallback for ratio calc ONLY (don't save to DB)
             calc_base = base_vol if base_vol > 0 else 500
 
             q = client.stock.intraday.quote(symbol=code)
@@ -483,7 +479,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.22")
+    st.title("⚙️ 戰情室 v5.23")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -511,18 +507,17 @@ with st.sidebar:
                     static_list = []
                     progress_bar = status.progress(0)
                     
-                    # [FIX] Use slow fetcher inside init to ensure data populated
+                    # Use slow fetcher inside init
                     client = RestClient(api_key=API_KEYS[0])
                     
                     for i, code in enumerate(targets):
                         yoy, eps, pe = fetch_fundamental_data(code)
-                        # Fetch Vol directly here to guarantee DB has it
                         vol = fetch_yesterday_volume_hybrid(client, code)
                         vol = vol if vol else 0
                         
                         static_list.append((code, 0, 0, yoy, eps, pe, vol))
                         progress_bar.progress((i + 1) / len(targets))
-                        time.sleep(0.1) # Be nice to API
+                        time.sleep(0.1)
                         
                     db.upsert_static(static_list)
                     status.update(label="初始化完成！", state="complete")
@@ -684,4 +679,3 @@ def render_live_dashboard():
 
 # Render the fragment
 render_live_dashboard()
-
