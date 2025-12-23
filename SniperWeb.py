@@ -525,7 +525,7 @@ def render_live_dashboard():
         df_watch['現價'] = df_watch['現價'].apply(lambda x: format_number(x, decimals=2))
         df_watch['均價'] = df_watch['均價'].apply(lambda x: format_number(x, decimals=2))
         df_watch['漲跌%'] = df_watch['漲跌%'].apply(lambda x: format_number(x, decimals=2, suffix="%"))
-        df_watch['量比'] = df_watch['量比'].apply(lambda x: format_number(x, decimals=1, threshold=10))
+        df_watch['量比'] = df_watch['量比'].apply(lambda x: format_number(x, decimals=1, threshold=10, pos_color="#ffffff"))
         df_watch['PE'] = df_watch['PE'].apply(lambda x: format_number(x, decimals=1))
         
         def format_big_player(row):
@@ -555,5 +555,6 @@ def render_live_dashboard():
 
 # Render the fragment
 render_live_dashboard()
+
 
 
