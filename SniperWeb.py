@@ -10,7 +10,7 @@ from itertools import cycle
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.19 Classic", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.20 Cache", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -73,7 +73,7 @@ class Database:
         c.execute('''CREATE TABLE IF NOT EXISTS inventory (code TEXT PRIMARY KEY, cost REAL, qty REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS pinned (code TEXT PRIMARY KEY)''')
-        # avg_vol now stores "Yesterday Volume"
+        # avg_vol now stores "Yesterday Volume" (cached)
         c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, win REAL, ret REAL, yoy REAL, eps REAL, pe REAL, avg_vol REAL DEFAULT 0)''')
         conn.commit(); conn.close()
 
@@ -100,8 +100,16 @@ class Database:
         self.write_queue.put(('executemany', sql, data_list))
 
     def upsert_static(self, data_list):
+        # Insert without overwriting avg_vol (handle it separately or be careful)
+        # Here we use REPLACE, so we must include avg_vol.
+        # But usually static init sets avg_vol to 0 initially.
         sql = 'INSERT OR REPLACE INTO static_info (code, win, ret, yoy, eps, pe, avg_vol) VALUES (?, ?, ?, ?, ?, ?, ?)'
         self.write_queue.put(('executemany', sql, data_list))
+
+    def update_base_vol(self, code, vol):
+        """[NEW] Update single base volume to DB"""
+        sql = 'UPDATE static_info SET avg_vol = ? WHERE code = ?'
+        self.write_queue.put(('execute', sql, (vol, code)))
 
     def update_pinned(self, code, is_pinned):
         if is_pinned: self.write_queue.put(('execute', 'INSERT OR IGNORE INTO pinned (code) VALUES (?)', (code,)))
@@ -147,12 +155,13 @@ class Database:
         conn = self._get_conn(); c = conn.cursor()
         c.execute('SELECT code, avg_vol FROM static_info')
         rows = c.fetchall(); conn.close()
-        return {r[0]: r[1] for r in rows if r[1] > 0}
+        # Return dict of codes where volume is already cached (>0)
+        return {r[0]: r[1] for r in rows if r[1] and r[1] > 0}
 
 db = Database(DB_PATH)
 
 # ==========================================
-# 4. Utilities (Classic Logic Restored)
+# 4. Utilities
 # ==========================================
 def format_number(x, decimals=2, *, pos_color="#ff4d4f", neg_color="#2ecc71", zero_color="#e0e0e0", threshold=None, threshold_color="#ff4d4f", suffix=""):
     try:
@@ -168,12 +177,10 @@ def format_number(x, decimals=2, *, pos_color="#ff4d4f", neg_color="#2ecc71", ze
     except: return str(x)
 
 def fetch_yesterday_volume(client, code):
-    """[CLASSIC LOGIC] Fetch Volume from Fugle Candles (D-1)"""
+    """Attempt to fetch yesterday volume from Fugle"""
     try:
-        # Fetch last 2 days to get yesterday
         candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=2)
         if candles and 'data' in candles and len(candles['data']) >= 2:
-            # Fugle returns shares, convert to lots (/1000)
             return int(candles['data'][-2]['volume']) // 1000
     except: pass
     return None
@@ -191,7 +198,6 @@ def fetch_fundamental_data(code):
             yoy = (info.get('revenueGrowth', 0) or 0) * 100
             eps = info.get('trailingEps', 0) or 0
             pe = info.get('trailingPE', 0) or 0
-            # [NOTE] We don't fetch avg_vol here anymore, we use Fugle in Engine
             return yoy, eps, pe
     except: pass
     return 0, 0, 0
@@ -206,21 +212,12 @@ def get_dynamic_thresholds(price):
     else: return 2.0, 1.2
 
 def _calc_est_vol(current_vol):
-    """
-    [CLASSIC LOGIC] Linear Projection
-    Raw volume (shares) -> Estimated daily volume (shares)
-    """
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    
     if now < market_open: return 0 
-    
     elapsed_minutes = (now - market_open).seconds / 60
-    
     if elapsed_minutes <= 0: return 0
-    if elapsed_minutes >= 270: return current_vol # Market closed
-
-    # Simple Linear Projection (Old School)
+    if elapsed_minutes >= 270: return current_vol
     return int(current_vol * (270 / elapsed_minutes))
 
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown, price, vwap, has_attacked):
@@ -290,7 +287,7 @@ class NotificationManager:
 notification_manager = NotificationManager()
 
 # ==========================================
-# 6. Engine (Classic Volume Logic)
+# 6. Engine (Persistent Cache)
 # ==========================================
 class SniperEngine:
     def __init__(self):
@@ -299,7 +296,7 @@ class SniperEngine:
         self.client_cycle = cycle(self.clients) if self.clients else None
         self.targets = []
         self.inventory_codes = []
-        self.yesterday_vol = {} # Stores YESTERDAY'S volume
+        self.base_vol_cache = {} # Persistent Cache
         self.daily_net = {}
         self.vol_queues = {}
         self.prev_data = {}
@@ -311,8 +308,8 @@ class SniperEngine:
     def update_targets(self):
         self.targets = db.get_all_codes()
         self.inventory_codes = db.get_inventory_codes()
-        # Note: We fetch yesterday's vol dynamically in _fetch_stock, or pre-load here if needed.
-        # For simplicity and robustness, we lazy load in _fetch_stock
+        # [CACHE] Load existing volumes from DB on init
+        self.base_vol_cache = db.get_volume_map()
 
     def start(self):
         if self.running: return
@@ -327,76 +324,64 @@ class SniperEngine:
 
     def _fetch_stock(self, code):
         try:
-            # 1. Get Client
             client = next(self.client_cycle) if self.client_cycle else None
             if not client: return None
             
-            # 2. Lazy Load Yesterday's Volume (Classic Logic)
-            if code not in self.yesterday_vol:
-                y_vol = fetch_yesterday_volume(client, code)
-                if y_vol: self.yesterday_vol[code] = y_vol
-                else: self.yesterday_vol[code] = 1000 # Fallback 1000 if fails
+            # [CACHE LOGIC START]
+            # 1. Check Memory Cache
+            base_vol = self.base_vol_cache.get(code, 0)
             
-            base_vol = self.yesterday_vol.get(code, 1000)
+            # 2. If missing, try fetch (Only fetch if we don't have it)
+            if base_vol <= 0:
+                y_vol = fetch_yesterday_volume(client, code)
+                if y_vol and y_vol > 0:
+                    base_vol = y_vol
+                    # Save to Memory
+                    self.base_vol_cache[code] = base_vol
+                    # Save to DB (Persistent)
+                    db.update_base_vol(code, base_vol)
+                else:
+                    # [RETRY STRATEGY] Do NOT save 0/dummy to cache.
+                    # Just fallback for this single calculation, keep retrying next loop.
+                    base_vol = 500 # Temporary fallback for ratio calculation only
+            # [CACHE LOGIC END]
 
-            # 3. Get Realtime Quote
             q = client.stock.intraday.quote(symbol=code)
             price = q.get('lastPrice', 0)
             if not price: return None
             
             pct = q.get('changePercent', 0)
-            vol_shares = q.get('total', {}).get('tradeVolume', 0)
-            vol = vol_shares * 1000 # To shares? No, volume is usually lots in Fugle quote? Wait. 
-            # Correction: Fugle 'tradeVolume' is usually lots. 'tradeValue' is total value.
-            # Let's align units:
-            # base_vol is in LOTS (shares // 1000).
-            # q['total']['tradeVolume'] is usually LOTS.
-            # So ratio = est_lots / base_lots.
+            vol_lots = q.get('total', {}).get('tradeVolume', 0)
+            vol = vol_lots * 1000 
             
-            # Re-read legacy code: 
-            # daily_vol = row['Volume'] -> Yahoo daily is shares? Fugle candles is shares.
-            # q.get('total').get('tradeVolume') is LOTS.
-            
-            current_lots = q.get('total', {}).get('tradeVolume', 0)
-            est_lots = _calc_est_vol(current_lots)
-            
+            est_lots = _calc_est_vol(vol_lots)
+            # Use the base_vol (which is either cached true val, or temp fallback)
             ratio = est_lots / base_vol if base_vol > 0 else 0
             
-            # VWAP Calculation
-            # tradeValue is total TWD. tradeVolume is lots.
-            # VWAP = Value / (Volume * 1000)
             total_val = q.get('total', {}).get('tradeValue', 0)
-            vwap = (total_val / (current_lots * 1000)) if current_lots > 0 else price
+            vwap = (total_val / vol) if vol > 0 else price
             
-            # Big Player Logic (Legacy)
             delta_net = 0
             if code in self.prev_data:
                 prev_v = self.prev_data[code]['vol']
                 prev_p = self.prev_data[code]['price']
-                # Delta Volume (Lots)
-                delta_v = current_lots - prev_v
-                
-                threshold = int(400/price) if price > 0 else 5
-                threshold = max(1, threshold)
-                
+                delta_v = vol_lots - prev_v
+                threshold = max(1, int(400/price)) if price > 0 else 5
                 if delta_v >= threshold:
                     if price >= prev_p: delta_net = int(delta_v)
                     elif price < prev_p: delta_net = -int(delta_v)
             
-            self.prev_data[code] = {'vol': current_lots, 'price': price}
-            
+            self.prev_data[code] = {'vol': vol_lots, 'price': price}
             now_ts = time.time()
             if code not in self.vol_queues: self.vol_queues[code] = []
             if delta_net != 0: self.vol_queues[code].append((now_ts, delta_net))
             
-            # Clean old queue
             self.daily_net[code] = self.daily_net.get(code, 0) + delta_net
             self.vol_queues[code] = [x for x in self.vol_queues[code] if x[0] > now_ts - 3600]
             net_1h = sum(x[1] for x in self.vol_queues[code])
             net_10m = sum(x[1] for x in self.vol_queues[code] if x[0] > now_ts - 600)
             net_day = self.daily_net.get(code, 0)
             
-            # Signal Check
             tgt_pct, tgt_ratio = get_dynamic_thresholds(price)
             raw_state = check_signal(pct, price >= vwap, net_day, net_1h, ratio, tgt_pct, tgt_ratio, price < vwap*0.99, price, vwap, code in self.active_flags)
             
@@ -418,7 +403,7 @@ class SniperEngine:
                 )
                 self._dispatch_event(ev)
 
-            return (code, get_stock_name(code), "一般", price, pct, vwap, current_lots, ratio, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m)
+            return (code, get_stock_name(code), "一般", price, pct, vwap, vol_lots, ratio, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m)
         except: return None
 
     def _run_loop(self):
@@ -430,7 +415,7 @@ class SniperEngine:
                 self.daily_net = {}
                 self.prev_data = {}
                 self.vol_queues = {}
-                self.yesterday_vol = {} # Reset base vol daily
+                self.base_vol_cache = {} # Clear cache daily
                 notification_manager.reset_daily_state()
                 self.last_reset = now.date()
             
@@ -467,7 +452,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.19")
+    st.title("⚙️ 戰情室 v5.20")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -496,7 +481,7 @@ with st.sidebar:
                     progress_bar = status.progress(0)
                     for i, code in enumerate(targets):
                         yoy, eps, pe = fetch_fundamental_data(code)
-                        # Static info no longer holds avg_vol, set 0
+                        # Init with 0 vol, let engine fill it
                         static_list.append((code, 0, 0, yoy, eps, pe, 0))
                         progress_bar.progress((i + 1) / len(targets))
                     db.upsert_static(static_list)
@@ -603,11 +588,11 @@ def render_live_dashboard():
         
         df_watch = df_watch.rename(columns={'event_label': '訊號', 'code': '代碼', 'name': '名稱', 'price': '現價', 'pct': '漲跌%', 'vwap': '均價', 'ratio': '量比', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
         
-        df_watch['現價'] = df_watch['現價'].apply(lambda x: format_number(x, decimals=2, pos_color="#000000"))
-        df_watch['均價'] = df_watch['均價'].apply(lambda x: format_number(x, decimals=2, pos_color="#000000"))
+        df_watch['現價'] = df_watch['現價'].apply(lambda x: format_number(x, decimals=2, pos_color="#e0e0e0"))
+        df_watch['均價'] = df_watch['均價'].apply(lambda x: format_number(x, decimals=2, pos_color="#e0e0e0"))
         df_watch['漲跌%'] = df_watch['漲跌%'].apply(lambda x: format_number(x, decimals=2, suffix="%"))
         df_watch['量比'] = df_watch['量比'].apply(
-            lambda x: format_number(x, decimals=1, threshold=10, pos_color="#cccccc") if float(str(x or 0).replace(',','')) > 0 else "<span style='color:#cccccc'>-</span>"
+            lambda x: format_number(x, decimals=1, threshold=10, pos_color="#cccccc") if float(str(x or 0).replace(',','')) > 0 else "<span style='color:#e0e0e0'>-</span>"
         )
         df_watch['PE'] = df_watch['PE'].apply(lambda x: format_number(x, decimals=1))
         
@@ -627,7 +612,7 @@ def render_live_dashboard():
             table.custom-table { width: 100%; border-collapse: collapse; }
             table.custom-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; }
             table.custom-table td { padding: 8px; border-bottom: 1px solid #444; font-size: 14px; }
-            table.custom-table tr:hover { background-color: #FFF3BF; }
+            table.custom-table tr:hover { background-color: #2e2e2e; }
             </style>
         """, unsafe_allow_html=True)
 
@@ -638,7 +623,3 @@ def render_live_dashboard():
 
 # Render the fragment
 render_live_dashboard()
-
-
-
-
