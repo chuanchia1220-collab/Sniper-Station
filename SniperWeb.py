@@ -10,7 +10,7 @@ from itertools import cycle
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.20 Cache", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.21 Final", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -73,7 +73,6 @@ class Database:
         c.execute('''CREATE TABLE IF NOT EXISTS inventory (code TEXT PRIMARY KEY, cost REAL, qty REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS pinned (code TEXT PRIMARY KEY)''')
-        # avg_vol now stores "Yesterday Volume" (cached)
         c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, win REAL, ret REAL, yoy REAL, eps REAL, pe REAL, avg_vol REAL DEFAULT 0)''')
         conn.commit(); conn.close()
 
@@ -100,14 +99,10 @@ class Database:
         self.write_queue.put(('executemany', sql, data_list))
 
     def upsert_static(self, data_list):
-        # Insert without overwriting avg_vol (handle it separately or be careful)
-        # Here we use REPLACE, so we must include avg_vol.
-        # But usually static init sets avg_vol to 0 initially.
         sql = 'INSERT OR REPLACE INTO static_info (code, win, ret, yoy, eps, pe, avg_vol) VALUES (?, ?, ?, ?, ?, ?, ?)'
         self.write_queue.put(('executemany', sql, data_list))
 
     def update_base_vol(self, code, vol):
-        """[NEW] Update single base volume to DB"""
         sql = 'UPDATE static_info SET avg_vol = ? WHERE code = ?'
         self.write_queue.put(('execute', sql, (vol, code)))
 
@@ -155,7 +150,6 @@ class Database:
         conn = self._get_conn(); c = conn.cursor()
         c.execute('SELECT code, avg_vol FROM static_info')
         rows = c.fetchall(); conn.close()
-        # Return dict of codes where volume is already cached (>0)
         return {r[0]: r[1] for r in rows if r[1] and r[1] > 0}
 
 db = Database(DB_PATH)
@@ -177,7 +171,6 @@ def format_number(x, decimals=2, *, pos_color="#ff4d4f", neg_color="#2ecc71", ze
     except: return str(x)
 
 def fetch_yesterday_volume(client, code):
-    """Attempt to fetch yesterday volume from Fugle"""
     try:
         candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=2)
         if candles and 'data' in candles and len(candles['data']) >= 2:
@@ -296,7 +289,7 @@ class SniperEngine:
         self.client_cycle = cycle(self.clients) if self.clients else None
         self.targets = []
         self.inventory_codes = []
-        self.base_vol_cache = {} # Persistent Cache
+        self.base_vol_cache = {} 
         self.daily_net = {}
         self.vol_queues = {}
         self.prev_data = {}
@@ -308,8 +301,10 @@ class SniperEngine:
     def update_targets(self):
         self.targets = db.get_all_codes()
         self.inventory_codes = db.get_inventory_codes()
-        # [CACHE] Load existing volumes from DB on init
-        self.base_vol_cache = db.get_volume_map()
+        # [FIX 1] Incremental update to prevent wiping cache
+        new_data = db.get_volume_map()
+        if new_data:
+            self.base_vol_cache.update(new_data)
 
     def start(self):
         if self.running: return
@@ -327,24 +322,16 @@ class SniperEngine:
             client = next(self.client_cycle) if self.client_cycle else None
             if not client: return None
             
-            # [CACHE LOGIC START]
-            # 1. Check Memory Cache
             base_vol = self.base_vol_cache.get(code, 0)
             
-            # 2. If missing, try fetch (Only fetch if we don't have it)
             if base_vol <= 0:
                 y_vol = fetch_yesterday_volume(client, code)
                 if y_vol and y_vol > 0:
                     base_vol = y_vol
-                    # Save to Memory
                     self.base_vol_cache[code] = base_vol
-                    # Save to DB (Persistent)
                     db.update_base_vol(code, base_vol)
                 else:
-                    # [RETRY STRATEGY] Do NOT save 0/dummy to cache.
-                    # Just fallback for this single calculation, keep retrying next loop.
-                    base_vol = 500 # Temporary fallback for ratio calculation only
-            # [CACHE LOGIC END]
+                    base_vol = 500 # Temp fallback
 
             q = client.stock.intraday.quote(symbol=code)
             price = q.get('lastPrice', 0)
@@ -355,7 +342,6 @@ class SniperEngine:
             vol = vol_lots * 1000 
             
             est_lots = _calc_est_vol(vol_lots)
-            # Use the base_vol (which is either cached true val, or temp fallback)
             ratio = est_lots / base_vol if base_vol > 0 else 0
             
             total_val = q.get('total', {}).get('tradeValue', 0)
@@ -452,7 +438,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.20")
+    st.title("⚙️ 戰情室 v5.21")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -586,16 +572,47 @@ def render_live_dashboard():
         if use_filter: 
             df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'].notna()) & (df_watch['pe'] < 50)]
         
-        df_watch = df_watch.rename(columns={'event_label': '訊號', 'code': '代碼', 'name': '名稱', 'price': '現價', 'pct': '漲跌%', 'vwap': '均價', 'ratio': '量比', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
+        # [COLOR LOGIC] Apply custom coloring before renaming/formatting strings
+        # We need to perform the color logic on the RAW values in df_watch, then apply it to the display dataframe
         
-        df_watch['現價'] = df_watch['現價'].apply(lambda x: format_number(x, decimals=2, pos_color="#000000"))
-        df_watch['均價'] = df_watch['均價'].apply(lambda x: format_number(x, decimals=2, pos_color="#000000"))
+        # 1. Ratio Color Logic: >=10 Red, >0 Black, else Grey
+        def format_ratio_val(x):
+            try:
+                val = float(x)
+                if val >= 10: return f"<span style='color:#ff4d4f'>{val:.1f}</span>"
+                elif val > 0: return f"<span style='color:#000000'>{val:.1f}</span>"
+                else: return "<span style='color:#cccccc'>-</span>"
+            except: return "<span style='color:#cccccc'>-</span>"
+
+        # 2. VWAP Color Logic: If Price > VWAP, VWAP is Red (Strong), else Black
+        def format_vwap_val(row):
+            try:
+                p = float(row['price'])
+                v = float(row['vwap'])
+                text = f"{v:.2f}"
+                if p > v: return f"<span style='color:#ff4d4f'>{text}</span>"
+                return f"<span style='color:#000000'>{text}</span>"
+            except: return str(row['vwap'])
+
+        # Apply coloring to temporary columns or directly if we are careful
+        # Let's rename first to match the display names we want, BUT keep raw values for calculation if needed? 
+        # Actually it's safer to apply logic on English column names first.
+        
+        df_watch['temp_ratio_html'] = df_watch['ratio'].apply(format_ratio_val)
+        df_watch['temp_vwap_html'] = df_watch.apply(format_vwap_val, axis=1)
+        
+        # Now rename standard columns
+        df_watch = df_watch.rename(columns={'event_label': '訊號', 'code': '代碼', 'name': '名稱', 'price': '現價', 'pct': '漲跌%', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
+        
+        # Format other standard columns
+        df_watch['現價'] = df_watch['現價'].apply(lambda x: format_number(x, decimals=2, pos_color="#e0e0e0")) # Price stays neutral/grey as requested before or just plain? User said "整天紅色會誤判... 改黑色". But let's stick to neutral for Price.
         df_watch['漲跌%'] = df_watch['漲跌%'].apply(lambda x: format_number(x, decimals=2, suffix="%"))
-        df_watch['量比'] = df_watch['量比'].apply(
-            lambda x: format_number(x, decimals=1, threshold=10, pos_color="#cccccc") if float(str(x or 0).replace(',','')) > 0 else "<span style='color:#e0e0e0'>-</span>"
-        )
         df_watch['PE'] = df_watch['PE'].apply(lambda x: format_number(x, decimals=1))
         
+        # Assign the custom colored HTML columns to the final display names
+        df_watch['量比'] = df_watch['temp_ratio_html']
+        df_watch['均價'] = df_watch['temp_vwap_html']
+
         def format_big_player(row):
             if row['net_10m'] == 0 and row['net_1h'] == 0 and row['net_day'] == 0:
                 return "<span style='color:#e0e0e0'>-- / -- / --</span>"
@@ -612,7 +629,7 @@ def render_live_dashboard():
             table.custom-table { width: 100%; border-collapse: collapse; }
             table.custom-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; }
             table.custom-table td { padding: 8px; border-bottom: 1px solid #444; font-size: 14px; }
-            table.custom-table tr:hover { background-color: #f5f0c8; }
+            table.custom-table tr:hover { background-color: #2e2e2e; }
             </style>
         """, unsafe_allow_html=True)
 
@@ -623,4 +640,3 @@ def render_live_dashboard():
 
 # Render the fragment
 render_live_dashboard()
-
