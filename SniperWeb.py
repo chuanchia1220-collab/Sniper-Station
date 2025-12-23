@@ -10,7 +10,7 @@ from itertools import cycle
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.23 Final", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.24 Stable", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -22,7 +22,8 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v60.db"
+# [DB UPGRADE] Use v61 to force clean 5MA cache
+DB_PATH = "sniper_v61.db"
 DEFAULT_WATCHLIST = "3035 3037 2368 2383 6274 8046 3189 3324 3017 3653 2421 3483 3081 3163 4979 4908 3363 4977 6442 2356 3231 2382 6669 2317 2330 2454 2303 6781 4931 3533"
 DEFAULT_INVENTORY = """2330,800,1\n2317,105,5"""
 
@@ -73,6 +74,7 @@ class Database:
         c.execute('''CREATE TABLE IF NOT EXISTS inventory (code TEXT PRIMARY KEY, cost REAL, qty REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS pinned (code TEXT PRIMARY KEY)''')
+        # avg_vol now stores "5-Day Average Volume"
         c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, win REAL, ret REAL, yoy REAL, eps REAL, pe REAL, avg_vol REAL DEFAULT 0)''')
         conn.commit(); conn.close()
 
@@ -155,7 +157,7 @@ class Database:
 db = Database(DB_PATH)
 
 # ==========================================
-# 4. Utilities (Hybrid Vol Fetcher)
+# 4. Utilities (5MA + Anti-Flicker)
 # ==========================================
 def format_number(x, decimals=2, *, pos_color="#ff4d4f", neg_color="#2ecc71", zero_color="#e0e0e0", threshold=None, threshold_color="#ff4d4f", suffix=""):
     try:
@@ -170,25 +172,31 @@ def format_number(x, decimals=2, *, pos_color="#ff4d4f", neg_color="#2ecc71", ze
         else: return f"<span style='color:{zero_color}'>{text}</span>"
     except: return str(x)
 
-def fetch_yesterday_volume_hybrid(client, code):
+def fetch_5ma_volume_hybrid(client, code):
     """
-    [HYBRID] Fugle -> Yahoo -> Fail
-    Returns Yesterday's Volume in LOTS (Shares/1000)
+    [STABLE] Fetch 5-Day Average Volume
+    Strategy: Yahoo (Strong for Hist) -> Fugle -> Fail
+    Returns: Volume in LOTS (Zhang)
     """
+    # 1. Try Yahoo (Best for History)
     try:
-        # Fugle
-        candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=2)
-        if candles and 'data' in candles and len(candles['data']) >= 2:
-            return int(candles['data'][-2]['volume']) // 1000
-    except: pass
-
-    try:
-        # Yahoo
         suffix = ".TW"
         if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
-        hist = yf.Ticker(f"{code}{suffix}").history(period="5d")
-        if not hist.empty and len(hist) >= 2:
-            return int(hist.iloc[-2]['Volume']) // 1000
+        # Fetch 10 days to be safe, take last 5
+        hist = yf.Ticker(f"{code}{suffix}").history(period="10d")
+        if not hist.empty and len(hist) >= 5:
+            # Calculate mean of last 5 days volume (Shares)
+            avg_shares = hist['Volume'].tail(5).mean()
+            return int(avg_shares) // 1000
+    except: pass
+
+    # 2. Try Fugle (Fallback)
+    try:
+        candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=5)
+        if candles and 'data' in candles and len(candles['data']) >= 5:
+            total_shares = sum(int(c['volume']) for c in candles['data'])
+            avg_shares = total_shares / 5
+            return int(avg_shares) // 1000
     except: pass
     
     return None
@@ -220,6 +228,10 @@ def get_dynamic_thresholds(price):
     else: return 2.0, 1.2
 
 def _calc_est_vol(current_vol):
+    """
+    [SMOOTHED] Linear projection with early market dampener logic built-in naturally?
+    No, let's stick to standard linear but reliance on 5MA denominator makes it stable.
+    """
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
     if now < market_open: return 0 
@@ -295,7 +307,7 @@ class NotificationManager:
 notification_manager = NotificationManager()
 
 # ==========================================
-# 6. Engine (Persistent Cache + Background Worker)
+# 6. Engine (5MA Cache + Anti-Flicker)
 # ==========================================
 class SniperEngine:
     def __init__(self):
@@ -316,7 +328,7 @@ class SniperEngine:
     def update_targets(self):
         self.targets = db.get_all_codes()
         self.inventory_codes = db.get_inventory_codes()
-        # [FIX] Load existing volumes from DB on init
+        # Load existing volumes (5MA)
         new_data = db.get_volume_map()
         if new_data:
             self.base_vol_cache.update(new_data)
@@ -326,39 +338,31 @@ class SniperEngine:
         self.update_targets()
         self.running = True
         threading.Thread(target=self._run_loop, daemon=True).start()
-        # [NEW] Start background volume backfiller
+        # Start background 5MA backfiller
         threading.Thread(target=self._worker_volume_backfill, daemon=True).start()
 
     def stop(self): self.running = False
 
     def _worker_volume_backfill(self):
-        """Slowly backfill missing volumes (Fugle/Yahoo Hybrid)"""
+        """Slowly backfill missing 5MA volumes"""
         while self.running:
             if not self.targets:
-                time.sleep(5)
-                continue
-                
+                time.sleep(5); continue
             for code in self.targets:
                 if not self.running: break
-                
-                # Check if we already have it in memory
+                # Skip if already cached
                 if code in self.base_vol_cache and self.base_vol_cache[code] > 0:
-                    continue # Skip if already has data
-                
-                # Try fetch
+                    continue 
                 try:
                     client = next(self.client_cycle) if self.client_cycle else None
                     if client:
-                        vol = fetch_yesterday_volume_hybrid(client, code)
+                        vol = fetch_5ma_volume_hybrid(client, code)
                         if vol and vol > 0:
                             self.base_vol_cache[code] = vol
                             db.update_base_vol(code, vol)
                 except: pass
-                
-                # Sleep to prevent Rate Limit
                 time.sleep(1.0) 
-            
-            time.sleep(10) # Pause after full cycle
+            time.sleep(10)
 
     def _dispatch_event(self, ev: SniperEvent):
         notification_manager.enqueue(ev)
@@ -368,9 +372,7 @@ class SniperEngine:
             client = next(self.client_cycle) if self.client_cycle else None
             if not client: return None
             
-            # [LOGIC] Use cache or 500 fallback. 
-            # Never overwrite cache with 0. 
-            # Cache is populated by background worker or init.
+            # [LOGIC] Use 5MA cache or fallback
             base_vol = self.base_vol_cache.get(code, 0)
             calc_base = base_vol if base_vol > 0 else 500
 
@@ -380,6 +382,11 @@ class SniperEngine:
             
             pct = q.get('changePercent', 0)
             vol_lots = q.get('total', {}).get('tradeVolume', 0)
+            
+            # [ANTI-FLICKER] If API returns 0 volume, use last known volume
+            if vol_lots == 0 and code in self.prev_data:
+                vol_lots = self.prev_data[code]['vol']
+            
             vol = vol_lots * 1000 
             
             est_lots = _calc_est_vol(vol_lots)
@@ -479,7 +486,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.23")
+    st.title("⚙️ 戰情室 v5.24")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -503,16 +510,16 @@ with st.sidebar:
                     time.sleep(0.5)
                     engine.update_targets()
                     targets = engine.targets
-                    status = st.status("正在初始化數據 (含基本面與均量)...", expanded=True)
+                    status = st.status("正在初始化數據 (含5日均量)...", expanded=True)
                     static_list = []
                     progress_bar = status.progress(0)
                     
-                    # Use slow fetcher inside init
                     client = RestClient(api_key=API_KEYS[0])
                     
                     for i, code in enumerate(targets):
                         yoy, eps, pe = fetch_fundamental_data(code)
-                        vol = fetch_yesterday_volume_hybrid(client, code)
+                        # Fetch 5MA Vol directly here
+                        vol = fetch_5ma_volume_hybrid(client, code)
                         vol = vol if vol else 0
                         
                         static_list.append((code, 0, 0, yoy, eps, pe, vol))
