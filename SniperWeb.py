@@ -603,8 +603,8 @@ def render_live_dashboard():
         
         df_watch = df_watch.rename(columns={'event_label': '訊號', 'code': '代碼', 'name': '名稱', 'price': '現價', 'pct': '漲跌%', 'vwap': '均價', 'ratio': '量比', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
         
-        df_watch['現價'] = df_watch['現價'].apply(lambda x: format_number(x, decimals=2, pos_color="#e0e0e0"))
-        df_watch['均價'] = df_watch['均價'].apply(lambda x: format_number(x, decimals=2, pos_color="#e0e0e0"))
+        df_watch['現價'] = df_watch['現價'].apply(lambda x: format_number(x, decimals=2, pos_color="#000000"))
+        df_watch['均價'] = df_watch['均價'].apply(lambda x: format_number(x, decimals=2, pos_color="#000000"))
         df_watch['漲跌%'] = df_watch['漲跌%'].apply(lambda x: format_number(x, decimals=2, suffix="%"))
         df_watch['量比'] = df_watch['量比'].apply(
             lambda x: format_number(x, decimals=1, threshold=10, pos_color="#cccccc") if float(str(x or 0).replace(',','')) > 0 else "<span style='color:#cccccc'>-</span>"
@@ -638,6 +638,7 @@ def render_live_dashboard():
 
 # Render the fragment
 render_live_dashboard()
+
 
 
 
