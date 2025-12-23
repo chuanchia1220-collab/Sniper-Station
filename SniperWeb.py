@@ -181,7 +181,7 @@ def fetch_fundamental_data(code):
         info = ticker.info
         if info and 'symbol' in info:
             # [LOGIC UPDATE] Get average volume (default to 5000 if missing)
-            avg_vol = info.get('averageVolume', 5000) or 5000
+            avg_vol = (info.get('averageVolume', 5_000_000) or 5_000_000) / 1000
             yoy = (info.get('revenueGrowth', 0) or 0) * 100
             eps = info.get('trailingEps', 0) or 0
             pe = info.get('trailingPE', 0) or 0
@@ -201,7 +201,8 @@ def get_dynamic_thresholds(price):
 def _calc_est_vol(current_vol):
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     elapsed = (now - now.replace(hour=9, minute=0, second=0, microsecond=0)).seconds / 60
-    if elapsed < 1: return current_vol
+    if elapsed < 10:
+    return current_vol * 27  # 直接推估一日（270 分鐘）
     return int(current_vol * (270 / elapsed)) if elapsed < 270 else current_vol
 
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown, price, vwap, has_attacked):
@@ -555,6 +556,7 @@ def render_live_dashboard():
 
 # Render the fragment
 render_live_dashboard()
+
 
 
 
