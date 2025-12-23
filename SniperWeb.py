@@ -10,7 +10,7 @@ from itertools import cycle
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.21 Final", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.22 VolRescue", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -155,7 +155,7 @@ class Database:
 db = Database(DB_PATH)
 
 # ==========================================
-# 4. Utilities
+# 4. Utilities (Hybrid Vol Fetcher)
 # ==========================================
 def format_number(x, decimals=2, *, pos_color="#ff4d4f", neg_color="#2ecc71", zero_color="#e0e0e0", threshold=None, threshold_color="#ff4d4f", suffix=""):
     try:
@@ -170,12 +170,29 @@ def format_number(x, decimals=2, *, pos_color="#ff4d4f", neg_color="#2ecc71", ze
         else: return f"<span style='color:{zero_color}'>{text}</span>"
     except: return str(x)
 
-def fetch_yesterday_volume(client, code):
+def fetch_yesterday_volume_hybrid(client, code):
+    """
+    [RESURRECTION] Hybrid Strategy: Fugle -> Yahoo -> Fail
+    Returns Yesterday's Volume in LOTS (Shares/1000)
+    """
+    # 1. Try Fugle (Most Accurate)
     try:
         candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=2)
         if candles and 'data' in candles and len(candles['data']) >= 2:
             return int(candles['data'][-2]['volume']) // 1000
     except: pass
+
+    # 2. Try Yahoo (Fallback)
+    try:
+        suffix = ".TW"
+        if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
+        # Use simple history fetch
+        hist = yf.Ticker(f"{code}{suffix}").history(period="5d")
+        if not hist.empty and len(hist) >= 2:
+            # Yahoo volume is shares
+            return int(hist.iloc[-2]['Volume']) // 1000
+    except: pass
+    
     return None
 
 def fetch_fundamental_data(code):
@@ -280,7 +297,7 @@ class NotificationManager:
 notification_manager = NotificationManager()
 
 # ==========================================
-# 6. Engine (Persistent Cache)
+# 6. Engine (Persistent Cache + Background Worker)
 # ==========================================
 class SniperEngine:
     def __init__(self):
@@ -301,7 +318,7 @@ class SniperEngine:
     def update_targets(self):
         self.targets = db.get_all_codes()
         self.inventory_codes = db.get_inventory_codes()
-        # [FIX 1] Incremental update to prevent wiping cache
+        # [FIX] Load existing volumes from DB on init
         new_data = db.get_volume_map()
         if new_data:
             self.base_vol_cache.update(new_data)
@@ -311,8 +328,41 @@ class SniperEngine:
         self.update_targets()
         self.running = True
         threading.Thread(target=self._run_loop, daemon=True).start()
+        # [NEW] Start background volume backfiller
+        threading.Thread(target=self._worker_volume_backfill, daemon=True).start()
 
     def stop(self): self.running = False
+
+    def _worker_volume_backfill(self):
+        """Slowly backfill missing volumes (Fugle/Yahoo Hybrid)"""
+        while self.running:
+            if not self.targets:
+                time.sleep(5)
+                continue
+                
+            for code in self.targets:
+                if not self.running: break
+                
+                # Check if we already have it in memory
+                if code in self.base_vol_cache and self.base_vol_cache[code] > 0:
+                    continue # Skip if already has data
+                
+                # Try fetch
+                try:
+                    # Use a separate client cycle or just new client to avoid conflict?
+                    # Here we reuse the cycle but very slowly
+                    client = next(self.client_cycle) if self.client_cycle else None
+                    if client:
+                        vol = fetch_yesterday_volume_hybrid(client, code)
+                        if vol and vol > 0:
+                            self.base_vol_cache[code] = vol
+                            db.update_base_vol(code, vol)
+                except: pass
+                
+                # Sleep to prevent Rate Limit
+                time.sleep(1.0) 
+            
+            time.sleep(10) # Pause after full cycle
 
     def _dispatch_event(self, ev: SniperEvent):
         notification_manager.enqueue(ev)
@@ -322,16 +372,11 @@ class SniperEngine:
             client = next(self.client_cycle) if self.client_cycle else None
             if not client: return None
             
+            # [LOGIC] Only use cache. If 0, it means backfiller hasn't caught up yet.
             base_vol = self.base_vol_cache.get(code, 0)
             
-            if base_vol <= 0:
-                y_vol = fetch_yesterday_volume(client, code)
-                if y_vol and y_vol > 0:
-                    base_vol = y_vol
-                    self.base_vol_cache[code] = base_vol
-                    db.update_base_vol(code, base_vol)
-                else:
-                    base_vol = 500 # Temp fallback
+            # Temporary fallback for ratio calc ONLY (don't save to DB)
+            calc_base = base_vol if base_vol > 0 else 500
 
             q = client.stock.intraday.quote(symbol=code)
             price = q.get('lastPrice', 0)
@@ -342,7 +387,7 @@ class SniperEngine:
             vol = vol_lots * 1000 
             
             est_lots = _calc_est_vol(vol_lots)
-            ratio = est_lots / base_vol if base_vol > 0 else 0
+            ratio = est_lots / calc_base if calc_base > 0 else 0
             
             total_val = q.get('total', {}).get('tradeValue', 0)
             vwap = (total_val / vol) if vol > 0 else price
@@ -401,7 +446,7 @@ class SniperEngine:
                 self.daily_net = {}
                 self.prev_data = {}
                 self.vol_queues = {}
-                self.base_vol_cache = {} # Clear cache daily
+                self.base_vol_cache = {} 
                 notification_manager.reset_daily_state()
                 self.last_reset = now.date()
             
@@ -438,7 +483,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.21")
+    st.title("⚙️ 戰情室 v5.22")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -462,14 +507,23 @@ with st.sidebar:
                     time.sleep(0.5)
                     engine.update_targets()
                     targets = engine.targets
-                    status = st.status("正在初始化數據 (基本面)...", expanded=True)
+                    status = st.status("正在初始化數據 (含基本面與均量)...", expanded=True)
                     static_list = []
                     progress_bar = status.progress(0)
+                    
+                    # [FIX] Use slow fetcher inside init to ensure data populated
+                    client = RestClient(api_key=API_KEYS[0])
+                    
                     for i, code in enumerate(targets):
                         yoy, eps, pe = fetch_fundamental_data(code)
-                        # Init with 0 vol, let engine fill it
-                        static_list.append((code, 0, 0, yoy, eps, pe, 0))
+                        # Fetch Vol directly here to guarantee DB has it
+                        vol = fetch_yesterday_volume_hybrid(client, code)
+                        vol = vol if vol else 0
+                        
+                        static_list.append((code, 0, 0, yoy, eps, pe, vol))
                         progress_bar.progress((i + 1) / len(targets))
+                        time.sleep(0.1) # Be nice to API
+                        
                     db.upsert_static(static_list)
                     status.update(label="初始化完成！", state="complete")
                     st.rerun()
@@ -572,10 +626,7 @@ def render_live_dashboard():
         if use_filter: 
             df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'].notna()) & (df_watch['pe'] < 50)]
         
-        # [COLOR LOGIC] Apply custom coloring before renaming/formatting strings
-        # We need to perform the color logic on the RAW values in df_watch, then apply it to the display dataframe
-        
-        # 1. Ratio Color Logic: >=10 Red, >0 Black, else Grey
+        # Color Logics
         def format_ratio_val(x):
             try:
                 val = float(x)
@@ -584,7 +635,6 @@ def render_live_dashboard():
                 else: return "<span style='color:#cccccc'>-</span>"
             except: return "<span style='color:#cccccc'>-</span>"
 
-        # 2. VWAP Color Logic: If Price > VWAP, VWAP is Red (Strong), else Black
         def format_vwap_val(row):
             try:
                 p = float(row['price'])
@@ -594,22 +644,16 @@ def render_live_dashboard():
                 return f"<span style='color:#000000'>{text}</span>"
             except: return str(row['vwap'])
 
-        # Apply coloring to temporary columns or directly if we are careful
-        # Let's rename first to match the display names we want, BUT keep raw values for calculation if needed? 
-        # Actually it's safer to apply logic on English column names first.
-        
         df_watch['temp_ratio_html'] = df_watch['ratio'].apply(format_ratio_val)
         df_watch['temp_vwap_html'] = df_watch.apply(format_vwap_val, axis=1)
         
-        # Now rename standard columns
         df_watch = df_watch.rename(columns={'event_label': '訊號', 'code': '代碼', 'name': '名稱', 'price': '現價', 'pct': '漲跌%', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
         
-        # Format other standard columns
-        df_watch['現價'] = df_watch['現價'].apply(lambda x: format_number(x, decimals=2, pos_color="#000000"))
+        df_watch['現價'] = df_watch['現價'].apply(lambda x: format_number(x, decimals=2, pos_color="#e0e0e0"))
         df_watch['漲跌%'] = df_watch['漲跌%'].apply(lambda x: format_number(x, decimals=2, suffix="%"))
         df_watch['PE'] = df_watch['PE'].apply(lambda x: format_number(x, decimals=1))
         
-        # Assign the custom colored HTML columns to the final display names
+        # Apply HTML columns
         df_watch['量比'] = df_watch['temp_ratio_html']
         df_watch['均價'] = df_watch['temp_vwap_html']
 
@@ -629,7 +673,7 @@ def render_live_dashboard():
             table.custom-table { width: 100%; border-collapse: collapse; }
             table.custom-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; }
             table.custom-table td { padding: 8px; border-bottom: 1px solid #444; font-size: 14px; }
-            table.custom-table tr:hover { background-color: #f5f0c8; }
+            table.custom-table tr:hover { background-color: #2e2e2e; }
             </style>
         """, unsafe_allow_html=True)
 
@@ -640,4 +684,3 @@ def render_live_dashboard():
 
 # Render the fragment
 render_live_dashboard()
-
