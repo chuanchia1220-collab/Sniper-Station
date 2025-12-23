@@ -516,9 +516,16 @@ with st.sidebar:
                     
                     client = RestClient(api_key=API_KEYS[0])
                     
+                    # [FIX] Manual rotation for Init process
+                    # 不需要先建立 client，我們在迴圈內輪流建立或切換
+                    
                     for i, code in enumerate(targets):
+                        # 輪流使用 Keys：第 0 檔用 Key0, 第 1 檔用 Key1, ...
+                        current_key = API_KEYS[i % len(API_KEYS)]
+                        client = RestClient(api_key=current_key)
+
                         yoy, eps, pe = fetch_fundamental_data(code)
-                        # Fetch 5MA Vol directly here
+                        # Fetch Vol using the rotated client
                         vol = fetch_5ma_volume_hybrid(client, code)
                         vol = vol if vol else 0
                         
@@ -686,4 +693,5 @@ def render_live_dashboard():
 
 # Render the fragment
 render_live_dashboard()
+
 
