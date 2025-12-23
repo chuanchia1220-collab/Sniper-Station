@@ -202,7 +202,7 @@ def _calc_est_vol(current_vol):
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     elapsed = (now - now.replace(hour=9, minute=0, second=0, microsecond=0)).seconds / 60
     if elapsed < 10:
-    return current_vol * 27  # 直接推估一日（270 分鐘）
+        return current_vol * 27  # 直接推估一日（270 分鐘）
     return int(current_vol * (270 / elapsed)) if elapsed < 270 else current_vol
 
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown, price, vwap, has_attacked):
@@ -556,6 +556,7 @@ def render_live_dashboard():
 
 # Render the fragment
 render_live_dashboard()
+
 
 
 
