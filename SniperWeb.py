@@ -6,11 +6,16 @@ from datetime import datetime, timedelta, timezone, time as dt_time
 from dataclasses import dataclass, field
 import time, os, twstock, json, threading, sqlite3, concurrent.futures, requests, queue
 from itertools import cycle
+import warnings
+
+# [LOG FIX] Silence non-critical warnings
+warnings.filterwarnings("ignore")
+pd.set_option('future.no_silent_downcasting', True)
 
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.24 Stable", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.29 Strict", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -22,7 +27,6 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-# [DB UPGRADE] Use v61 to force clean 5MA cache
 DB_PATH = "sniper_v61.db"
 DEFAULT_WATCHLIST = "3035 3037 2368 2383 6274 8046 3189 3324 3017 3653 2421 3483 3081 3163 4979 4908 3363 4977 6442 2356 3231 2382 6669 2317 2330 2454 2303 6781 4931 3533"
 DEFAULT_INVENTORY = """2330,800,1\n2317,105,5"""
@@ -74,7 +78,6 @@ class Database:
         c.execute('''CREATE TABLE IF NOT EXISTS inventory (code TEXT PRIMARY KEY, cost REAL, qty REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS pinned (code TEXT PRIMARY KEY)''')
-        # avg_vol now stores "5-Day Average Volume"
         c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, win REAL, ret REAL, yoy REAL, eps REAL, pe REAL, avg_vol REAL DEFAULT 0)''')
         conn.commit(); conn.close()
 
@@ -157,7 +160,7 @@ class Database:
 db = Database(DB_PATH)
 
 # ==========================================
-# 4. Utilities (5MA + Anti-Flicker)
+# 4. Utilities
 # ==========================================
 def format_number(x, decimals=2, *, pos_color="#ff4d4f", neg_color="#2ecc71", zero_color="#e0e0e0", threshold=None, threshold_color="#ff4d4f", suffix=""):
     try:
@@ -173,24 +176,15 @@ def format_number(x, decimals=2, *, pos_color="#ff4d4f", neg_color="#2ecc71", ze
     except: return str(x)
 
 def fetch_5ma_volume_hybrid(client, code):
-    """
-    [STABLE] Fetch 5-Day Average Volume
-    Strategy: Yahoo (Strong for Hist) -> Fugle -> Fail
-    Returns: Volume in LOTS (Zhang)
-    """
-    # 1. Try Yahoo (Best for History)
     try:
         suffix = ".TW"
         if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
-        # Fetch 10 days to be safe, take last 5
         hist = yf.Ticker(f"{code}{suffix}").history(period="10d")
         if not hist.empty and len(hist) >= 5:
-            # Calculate mean of last 5 days volume (Shares)
             avg_shares = hist['Volume'].tail(5).mean()
             return int(avg_shares) // 1000
     except: pass
 
-    # 2. Try Fugle (Fallback)
     try:
         candles = client.stock.historical.candles(symbol=code, timeframe="D", limit=5)
         if candles and 'data' in candles and len(candles['data']) >= 5:
@@ -228,10 +222,6 @@ def get_dynamic_thresholds(price):
     else: return 2.0, 1.2
 
 def _calc_est_vol(current_vol):
-    """
-    [SMOOTHED] Linear projection with early market dampener logic built-in naturally?
-    No, let's stick to standard linear but reliance on 5MA denominator makes it stable.
-    """
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
     if now < market_open: return 0 
@@ -307,7 +297,7 @@ class NotificationManager:
 notification_manager = NotificationManager()
 
 # ==========================================
-# 6. Engine (5MA Cache + Anti-Flicker)
+# 6. Engine (Strict Signals + Stable Vol)
 # ==========================================
 class SniperEngine:
     def __init__(self):
@@ -328,7 +318,6 @@ class SniperEngine:
     def update_targets(self):
         self.targets = db.get_all_codes()
         self.inventory_codes = db.get_inventory_codes()
-        # Load existing volumes (5MA)
         new_data = db.get_volume_map()
         if new_data:
             self.base_vol_cache.update(new_data)
@@ -338,19 +327,16 @@ class SniperEngine:
         self.update_targets()
         self.running = True
         threading.Thread(target=self._run_loop, daemon=True).start()
-        # Start background 5MA backfiller
         threading.Thread(target=self._worker_volume_backfill, daemon=True).start()
 
     def stop(self): self.running = False
 
     def _worker_volume_backfill(self):
-        """Slowly backfill missing 5MA volumes"""
         while self.running:
             if not self.targets:
                 time.sleep(5); continue
             for code in self.targets:
                 if not self.running: break
-                # Skip if already cached
                 if code in self.base_vol_cache and self.base_vol_cache[code] > 0:
                     continue 
                 try:
@@ -372,7 +358,6 @@ class SniperEngine:
             client = next(self.client_cycle) if self.client_cycle else None
             if not client: return None
             
-            # [LOGIC] Use 5MA cache or fallback
             base_vol = self.base_vol_cache.get(code, 0)
             calc_base = base_vol if base_vol > 0 else 500
 
@@ -383,7 +368,6 @@ class SniperEngine:
             pct = q.get('changePercent', 0)
             vol_lots = q.get('total', {}).get('tradeVolume', 0)
             
-            # [ANTI-FLICKER] If API returns 0 volume, use last known volume
             if vol_lots == 0 and code in self.prev_data:
                 vol_lots = self.prev_data[code]['vol']
             
@@ -419,16 +403,23 @@ class SniperEngine:
             tgt_pct, tgt_ratio = get_dynamic_thresholds(price)
             raw_state = check_signal(pct, price >= vwap, net_day, net_1h, ratio, tgt_pct, tgt_ratio, price < vwap*0.99, price, vwap, code in self.active_flags)
             
+            # [STRICT SIGNAL FILTER]
             event_label = None
             scope = "inventory" if code in self.inventory_codes else "watchlist"
             
-            if "攻擊" in raw_state and code not in self.active_flags: event_label = "攻擊"
-            elif "伏擊" in raw_state: event_label = "伏擊"
-            elif "出貨" in raw_state and code not in self.daily_risk_flags and scope == "inventory": event_label = "出貨"
+            if "攻擊" in raw_state and code not in self.active_flags: 
+                event_label = "攻擊" # Both scopes
+            elif "漲停" in raw_state and scope == "inventory": 
+                event_label = "漲停" # Inv Only
+            elif "出貨" in raw_state and code not in self.daily_risk_flags and scope == "inventory": 
+                event_label = "出貨" # Inv Only
+            elif "伏擊" in raw_state and scope == "watchlist": 
+                event_label = "伏擊" # Watch Only
 
             if event_label:
-                self.active_flags[code] = True
-                if "出貨" in event_label: self.daily_risk_flags[code] = True
+                if event_label == "攻擊": self.active_flags[code] = True
+                if event_label == "出貨": self.daily_risk_flags[code] = True
+                
                 ev = SniperEvent(
                     code=code, name=get_stock_name(code), scope=scope, 
                     event_kind="STRATEGY", event_label=event_label, 
@@ -486,7 +477,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.24")
+    st.title("⚙️ 戰情室 v5.29")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -514,18 +505,12 @@ with st.sidebar:
                     static_list = []
                     progress_bar = status.progress(0)
                     
-                    client = RestClient(api_key=API_KEYS[0])
-                    
-                    # [FIX] Manual rotation for Init process
-                    # 不需要先建立 client，我們在迴圈內輪流建立或切換
-                    
+                    # [FIX] Smart API Rotation
                     for i, code in enumerate(targets):
-                        # 輪流使用 Keys：第 0 檔用 Key0, 第 1 檔用 Key1, ...
                         current_key = API_KEYS[i % len(API_KEYS)]
                         client = RestClient(api_key=current_key)
-
+                        
                         yoy, eps, pe = fetch_fundamental_data(code)
-                        # Fetch Vol using the rotated client
                         vol = fetch_5ma_volume_hybrid(client, code)
                         vol = vol if vol else 0
                         
@@ -594,7 +579,7 @@ def render_live_dashboard():
         df_inv_show = df_inv[cols].copy()
         
         for col in ['營收YoY', 'EPS', 'PE']:
-            df_inv_show[col] = df_inv_show[col].fillna(0)
+            df_inv_show[col] = df_inv_show[col].fillna(0).infer_objects(copy=False)
 
         st.data_editor(
             df_inv_show,
@@ -613,7 +598,8 @@ def render_live_dashboard():
                 "EPS": st.column_config.NumberColumn("EPS", format="%.2f"),
                 "PE": st.column_config.NumberColumn("PE", format="%.1f")
             },
-            use_container_width=True, hide_index=True, disabled=True, key="inv_table_live"
+            width='stretch',
+            hide_index=True, disabled=True, key="inv_table_live"
         )
     else: st.info("尚無庫存資料")
 
@@ -627,10 +613,10 @@ def render_live_dashboard():
         
         for col in ['net_10m', 'net_1h', 'net_day']:
             if col not in df_watch.columns: df_watch[col] = 0
-            df_watch[col] = df_watch[col].fillna(0)
+            df_watch[col] = df_watch[col].fillna(0).infer_objects(copy=False)
 
-        df_watch['yoy'] = df_watch['yoy'].fillna(0)
-        df_watch['eps'] = df_watch['eps'].fillna(0)
+        df_watch['yoy'] = df_watch['yoy'].fillna(0).infer_objects(copy=False)
+        df_watch['eps'] = df_watch['eps'].fillna(0).infer_objects(copy=False)
         
         if use_filter: 
             df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'].notna()) & (df_watch['pe'] < 50)]
@@ -693,5 +679,3 @@ def render_live_dashboard():
 
 # Render the fragment
 render_live_dashboard()
-
-
