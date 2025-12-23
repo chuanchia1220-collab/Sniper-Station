@@ -323,7 +323,7 @@ class SniperEngine:
         self.active_flags = {}
         self.daily_risk_flags = {}
         self.last_reset = datetime.now().date()
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
     def update_targets(self):
         self.targets = db.get_all_codes()
@@ -686,3 +686,4 @@ def render_live_dashboard():
 
 # Render the fragment
 render_live_dashboard()
+
