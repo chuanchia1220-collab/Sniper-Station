@@ -335,7 +335,7 @@ class SniperEngine:
             if code not in self.yesterday_vol:
                 y_vol = fetch_yesterday_volume(client, code)
                 if y_vol: self.yesterday_vol[code] = y_vol
-                else: self.yesterday_vol[code] = None
+                else: self.yesterday_vol[code] = 1000 # Fallback 1000 if fails
             
             base_vol = self.yesterday_vol.get(code, 1000)
 
@@ -607,7 +607,7 @@ def render_live_dashboard():
         df_watch['均價'] = df_watch['均價'].apply(lambda x: format_number(x, decimals=2))
         df_watch['漲跌%'] = df_watch['漲跌%'].apply(lambda x: format_number(x, decimals=2, suffix="%"))
         df_watch['量比'] = df_watch['量比'].apply(
-            lambda x: format_number(x, decimals=1, threshold=10) if float(str(x or 0).replace(',','')) > 0 else "<span style='color:#FFF3BF'>-</span>"
+            lambda x: format_number(x, decimals=1, threshold=10) if float(str(x or 0).replace(',','')) > 0 else "<span style='color:cccccc'>-</span>"
         )
         df_watch['PE'] = df_watch['PE'].apply(lambda x: format_number(x, decimals=1))
         
@@ -627,7 +627,7 @@ def render_live_dashboard():
             table.custom-table { width: 100%; border-collapse: collapse; }
             table.custom-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; }
             table.custom-table td { padding: 8px; border-bottom: 1px solid #444; font-size: 14px; }
-            table.custom-table tr:hover { background-color: #2e2e2e; }
+            table.custom-table tr:hover { background-color: #FFF3BF; }
             </style>
         """, unsafe_allow_html=True)
 
@@ -638,4 +638,3 @@ def render_live_dashboard():
 
 # Render the fragment
 render_live_dashboard()
-
