@@ -15,7 +15,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.31 Bunker", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.32 Ladder", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -74,12 +74,12 @@ class Database:
 
     def _init_db(self):
         conn = self._get_conn(); c = conn.cursor()
-        # [BLOCK 2] Realtime Data (Fast, frequently updated)
+        # [BLOCK 2] Realtime Data
         c.execute('''CREATE TABLE IF NOT EXISTS realtime (code TEXT PRIMARY KEY, name TEXT, category TEXT, price REAL, pct REAL, vwap REAL, vol REAL, est_vol REAL, ratio REAL, net_1h REAL, net_10m REAL, net_day REAL, signal TEXT, update_time REAL, data_status TEXT DEFAULT 'DATA_OK', signal_level TEXT DEFAULT 'B', risk_status TEXT DEFAULT 'NORMAL')''')
         c.execute('''CREATE TABLE IF NOT EXISTS inventory (code TEXT PRIMARY KEY, cost REAL, qty REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS pinned (code TEXT PRIMARY KEY)''')
-        # [BLOCK 1] Static Info (5MA Bunker - Rarely updated)
+        # [BLOCK 1] Static Bunker
         c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, win REAL, ret REAL, yoy REAL, eps REAL, pe REAL, avg_vol REAL DEFAULT 0)''')
         conn.commit(); conn.close()
 
@@ -102,22 +102,15 @@ class Database:
 
     def upsert_realtime_batch(self, data_list):
         if not data_list: return
-        # [BLOCK 2 Update] Only updates realtime columns
         sql = '''INSERT OR REPLACE INTO realtime (code, name, category, price, pct, vwap, vol, est_vol, ratio, net_1h, net_day, signal, update_time, data_status, signal_level, risk_status, net_10m) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'''
         self.write_queue.put(('executemany', sql, data_list))
 
     def upsert_static(self, data_list):
-        # [BLOCK 1 Update] Only updates static columns
         sql = 'INSERT OR REPLACE INTO static_info (code, win, ret, yoy, eps, pe, avg_vol) VALUES (?, ?, ?, ?, ?, ?, ?)'
         self.write_queue.put(('executemany', sql, data_list))
 
     def update_base_vol(self, code, vol):
-        """
-        [BUNKER GUARD]
-        Only update 5MA if we have a valid positive number.
-        Never overwrite with 0.
-        """
-        if vol is None or vol <= 0: return # Strict Gatekeeper
+        if vol is None or vol <= 0: return 
         sql = 'UPDATE static_info SET avg_vol = ? WHERE code = ?'
         self.write_queue.put(('execute', sql, (vol, code)))
 
@@ -186,7 +179,6 @@ def format_number(x, decimals=2, *, pos_color="#ff4d4f", neg_color="#2ecc71", ze
     except: return str(x)
 
 def fetch_5ma_volume_hybrid(client, code):
-    """[BLOCK 1 WORKER] Fetches 5MA. Returns None if failed."""
     try:
         suffix = ".TW"
         if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
@@ -228,9 +220,19 @@ def get_stock_name(symbol):
     except: return symbol
 
 def get_dynamic_thresholds(price):
-    if price < 50: return 3.5, 2.5
-    elif price < 300: return 2.5, 1.5
-    else: return 2.0, 1.2
+    """
+    [v5.32] 9-Tier Dynamic Ladder
+    Returns: (attack_pct, attack_ratio, ambush_ratio)
+    """
+    if price >= 1100: return 2.0, 1.2, 2.5
+    elif price >= 950: return 2.0, 1.2, 3.0
+    elif price >= 800: return 2.0, 1.2, 3.5
+    elif price >= 650: return 2.0, 1.2, 4.0
+    elif price >= 500: return 2.0, 1.2, 4.5
+    elif price >= 300: return 2.0, 1.2, 5.0
+    elif price >= 150: return 2.5, 1.5, 6.0
+    elif price >= 50:  return 2.5, 1.5, 8.0
+    else:              return 3.5, 2.5, 10.0
 
 def _calc_est_vol(current_vol):
     now = datetime.now(timezone.utc) + timedelta(hours=8)
@@ -241,10 +243,12 @@ def _calc_est_vol(current_vol):
     if elapsed_minutes >= 270: return current_vol
     return int(current_vol * (270 / elapsed_minutes))
 
-def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, is_breakdown, price, vwap, has_attacked):
+def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, ambush_ratio, is_breakdown, price, vwap, has_attacked):
     if pct >= 9.5: return "漲停"
     if ratio > 0:
-        if (ratio >= 10.0) and (abs(price - vwap) / vwap <= 0.01) and (pct <= 2.0) and (net_1h > 0) and (not has_attacked): return "伏擊"
+        # [v5.32] Use dynamic ambush_ratio from the 9-tier ladder
+        if (ratio >= ambush_ratio) and (abs(price - vwap) / vwap <= 0.01) and (pct <= 2.0) and (net_1h > 0) and (not has_attacked): return "伏擊"
+        
         if is_bullish and net_day > 200 and pct >= tgt_pct and ratio >= tgt_ratio: return "攻擊"
         if ratio >= tgt_ratio and pct < tgt_pct and is_bullish and net_1h > 200: return "量增"
         if is_breakdown and ratio >= tgt_ratio and net_1h < 0: return "出貨"
@@ -312,7 +316,7 @@ class NotificationManager:
 notification_manager = NotificationManager()
 
 # ==========================================
-# 6. Engine (Separated Block Logic)
+# 6. Engine (Separated Block Logic + Dynamic Ladder)
 # ==========================================
 class SniperEngine:
     def __init__(self):
@@ -321,7 +325,7 @@ class SniperEngine:
         self.client_cycle = cycle(self.clients) if self.clients else None
         self.targets = []
         self.inventory_codes = []
-        # [BLOCK 1] Bunker Cache (Read-Only during realtime)
+        # [BLOCK 1] Bunker Cache
         self.base_vol_cache = {} 
         # [BLOCK 2] Live Data
         self.daily_net = {}
@@ -335,7 +339,6 @@ class SniperEngine:
     def update_targets(self):
         self.targets = db.get_all_codes()
         self.inventory_codes = db.get_inventory_codes()
-        # Initial Load of Block 1
         new_data = db.get_volume_map()
         if new_data:
             self.base_vol_cache.update(new_data)
@@ -350,13 +353,11 @@ class SniperEngine:
     def stop(self): self.running = False
 
     def _worker_volume_backfill(self):
-        """[BLOCK 1 WORKER] Slowly updates the Bunker"""
         while self.running:
             if not self.targets:
                 time.sleep(5); continue
             for code in self.targets:
                 if not self.running: break
-                # Skip if already in Bunker
                 if code in self.base_vol_cache and self.base_vol_cache[code] > 0:
                     continue 
                 try:
@@ -364,9 +365,7 @@ class SniperEngine:
                     if client:
                         vol = fetch_5ma_volume_hybrid(client, code)
                         if vol and vol > 0:
-                            # Update Memory
                             self.base_vol_cache[code] = vol
-                            # Update DB (Safe method)
                             db.update_base_vol(code, vol)
                 except: pass
                 time.sleep(1.0) 
@@ -376,7 +375,6 @@ class SniperEngine:
         notification_manager.enqueue(ev)
 
     def _fetch_stock(self, code):
-        """[BLOCK 2 WORKER] Realtime Stream. Read-only access to Block 1."""
         try:
             client = next(self.client_cycle) if self.client_cycle else None
             if not client: return None
@@ -384,28 +382,24 @@ class SniperEngine:
             # [READ ONLY] From Block 1 Bunker
             base_vol = self.base_vol_cache.get(code, 0)
             
-            # Fetch Live Data
             q = client.stock.intraday.quote(symbol=code)
             price = q.get('lastPrice', 0)
-            if not price: return None # [GUARD] No price, no update
+            if not price: return None
             
             pct = q.get('changePercent', 0)
             vol_lots = q.get('total', {}).get('tradeVolume', 0)
             
-            # [BLOCK 2 LOGIC] Anti-Flicker for Live Volume
             if vol_lots == 0 and code in self.prev_data:
                 vol_lots = self.prev_data[code]['vol']
             
             vol = vol_lots * 1000 
             
-            # [CALCULATION] Purely math, no writing back to Block 1
             est_lots = _calc_est_vol(vol_lots)
             ratio = est_lots / base_vol if base_vol > 0 else 0
             
             total_val = q.get('total', {}).get('tradeValue', 0)
             vwap = (total_val / vol) if vol > 0 else price
             
-            # [BIG PLAYER LOGIC]
             delta_net = 0
             if code in self.prev_data:
                 prev_v = self.prev_data[code]['vol']
@@ -416,27 +410,27 @@ class SniperEngine:
                     if price >= prev_p: delta_net = int(delta_v)
                     elif price < prev_p: delta_net = -int(delta_v)
             
-            # Update Live Memory
             self.prev_data[code] = {'vol': vol_lots, 'price': price}
             now_ts = time.time()
             if code not in self.vol_queues: self.vol_queues[code] = []
             if delta_net != 0: self.vol_queues[code].append((now_ts, delta_net))
             
-            # Accumulators
             self.daily_net[code] = self.daily_net.get(code, 0) + delta_net
             self.vol_queues[code] = [x for x in self.vol_queues[code] if x[0] > now_ts - 3600]
             net_1h = sum(x[1] for x in self.vol_queues[code])
             net_10m = sum(x[1] for x in self.vol_queues[code] if x[0] > now_ts - 600)
             net_day = self.daily_net.get(code, 0)
             
-            # Signal Check
-            tgt_pct, tgt_ratio = get_dynamic_thresholds(price)
-            raw_state = check_signal(pct, price >= vwap, net_day, net_1h, ratio, tgt_pct, tgt_ratio, price < vwap*0.99, price, vwap, code in self.active_flags)
+            # [v5.32] Get 3 dynamic thresholds
+            tgt_pct, tgt_ratio, ambush_ratio = get_dynamic_thresholds(price)
             
-            # Signal Filtering
+            # Pass ambush_ratio to check_signal
+            raw_state = check_signal(pct, price >= vwap, net_day, net_1h, ratio, tgt_pct, tgt_ratio, ambush_ratio, price < vwap*0.99, price, vwap, code in self.active_flags)
+            
             event_label = None
             scope = "inventory" if code in self.inventory_codes else "watchlist"
             
+            # [STRICT NOTIFICATION]
             if "攻擊" in raw_state and code not in self.active_flags: event_label = "攻擊"
             elif "漲停" in raw_state and scope == "inventory": event_label = "漲停"
             elif "出貨" in raw_state and code not in self.daily_risk_flags and scope == "inventory": event_label = "出貨"
@@ -453,7 +447,6 @@ class SniperEngine:
                 )
                 self._dispatch_event(ev)
 
-            # [BLOCK 2 RETURN] Only Realtime Data, Est Vol, and Ratio are returned for DB update
             return (code, get_stock_name(code), "一般", price, pct, vwap, vol_lots, est_lots, ratio, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m)
         except: return None
 
@@ -466,7 +459,6 @@ class SniperEngine:
                 self.daily_net = {}
                 self.prev_data = {}
                 self.vol_queues = {}
-                # [RESET] Clear Bunker daily
                 self.base_vol_cache = {} 
                 notification_manager.reset_daily_state()
                 self.last_reset = now.date()
@@ -504,7 +496,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.31")
+    st.title("⚙️ 戰情室 v5.32")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -539,7 +531,6 @@ with st.sidebar:
                         
                         yoy, eps, pe = fetch_fundamental_data(code)
                         vol = fetch_5ma_volume_hybrid(client, code)
-                        # [BLOCK 1 WRITE] Initialize Bunker
                         if vol and vol > 0:
                             db.update_base_vol(code, vol)
                         else:
@@ -550,7 +541,6 @@ with st.sidebar:
                         time.sleep(0.1)
                         
                     db.upsert_static(static_list)
-                    # Sync Engine memory with DB
                     engine.update_targets()
                     status.update(label="初始化完成！", state="complete")
                     st.rerun()
