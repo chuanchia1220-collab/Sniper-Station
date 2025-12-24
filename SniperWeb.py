@@ -15,7 +15,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.33 Precision", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.34 Sensitive", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -74,12 +74,10 @@ class Database:
 
     def _init_db(self):
         conn = self._get_conn(); c = conn.cursor()
-        # [BLOCK 2] Realtime Data
         c.execute('''CREATE TABLE IF NOT EXISTS realtime (code TEXT PRIMARY KEY, name TEXT, category TEXT, price REAL, pct REAL, vwap REAL, vol REAL, est_vol REAL, ratio REAL, net_1h REAL, net_10m REAL, net_day REAL, signal TEXT, update_time REAL, data_status TEXT DEFAULT 'DATA_OK', signal_level TEXT DEFAULT 'B', risk_status TEXT DEFAULT 'NORMAL')''')
         c.execute('''CREATE TABLE IF NOT EXISTS inventory (code TEXT PRIMARY KEY, cost REAL, qty REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS pinned (code TEXT PRIMARY KEY)''')
-        # [BLOCK 1] Static Bunker
         c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, win REAL, ret REAL, yoy REAL, eps REAL, pe REAL, avg_vol REAL DEFAULT 0)''')
         conn.commit(); conn.close()
 
@@ -221,21 +219,18 @@ def get_stock_name(symbol):
 
 def get_dynamic_thresholds(price):
     """
-    [v5.33] Precision Ladder for High-Priced Stocks
-    Returns: (attack_pct, attack_ratio, ambush_ratio)
+    [v5.34] Sensitive High-Price Ladder
+    Adjusted based on 6442 feedback: 1300+ stock needs lower ratio.
     """
-    if price >= 1550: return 2.0, 1.2, 1.8
-    elif price >= 1400: return 2.0, 1.2, 2.0
-    elif price >= 1250: return 2.0, 1.2, 2.2  # (Target 6442)
-    elif price >= 1100: return 2.0, 1.2, 2.5
-    elif price >= 950: return 2.0, 1.2, 3.0
-    elif price >= 800: return 2.0, 1.2, 3.5
-    elif price >= 650: return 2.0, 1.2, 4.0
-    elif price >= 500: return 2.0, 1.2, 4.5
-    elif price >= 300: return 2.0, 1.2, 5.0
-    elif price >= 150: return 2.5, 1.5, 6.0
-    elif price >= 50:  return 2.5, 1.5, 8.0
-    else:              return 3.5, 2.5, 10.0
+    if price >= 1200: return 2.0, 1.2, 1.8  # (Target 6442: 1300+)
+    elif price >= 1000: return 2.0, 1.2, 2.0
+    elif price >= 800:  return 2.0, 1.2, 2.5
+    elif price >= 650:  return 2.0, 1.2, 3.0
+    elif price >= 500:  return 2.0, 1.2, 4.0
+    elif price >= 300:  return 2.0, 1.2, 5.0
+    elif price >= 150:  return 2.5, 1.5, 6.0
+    elif price >= 50:   return 2.5, 1.5, 8.0
+    else:               return 3.5, 2.5, 10.0
 
 def _calc_est_vol(current_vol):
     now = datetime.now(timezone.utc) + timedelta(hours=8)
@@ -249,7 +244,7 @@ def _calc_est_vol(current_vol):
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, ambush_ratio, is_breakdown, price, vwap, has_attacked):
     if pct >= 9.5: return "漲停"
     if ratio > 0:
-        # [v5.33] Use precision ambush_ratio
+        # [v5.34] Dynamic ambush logic
         if (ratio >= ambush_ratio) and (abs(price - vwap) / vwap <= 0.01) and (pct <= 2.0) and (net_1h > 0) and (not has_attacked): return "伏擊"
         
         if is_bullish and net_day > 200 and pct >= tgt_pct and ratio >= tgt_ratio: return "攻擊"
@@ -319,7 +314,7 @@ class NotificationManager:
 notification_manager = NotificationManager()
 
 # ==========================================
-# 6. Engine (Separated Block Logic + Precision Ladder)
+# 6. Engine (Separated Block Logic + Sensitive Ladder)
 # ==========================================
 class SniperEngine:
     def __init__(self):
@@ -424,7 +419,7 @@ class SniperEngine:
             net_10m = sum(x[1] for x in self.vol_queues[code] if x[0] > now_ts - 600)
             net_day = self.daily_net.get(code, 0)
             
-            # [v5.33] Precision Ladder
+            # [v5.34] Sensitive Ladder for 6442
             tgt_pct, tgt_ratio, ambush_ratio = get_dynamic_thresholds(price)
             
             raw_state = check_signal(pct, price >= vwap, net_day, net_1h, ratio, tgt_pct, tgt_ratio, ambush_ratio, price < vwap*0.99, price, vwap, code in self.active_flags)
@@ -498,7 +493,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.33")
+    st.title("⚙️ 戰情室 v5.34")
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
