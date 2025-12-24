@@ -15,7 +15,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.34 Sensitive", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.35 Dash", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -218,11 +218,7 @@ def get_stock_name(symbol):
     except: return symbol
 
 def get_dynamic_thresholds(price):
-    """
-    [v5.34] Sensitive High-Price Ladder
-    Adjusted based on 6442 feedback: 1300+ stock needs lower ratio.
-    """
-    if price >= 1200: return 2.0, 1.2, 1.8  # (Target 6442: 1300+)
+    if price >= 1200: return 2.0, 1.2, 1.8 
     elif price >= 1000: return 2.0, 1.2, 2.0
     elif price >= 800:  return 2.0, 1.2, 2.5
     elif price >= 650:  return 2.0, 1.2, 3.0
@@ -244,9 +240,7 @@ def _calc_est_vol(current_vol):
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, ambush_ratio, is_breakdown, price, vwap, has_attacked):
     if pct >= 9.5: return "漲停"
     if ratio > 0:
-        # [v5.34] Dynamic ambush logic
         if (ratio >= ambush_ratio) and (abs(price - vwap) / vwap <= 0.01) and (pct <= 2.0) and (net_1h > 0) and (not has_attacked): return "伏擊"
-        
         if is_bullish and net_day > 200 and pct >= tgt_pct and ratio >= tgt_ratio: return "攻擊"
         if ratio >= tgt_ratio and pct < tgt_pct and is_bullish and net_1h > 200: return "量增"
         if is_breakdown and ratio >= tgt_ratio and net_1h < 0: return "出貨"
@@ -314,7 +308,7 @@ class NotificationManager:
 notification_manager = NotificationManager()
 
 # ==========================================
-# 6. Engine (Separated Block Logic + Sensitive Ladder)
+# 6. Engine (With Market Thermometer)
 # ==========================================
 class SniperEngine:
     def __init__(self):
@@ -331,6 +325,9 @@ class SniperEngine:
         self.prev_data = {}
         self.active_flags = {}
         self.daily_risk_flags = {}
+        # [BLOCK 3] Market Stats
+        self.market_stats = {"TSE": 0, "OTC": 0, "Time": time.time()}
+        
         self.last_reset = datetime.now().date()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
@@ -369,6 +366,29 @@ class SniperEngine:
                 time.sleep(1.0) 
             time.sleep(10)
 
+    def _update_market_thermometer(self):
+        """[BLOCK 3] Fetches Market Index Volume every 15s"""
+        if time.time() - self.market_stats["Time"] < 15: return
+        
+        try:
+            # Use dedicated client or cycle
+            client = next(self.client_cycle) if self.client_cycle else None
+            if not client: return
+
+            # IX0001 = TSE, IX0043 = OTC
+            q_tse = client.stock.intraday.quote(symbol="IX0001")
+            q_otc = client.stock.intraday.quote(symbol="IX0043")
+            
+            val_tse = q_tse.get('total', {}).get('tradeValue', 0)
+            val_otc = q_otc.get('total', {}).get('tradeValue', 0)
+            
+            self.market_stats = {
+                "TSE": val_tse,
+                "OTC": val_otc,
+                "Time": time.time()
+            }
+        except: pass
+
     def _dispatch_event(self, ev: SniperEvent):
         notification_manager.enqueue(ev)
 
@@ -377,7 +397,6 @@ class SniperEngine:
             client = next(self.client_cycle) if self.client_cycle else None
             if not client: return None
             
-            # [READ ONLY] From Block 1 Bunker
             base_vol = self.base_vol_cache.get(code, 0)
             
             q = client.stock.intraday.quote(symbol=code)
@@ -419,7 +438,6 @@ class SniperEngine:
             net_10m = sum(x[1] for x in self.vol_queues[code] if x[0] > now_ts - 600)
             net_day = self.daily_net.get(code, 0)
             
-            # [v5.34] Sensitive Ladder for 6442
             tgt_pct, tgt_ratio, ambush_ratio = get_dynamic_thresholds(price)
             
             raw_state = check_signal(pct, price >= vwap, net_day, net_1h, ratio, tgt_pct, tgt_ratio, ambush_ratio, price < vwap*0.99, price, vwap, code in self.active_flags)
@@ -427,7 +445,6 @@ class SniperEngine:
             event_label = None
             scope = "inventory" if code in self.inventory_codes else "watchlist"
             
-            # [STRICT SIGNAL FILTER]
             if "攻擊" in raw_state and code not in self.active_flags: event_label = "攻擊"
             elif "漲停" in raw_state and scope == "inventory": event_label = "漲停"
             elif "出貨" in raw_state and code not in self.daily_risk_flags and scope == "inventory": event_label = "出貨"
@@ -460,6 +477,10 @@ class SniperEngine:
                 notification_manager.reset_daily_state()
                 self.last_reset = now.date()
             
+            # [BLOCK 3 Update]
+            if MarketSession.is_market_open(now):
+                self._update_market_thermometer()
+
             targets = db.get_all_codes()
             self.inventory_codes = db.get_inventory_codes()
             
@@ -493,7 +514,40 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("⚙️ 戰情室 v5.34")
+    st.title("🛡️ 戰情室 v5.35")
+    
+    # --- [TOP] Market Thermometer ---
+    st.subheader("🌡️ 大盤溫度計")
+    
+    # Get Market Data
+    tse_val = engine.market_stats.get("TSE", 0)
+    otc_val = engine.market_stats.get("OTC", 0)
+    
+    # Calc Est Value (Billions)
+    est_tse = int(_calc_est_vol(tse_val) / 100000000)
+    est_otc = int(_calc_est_vol(otc_val) / 100000000)
+    
+    # TSE Metric
+    delta_color_tse = "off"
+    if est_tse >= 4000: delta_color_tse = "normal" # Red/Up in Streamlit default
+    elif est_tse <= 2500: delta_color_tse = "inverse" # Blue/Down
+    
+    st.metric("上市預估量 (億)", f"{est_tse}", delta=None, help=">4000億:熱, <2500億:冷")
+    if est_tse >= 4000: st.caption("🔥 資金狂潮 (攻擊)")
+    elif est_tse <= 2500: st.caption("🧊 量能急凍 (盤整)")
+    else: st.caption("☁️ 溫和換手 (中性)")
+    
+    st.divider()
+
+    # OTC Metric
+    st.metric("上櫃預估量 (億)", f"{est_otc}", delta=None)
+    if est_otc >= 1200: st.caption("🔥 中小噴發")
+    elif est_otc <= 600: st.caption("🧊 內資縮手")
+    else: st.caption("☁️ 正常輪動")
+    
+    st.markdown("---")
+
+    # --- [BOTTOM] Controls ---
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
@@ -554,7 +608,6 @@ with st.sidebar:
                     st.toast("核心已停止")
                     st.rerun()
 
-    st.markdown("---")
     st.caption(f"Engine: {'🟢 RUNNING' if engine.running else '🔴 STOPPED'}")
     
     st.subheader("🧪 系統測試")
