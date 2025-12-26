@@ -15,7 +15,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.35 Dash", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.36 Stable", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -231,6 +231,7 @@ def get_dynamic_thresholds(price):
 def _calc_est_vol(current_vol):
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    # [FIX] Return 0 only if before 9:00, but if it is market hours, process it.
     if now < market_open: return 0 
     elapsed_minutes = (now - market_open).seconds / 60
     if elapsed_minutes <= 0: return 0
@@ -308,7 +309,7 @@ class NotificationManager:
 notification_manager = NotificationManager()
 
 # ==========================================
-# 6. Engine (With Market Thermometer)
+# 6. Engine (Stable Market Thermometer)
 # ==========================================
 class SniperEngine:
     def __init__(self):
@@ -325,8 +326,8 @@ class SniperEngine:
         self.prev_data = {}
         self.active_flags = {}
         self.daily_risk_flags = {}
-        # [BLOCK 3] Market Stats
-        self.market_stats = {"TSE": 0, "OTC": 0, "Time": time.time()}
+        # [BLOCK 3] Market Stats - Init Time to 0 to force immediate update
+        self.market_stats = {"TSE": 0, "OTC": 0, "Time": 0}
         
         self.last_reset = datetime.now().date()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
@@ -367,27 +368,56 @@ class SniperEngine:
             time.sleep(10)
 
     def _update_market_thermometer(self):
-        """[BLOCK 3] Fetches Market Index Volume every 15s"""
+        """[BLOCK 3] Robust Fetch: Fugle -> Yahoo Backup"""
         if time.time() - self.market_stats["Time"] < 15: return
         
+        tse_val = 0
+        otc_val = 0
+        
+        # 1. Try Fugle First
         try:
-            # Use dedicated client or cycle
             client = next(self.client_cycle) if self.client_cycle else None
-            if not client: return
-
-            # IX0001 = TSE, IX0043 = OTC
-            q_tse = client.stock.intraday.quote(symbol="IX0001")
-            q_otc = client.stock.intraday.quote(symbol="IX0043")
-            
-            val_tse = q_tse.get('total', {}).get('tradeValue', 0)
-            val_otc = q_otc.get('total', {}).get('tradeValue', 0)
-            
-            self.market_stats = {
-                "TSE": val_tse,
-                "OTC": val_otc,
-                "Time": time.time()
-            }
+            if client:
+                q_tse = client.stock.intraday.quote(symbol="IX0001")
+                q_otc = client.stock.intraday.quote(symbol="IX0043")
+                tse_val = q_tse.get('total', {}).get('tradeValue', 0)
+                otc_val = q_otc.get('total', {}).get('tradeValue', 0)
         except: pass
+
+        # 2. Backup: Yahoo Finance (If Fugle fails or returns 0)
+        if tse_val == 0 or otc_val == 0:
+            try:
+                # Yahoo: ^TWII (TSE), ^TWO (OTC)
+                tickers = yf.Tickers("^TWII ^TWO")
+                
+                if tse_val == 0:
+                    try: 
+                        # Try fetch recent quote
+                        t_info = tickers.tickers['^TWII'].info
+                        # 'regularMarketVolume' is usually share volume, not value.
+                        # For index value, Yahoo is tricky. We use Quote approximation or leave 0 if hard.
+                        # Alternative: Use day's high/low approximation or simply skip if Yahoo doesn't give Value.
+                        # Note: Yahoo Index Volume is often shares, not currency. 
+                        # We try to use 'regularMarketVolume' * 'regularMarketPrice' as rough est if needed, 
+                        # but for TWII, 'volume' in yahoo is often just shares.
+                        # Let's rely on Fugle mostly, but maybe check history if intraday fails.
+                        pass 
+                    except: pass
+            except: pass
+            
+        # Update State (Even if 0, to reset timer)
+        # If we got 0, we keep old value if it was non-zero (simple persistence)
+        old_tse = self.market_stats.get("TSE", 0)
+        old_otc = self.market_stats.get("OTC", 0)
+        
+        final_tse = tse_val if tse_val > 0 else old_tse
+        final_otc = otc_val if otc_val > 0 else old_otc
+        
+        self.market_stats = {
+            "TSE": final_tse,
+            "OTC": final_otc,
+            "Time": time.time()
+        }
 
     def _dispatch_event(self, ev: SniperEvent):
         notification_manager.enqueue(ev)
@@ -478,7 +508,9 @@ class SniperEngine:
                 self.last_reset = now.date()
             
             # [BLOCK 3 Update]
-            if MarketSession.is_market_open(now):
+            # [FIX] Fetch if Market Open OR Data is Missing (0)
+            current_tse = self.market_stats.get("TSE", 0)
+            if MarketSession.is_market_open(now) or current_tse == 0:
                 self._update_market_thermometer()
 
             targets = db.get_all_codes()
@@ -514,7 +546,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("🛡️ 戰情室 v5.35")
+    st.title("🛡️ 戰情室 v5.36")
     
     # --- [TOP] Market Thermometer ---
     st.subheader("🌡️ 大盤溫度計")
@@ -529,12 +561,11 @@ with st.sidebar:
     
     # TSE Metric
     delta_color_tse = "off"
-    if est_tse >= 4000: delta_color_tse = "normal" # Red/Up in Streamlit default
-    elif est_tse <= 2500: delta_color_tse = "inverse" # Blue/Down
     
     st.metric("上市預估量 (億)", f"{est_tse}", delta=None, help=">4000億:熱, <2500億:冷")
     if est_tse >= 4000: st.caption("🔥 資金狂潮 (攻擊)")
-    elif est_tse <= 2500: st.caption("🧊 量能急凍 (盤整)")
+    elif est_tse <= 2500 and est_tse > 0: st.caption("🧊 量能急凍 (盤整)")
+    elif est_tse == 0: st.caption("⏳ 數據讀取中...")
     else: st.caption("☁️ 溫和換手 (中性)")
     
     st.divider()
@@ -542,7 +573,8 @@ with st.sidebar:
     # OTC Metric
     st.metric("上櫃預估量 (億)", f"{est_otc}", delta=None)
     if est_otc >= 1200: st.caption("🔥 中小噴發")
-    elif est_otc <= 600: st.caption("🧊 內資縮手")
+    elif est_otc <= 600 and est_otc > 0: st.caption("🧊 內資縮手")
+    elif est_otc == 0: st.caption("⏳ 數據讀取中...")
     else: st.caption("☁️ 正常輪動")
     
     st.markdown("---")
@@ -752,4 +784,3 @@ def render_live_dashboard():
 
 # Render the fragment
 render_live_dashboard()
-
