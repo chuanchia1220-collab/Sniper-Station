@@ -329,7 +329,7 @@ class SniperEngine:
         self.market_stats = {"TSE": 0, "OTC": 0, "Time": time.time()}
         
         self.last_reset = datetime.now().date()
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
     def update_targets(self):
         self.targets = db.get_all_codes()
@@ -752,3 +752,4 @@ def render_live_dashboard():
 
 # Render the fragment
 render_live_dashboard()
+
