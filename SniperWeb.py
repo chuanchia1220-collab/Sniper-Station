@@ -777,7 +777,10 @@ def render_live_dashboard():
             </style>
         """, unsafe_allow_html=True)
 
-        html_str = df_html.to_html(escape=False, index=False, classes="custom-table")
+        def highlight_pinned(row):
+            return ['background-color: #f5f0c8' if row['📌'] == "📌" else '' for _ in row]
+
+        html_str = df_html.style.apply(highlight_pinned, axis=1).hide(axis='index').to_html(escape=False, classes="custom-table")
         st.markdown(html_str, unsafe_allow_html=True)
 
     else: st.info("尚無監控資料")
