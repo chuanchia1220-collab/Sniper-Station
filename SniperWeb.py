@@ -712,7 +712,7 @@ def render_live_dashboard():
         all_options = df_watch['code'].tolist()
         current_pinned = df_watch[df_watch['is_pinned'] == 1]['code'].tolist()
         
-        # 2. Render Multiselect (This is the NEW interactive part)
+        # 2. Render Multiselect
         new_pinned = st.multiselect(
             "📌 快速釘選 (選中即變色)", 
             options=all_options,
@@ -762,26 +762,27 @@ def render_live_dashboard():
                 return "<span style='color:#cccccc'>-</span>"
             except: return "-"
 
-        # --- Build HTML Table Manually (Replaces df.to_html) ---
+        # --- Build HTML Table Manually (FIXED: Removing Indentation) ---
+        # The key fix here is removing leading spaces in the strings below
         html_parts = []
         html_parts.append("""
-        <style>
-            table.sniper-table { width: 100%; border-collapse: collapse; font-family: monospace; }
-            table.sniper-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; }
-            table.sniper-table td { padding: 8px; border-bottom: 1px solid #444; font-size: 14px; }
-            table.sniper-table tr.pinned-row { background-color: #f5f0c8 !important; color: black !important; }
-            table.sniper-table tr.pinned-row span { font-weight: bold; }
-            table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
-        </style>
-        <table class="sniper-table">
-            <thead>
-                <tr>
-                    <th>📌</th><th>代碼</th><th>名稱</th><th>等級</th><th>現價</th><th>漲跌%</th>
-                    <th>均價</th><th>量比</th><th>訊號</th><th>大戶(10m/1H/日)</th><th>營收YoY</th><th>EPS</th><th>PE</th>
-                </tr>
-            </thead>
-            <tbody>
-        """)
+<style>
+    table.sniper-table { width: 100%; border-collapse: collapse; font-family: monospace; }
+    table.sniper-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; }
+    table.sniper-table td { padding: 8px; border-bottom: 1px solid #444; font-size: 14px; }
+    table.sniper-table tr.pinned-row { background-color: #f5f0c8 !important; color: black !important; }
+    table.sniper-table tr.pinned-row span { font-weight: bold; }
+    table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
+</style>
+<table class="sniper-table">
+    <thead>
+        <tr>
+            <th>📌</th><th>代碼</th><th>名稱</th><th>等級</th><th>現價</th><th>漲跌%</th>
+            <th>均價</th><th>量比</th><th>訊號</th><th>大戶(10m/1H/日)</th><th>營收YoY</th><th>EPS</th><th>PE</th>
+        </tr>
+    </thead>
+    <tbody>
+""")
 
         for _, row in df_watch.iterrows():
             row_class = "pinned-row" if row['Pinned'] else ""
@@ -800,23 +801,8 @@ def render_live_dashboard():
             if row['net_10m']==0 and row['net_1h']==0: big_player = "<span style='color:#ccc'>--</span>"
             else: big_player = f"<span style='color:{'#ff4d4f' if row['net_day']>0 else '#2ecc71'}'>{big_player}</span>"
 
-            html_parts.append(f"""
-                <tr class="{row_class}">
-                    <td>{pin_icon}</td>
-                    <td>{row['code']}</td>
-                    <td>{row['name']}</td>
-                    <td>{row['signal_level']}</td>
-                    <td>{price_html}</td>
-                    <td>{pct_html}</td>
-                    <td>{vwap_html}</td>
-                    <td>{ratio_html}</td>
-                    <td>{row['event_label']}</td>
-                    <td>{big_player}</td>
-                    <td>{row['yoy']:.1f}%</td>
-                    <td>{row['eps']:.2f}</td>
-                    <td>{row['pe']:.1f}</td>
-                </tr>
-            """)
+            # [FIX] Single line f-string to avoid markdown code block interpretation
+            html_parts.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{row["code"]}</td><td>{row["name"]}</td><td>{row["signal_level"]}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{row["event_label"]}</td><td>{big_player}</td><td>{row["yoy"]:.1f}%</td><td>{row["eps"]:.2f}</td><td>{row["pe"]:.1f}</td></tr>')
         
         html_parts.append("</tbody></table>")
         st.markdown("".join(html_parts), unsafe_allow_html=True)
