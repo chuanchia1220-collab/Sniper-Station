@@ -330,6 +330,7 @@ class SniperEngine:
         self.market_stats = {"TSE": 0, "OTC": 0, "Time": 0}
         
         self.last_reset = datetime.now().date()
+        # [NOTE] Keeping 10 workers as per previous user code
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
     def update_targets(self):
@@ -394,19 +395,11 @@ class SniperEngine:
                     try: 
                         # Try fetch recent quote
                         t_info = tickers.tickers['^TWII'].info
-                        # 'regularMarketVolume' is usually share volume, not value.
-                        # For index value, Yahoo is tricky. We use Quote approximation or leave 0 if hard.
-                        # Alternative: Use day's high/low approximation or simply skip if Yahoo doesn't give Value.
-                        # Note: Yahoo Index Volume is often shares, not currency. 
-                        # We try to use 'regularMarketVolume' * 'regularMarketPrice' as rough est if needed, 
-                        # but for TWII, 'volume' in yahoo is often just shares.
-                        # Let's rely on Fugle mostly, but maybe check history if intraday fails.
                         pass 
                     except: pass
             except: pass
             
         # Update State (Even if 0, to reset timer)
-        # If we got 0, we keep old value if it was non-zero (simple persistence)
         old_tse = self.market_stats.get("TSE", 0)
         old_otc = self.market_stats.get("OTC", 0)
         
@@ -710,17 +703,16 @@ def render_live_dashboard():
 
     st.markdown("---")
 
-    # --- Part 2: Watchlist (Manual HTML Highlighting) ---
+    # --- Part 2: Watchlist (Manual HTML Highlighting + Multiselect) ---
     st.subheader("🔭 監控雷達")
     df_watch = db.get_watchlist_view()
     
     if not df_watch.empty:
-        # [NEW] Interactive Pinning inside the dashboard
         # 1. Prepare list for multiselect
         all_options = df_watch['code'].tolist()
         current_pinned = df_watch[df_watch['is_pinned'] == 1]['code'].tolist()
         
-        # 2. Render Multiselect
+        # 2. Render Multiselect (This is the NEW interactive part)
         new_pinned = st.multiselect(
             "📌 快速釘選 (選中即變色)", 
             options=all_options,
@@ -729,7 +721,7 @@ def render_live_dashboard():
             key="pinned_multiselect"
         )
         
-        # 3. Update DB if changed (Simple Logic)
+        # 3. Update DB if changed
         if set(new_pinned) != set(current_pinned):
             for code in all_options:
                 is_p = 1 if code in new_pinned else 0
@@ -739,7 +731,7 @@ def render_live_dashboard():
             st.rerun()
 
         # 4. Prepare Data for HTML
-        df_watch['Pinned'] = df_watch['code'].isin(new_pinned) # Use local state for instant feedback
+        df_watch['Pinned'] = df_watch['code'].isin(new_pinned)
         
         for col in ['net_10m', 'net_1h', 'net_day']:
             if col not in df_watch.columns: df_watch[col] = 0
@@ -751,7 +743,7 @@ def render_live_dashboard():
         if use_filter: 
             df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'].notna()) & (df_watch['pe'] < 50)]
         
-        # --- HTML Generator Helpers ---
+        # --- HTML Helpers ---
         def get_color_val(val, suffix=""):
             try:
                 v = float(val)
@@ -770,7 +762,7 @@ def render_live_dashboard():
                 return "<span style='color:#cccccc'>-</span>"
             except: return "-"
 
-        # --- Build HTML Table Manually ---
+        # --- Build HTML Table Manually (Replaces df.to_html) ---
         html_parts = []
         html_parts.append("""
         <style>
@@ -799,7 +791,7 @@ def render_live_dashboard():
             pct_html = get_color_val(row['pct'], "%")
             
             vwap_color = "#ff4d4f" if row['price'] > row['vwap'] else "#000000"
-            if row['Pinned']: vwap_color = "#000000" 
+            if row['Pinned']: vwap_color = "#000000"
             vwap_html = f"<span style='color:{vwap_color}'>{row['vwap']:.2f}</span>"
             
             ratio_html = get_ratio_html(row['ratio'])
