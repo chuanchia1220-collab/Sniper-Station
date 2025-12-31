@@ -15,7 +15,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.36 Stable", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.37 UI", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -546,7 +546,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("🛡️ 戰情室 v5.36")
+    st.title("🛡️ 戰情室 v5.37")
     
     # --- [TOP] Market Thermometer ---
     st.subheader("🌡️ 大盤溫度計")
@@ -710,11 +710,36 @@ def render_live_dashboard():
 
     st.markdown("---")
 
-    # --- Part 2: Watchlist (Bottom - HTML Render Mode) ---
+    # --- Part 2: Watchlist (Manual HTML Highlighting) ---
     st.subheader("🔭 監控雷達")
     df_watch = db.get_watchlist_view()
+    
     if not df_watch.empty:
-        df_watch['Pinned'] = df_watch['is_pinned'].astype(bool)
+        # [NEW] Interactive Pinning inside the dashboard
+        # 1. Prepare list for multiselect
+        all_options = df_watch['code'].tolist()
+        current_pinned = df_watch[df_watch['is_pinned'] == 1]['code'].tolist()
+        
+        # 2. Render Multiselect
+        new_pinned = st.multiselect(
+            "📌 快速釘選 (選中即變色)", 
+            options=all_options,
+            default=current_pinned,
+            format_func=lambda x: f"{x} {get_stock_name(x)}",
+            key="pinned_multiselect"
+        )
+        
+        # 3. Update DB if changed (Simple Logic)
+        if set(new_pinned) != set(current_pinned):
+            for code in all_options:
+                is_p = 1 if code in new_pinned else 0
+                was_p = 1 if code in current_pinned else 0
+                if is_p != was_p:
+                    db.update_pinned(code, is_p)
+            st.rerun()
+
+        # 4. Prepare Data for HTML
+        df_watch['Pinned'] = df_watch['code'].isin(new_pinned) # Use local state for instant feedback
         
         for col in ['net_10m', 'net_1h', 'net_day']:
             if col not in df_watch.columns: df_watch[col] = 0
@@ -726,62 +751,83 @@ def render_live_dashboard():
         if use_filter: 
             df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'].notna()) & (df_watch['pe'] < 50)]
         
-        # Color Logics
-        def format_ratio_val(x):
+        # --- HTML Generator Helpers ---
+        def get_color_val(val, suffix=""):
             try:
-                val = float(x)
-                if val >= 10: return f"<span style='color:#ff4d4f'>{val:.1f}</span>"
-                elif val > 0: return f"<span style='color:#000000'>{val:.1f}</span>"
-                else: return "<span style='color:#cccccc'>-</span>"
-            except: return "<span style='color:#cccccc'>-</span>"
+                v = float(val)
+                color = "#000000"
+                if v > 0: color = "#ff4d4f"
+                elif v < 0: color = "#2ecc71"
+                elif v == 0: color = "#e0e0e0"
+                return f"<span style='color:{color}'>{v:.2f}{suffix}</span>"
+            except: return str(val)
 
-        def format_vwap_val(row):
+        def get_ratio_html(val):
             try:
-                p = float(row['price'])
-                v = float(row['vwap'])
-                text = f"{v:.2f}"
-                if p > v: return f"<span style='color:#ff4d4f'>{text}</span>"
-                return f"<span style='color:#000000'>{text}</span>"
-            except: return str(row['vwap'])
+                v = float(val)
+                if v >= 10: return f"<span style='color:#ff4d4f; font-weight:bold'>{v:.1f}</span>"
+                if v > 0: return f"{v:.1f}"
+                return "<span style='color:#cccccc'>-</span>"
+            except: return "-"
 
-        df_watch['temp_ratio_html'] = df_watch['ratio'].apply(format_ratio_val)
-        df_watch['temp_vwap_html'] = df_watch.apply(format_vwap_val, axis=1)
-        
-        df_watch = df_watch.rename(columns={'event_label': '訊號', 'code': '代碼', 'name': '名稱', 'price': '現價', 'pct': '漲跌%', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'signal_level': '等級'})
-        
-        df_watch['現價'] = df_watch['現價'].apply(lambda x: format_number(x, decimals=2, pos_color="#000000"))
-        df_watch['漲跌%'] = df_watch['漲跌%'].apply(lambda x: format_number(x, decimals=2, suffix="%"))
-        df_watch['PE'] = df_watch['PE'].apply(lambda x: format_number(x, decimals=1))
-        
-        # Apply HTML columns
-        df_watch['量比'] = df_watch['temp_ratio_html']
-        df_watch['均價'] = df_watch['temp_vwap_html']
+        # --- Build HTML Table Manually ---
+        html_parts = []
+        html_parts.append("""
+        <style>
+            table.sniper-table { width: 100%; border-collapse: collapse; font-family: monospace; }
+            table.sniper-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; }
+            table.sniper-table td { padding: 8px; border-bottom: 1px solid #444; font-size: 14px; }
+            table.sniper-table tr.pinned-row { background-color: #f5f0c8 !important; color: black !important; }
+            table.sniper-table tr.pinned-row span { font-weight: bold; }
+            table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
+        </style>
+        <table class="sniper-table">
+            <thead>
+                <tr>
+                    <th>📌</th><th>代碼</th><th>名稱</th><th>等級</th><th>現價</th><th>漲跌%</th>
+                    <th>均價</th><th>量比</th><th>訊號</th><th>大戶(10m/1H/日)</th><th>營收YoY</th><th>EPS</th><th>PE</th>
+                </tr>
+            </thead>
+            <tbody>
+        """)
 
-        def format_big_player(row):
-            if row['net_10m'] == 0 and row['net_1h'] == 0 and row['net_day'] == 0:
-                return "<span style='color:#e0e0e0'>-- / -- / --</span>"
-            return f"{format_number(row['net_10m'], decimals=0)} / {format_number(row['net_1h'], decimals=0)} / {format_number(row['net_day'], decimals=0)}"
+        for _, row in df_watch.iterrows():
+            row_class = "pinned-row" if row['Pinned'] else ""
+            pin_icon = "📌" if row['Pinned'] else ""
+            
+            price_html = get_color_val(row['price'])
+            pct_html = get_color_val(row['pct'], "%")
+            
+            vwap_color = "#ff4d4f" if row['price'] > row['vwap'] else "#000000"
+            if row['Pinned']: vwap_color = "#000000" 
+            vwap_html = f"<span style='color:{vwap_color}'>{row['vwap']:.2f}</span>"
+            
+            ratio_html = get_ratio_html(row['ratio'])
+            
+            big_player = f"{int(row['net_10m'])} / {int(row['net_1h'])} / {int(row['net_day'])}"
+            if row['net_10m']==0 and row['net_1h']==0: big_player = "<span style='color:#ccc'>--</span>"
+            else: big_player = f"<span style='color:{'#ff4d4f' if row['net_day']>0 else '#2ecc71'}'>{big_player}</span>"
+
+            html_parts.append(f"""
+                <tr class="{row_class}">
+                    <td>{pin_icon}</td>
+                    <td>{row['code']}</td>
+                    <td>{row['name']}</td>
+                    <td>{row['signal_level']}</td>
+                    <td>{price_html}</td>
+                    <td>{pct_html}</td>
+                    <td>{vwap_html}</td>
+                    <td>{ratio_html}</td>
+                    <td>{row['event_label']}</td>
+                    <td>{big_player}</td>
+                    <td>{row['yoy']:.1f}%</td>
+                    <td>{row['eps']:.2f}</td>
+                    <td>{row['pe']:.1f}</td>
+                </tr>
+            """)
         
-        df_watch['大戶'] = df_watch.apply(format_big_player, axis=1)
-        df_watch['📌'] = df_watch['Pinned'].apply(lambda x: "📌" if x else "")
-
-        cols_html = ['📌', '代碼', '名稱', '等級', '現價', '漲跌%', '均價', '量比', '訊號', '大戶', '營收YoY', 'EPS', 'PE']
-        df_html = df_watch[cols_html].copy()
-        
-        st.markdown("""
-            <style>
-            table.custom-table { width: 100%; border-collapse: collapse; }
-            table.custom-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; }
-            table.custom-table td { padding: 8px; border-bottom: 1px solid #444; font-size: 14px; }
-            table.custom-table tr:hover { background-color: #f5f0c8; }
-            </style>
-        """, unsafe_allow_html=True)
-
-        def highlight_pinned(row):
-            return ['background-color: #f5f0c8' if row['📌'] == "📌" else '' for _ in row]
-
-        html_str = df_html.style.apply(highlight_pinned, axis=1).hide(axis='index').to_html(escape=False, classes="custom-table")
-        st.markdown(html_str, unsafe_allow_html=True)
+        html_parts.append("</tbody></table>")
+        st.markdown("".join(html_parts), unsafe_allow_html=True)
 
     else: st.info("尚無監控資料")
 
