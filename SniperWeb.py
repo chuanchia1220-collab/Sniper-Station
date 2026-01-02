@@ -15,7 +15,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.40 Logic Fix", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.41 ColorFix", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -390,7 +390,12 @@ class SniperEngine:
                 tickers = yf.Tickers("^TWII ^TWO")
                 if tse_val == 0:
                     try: 
-                        pass 
+                        # Fallback to history for last close if intraday fails
+                        hist = tickers.tickers['^TWII'].history(period="1d")
+                        if not hist.empty:
+                            # Note: Yahoo volume for indices is often 0 or shares, not value.
+                            # We use a rough estimate if needed, but here just keep 0 if unknown.
+                            pass
                     except: pass
             except: pass
             
@@ -533,7 +538,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("🛡️ 戰情室 v5.40")
+    st.title("🛡️ 戰情室 v5.41")
     
     # --- [TOP] Market Thermometer ---
     st.subheader("🌡️ 大盤溫度計")
@@ -768,15 +773,21 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
             pin_icon = "📌" if row['Pinned'] else ""
             
             # [LOGIC FIX] Price color purely based on PCT (Independent of Pinned)
-            if row['pct'] > 0: p_color = "#ff4d4f"
-            elif row['pct'] < 0: p_color = "#2ecc71"
-            else: p_color = "#666666" # Neutral Dark Grey
+            if row['pct'] > 0: 
+                main_color = "#ff4d4f"
+            elif row['pct'] < 0: 
+                main_color = "#2ecc71"
+            else: 
+                main_color = "#999999" # Neutral
             
-            price_html = f"<span style='color:{p_color}'>{row['price']:.2f}</span>"
-            pct_html = f"<span style='color:{p_color}'>{row['pct']:.2f}%</span>"
+            price_html = f"<span style='color:{main_color}'>{row['price']:.2f}</span>"
+            pct_html = f"<span style='color:{main_color}'>{row['pct']:.2f}%</span>"
             
-            vwap_color = "#ff4d4f" if row['price'] > row['vwap'] else "#000000"
-            if row['Pinned']: vwap_color = "#000000"
+            # VWAP Logic: Red if Price > VWAP, Green if Price < VWAP
+            if row['price'] > row['vwap']: vwap_color = "#ff4d4f"
+            elif row['price'] < row['vwap']: vwap_color = "#2ecc71"
+            else: vwap_color = "#999999"
+            
             vwap_html = f"<span style='color:{vwap_color}'>{row['vwap']:.2f}</span>"
             
             ratio_html = get_ratio_html(row['ratio'])
