@@ -15,7 +15,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.39 Final", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.40 Logic Fix", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -533,7 +533,7 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("🛡️ 戰情室 v5.39")
+    st.title("🛡️ 戰情室 v5.40")
     
     # --- [TOP] Market Thermometer ---
     st.subheader("🌡️ 大盤溫度計")
@@ -734,6 +734,15 @@ def render_live_dashboard():
                 return "<span style='color:#cccccc'>-</span>"
             except: return "-"
 
+        # [FIX] Helper function for independent Big Player coloring
+        def bp_span(val):
+            try:
+                v = int(val)
+                if v > 0: return f"<span style='color:#ff4d4f'>{v}</span>"
+                elif v < 0: return f"<span style='color:#2ecc71'>{v}</span>"
+                else: return f"<span style='color:#999999'>0</span>"
+            except: return "<span style='color:#999999'>-</span>"
+
         # --- Build HTML Table Manually (No Indentation) ---
         table_start = """
 <style>
@@ -758,10 +767,10 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
             row_class = "pinned-row" if row['Pinned'] else ""
             pin_icon = "📌" if row['Pinned'] else ""
             
-            # [LOGIC FIX] Price color based on PCT change
+            # [LOGIC FIX] Price color purely based on PCT (Independent of Pinned)
             if row['pct'] > 0: p_color = "#ff4d4f"
             elif row['pct'] < 0: p_color = "#2ecc71"
-            else: p_color = "#000000" if row['Pinned'] else "#e0e0e0"
+            else: p_color = "#666666" # Neutral Dark Grey
             
             price_html = f"<span style='color:{p_color}'>{row['price']:.2f}</span>"
             pct_html = f"<span style='color:{p_color}'>{row['pct']:.2f}%</span>"
@@ -772,16 +781,8 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
             
             ratio_html = get_ratio_html(row['ratio'])
             
-            # [LOGIC FIX] Big Player color: Green if negative, Red if positive, Grey if 0
-            if row['net_day'] > 0: bp_color = "#ff4d4f"
-            elif row['net_day'] < 0: bp_color = "#2ecc71"
-            else: bp_color = "#cccccc"
-            
-            big_player = f"{int(row['net_10m'])} / {int(row['net_1h'])} / {int(row['net_day'])}"
-            if row['net_10m']==0 and row['net_1h']==0 and row['net_day']==0: 
-                big_player = "<span style='color:#ccc'>--</span>"
-            else: 
-                big_player = f"<span style='color:{bp_color}'>{big_player}</span>"
+            # [LOGIC FIX] Independent Big Player Coloring
+            big_player = f"{bp_span(row['net_10m'])} / {bp_span(row['net_1h'])} / {bp_span(row['net_day'])}"
 
             html_rows.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{row["code"]}</td><td>{row["name"]}</td><td>{row["signal_level"]}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{row["event_label"]}</td><td>{big_player}</td><td>{row["yoy"]:.1f}%</td><td>{row["eps"]:.2f}</td><td>{row["pe"]:.1f}</td></tr>')
         
