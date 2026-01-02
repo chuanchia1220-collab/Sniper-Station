@@ -15,7 +15,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v5.37 UI", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v5.39 Final", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -231,7 +231,6 @@ def get_dynamic_thresholds(price):
 def _calc_est_vol(current_vol):
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    # [FIX] Return 0 only if before 9:00, but if it is market hours, process it.
     if now < market_open: return 0 
     elapsed_minutes = (now - market_open).seconds / 60
     if elapsed_minutes <= 0: return 0
@@ -330,8 +329,7 @@ class SniperEngine:
         self.market_stats = {"TSE": 0, "OTC": 0, "Time": 0}
         
         self.last_reset = datetime.now().date()
-        # [NOTE] Keeping 10 workers as per previous user code
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
 
     def update_targets(self):
         self.targets = db.get_all_codes()
@@ -390,11 +388,8 @@ class SniperEngine:
             try:
                 # Yahoo: ^TWII (TSE), ^TWO (OTC)
                 tickers = yf.Tickers("^TWII ^TWO")
-                
                 if tse_val == 0:
                     try: 
-                        # Try fetch recent quote
-                        t_info = tickers.tickers['^TWII'].info
                         pass 
                     except: pass
             except: pass
@@ -501,7 +496,6 @@ class SniperEngine:
                 self.last_reset = now.date()
             
             # [BLOCK 3 Update]
-            # [FIX] Fetch if Market Open OR Data is Missing (0)
             current_tse = self.market_stats.get("TSE", 0)
             if MarketSession.is_market_open(now) or current_tse == 0:
                 self._update_market_thermometer()
@@ -539,21 +533,16 @@ class LegacyDispatcher:
 dispatcher = LegacyDispatcher()
 
 with st.sidebar:
-    st.title("🛡️ 戰情室 v5.37")
+    st.title("🛡️ 戰情室 v5.39")
     
     # --- [TOP] Market Thermometer ---
     st.subheader("🌡️ 大盤溫度計")
     
-    # Get Market Data
     tse_val = engine.market_stats.get("TSE", 0)
     otc_val = engine.market_stats.get("OTC", 0)
     
-    # Calc Est Value (Billions)
     est_tse = int(_calc_est_vol(tse_val) / 100000000)
     est_otc = int(_calc_est_vol(otc_val) / 100000000)
-    
-    # TSE Metric
-    delta_color_tse = "off"
     
     st.metric("上市預估量 (億)", f"{est_tse}", delta=None, help=">4000億:熱, <2500億:冷")
     if est_tse >= 4000: st.caption("🔥 資金狂潮 (攻擊)")
@@ -563,7 +552,6 @@ with st.sidebar:
     
     st.divider()
 
-    # OTC Metric
     st.metric("上櫃預估量 (億)", f"{est_otc}", delta=None)
     if est_otc >= 1200: st.caption("🔥 中小噴發")
     elif est_otc <= 600 and est_otc > 0: st.caption("🧊 內資縮手")
@@ -600,7 +588,6 @@ with st.sidebar:
                     static_list = []
                     progress_bar = status.progress(0)
                     
-                    # [FIX] Smart API Rotation
                     for i, code in enumerate(targets):
                         current_key = API_KEYS[i % len(API_KEYS)]
                         client = RestClient(api_key=current_key)
@@ -703,16 +690,14 @@ def render_live_dashboard():
 
     st.markdown("---")
 
-    # --- Part 2: Watchlist (Manual HTML Highlighting + Multiselect) ---
+    # --- Part 2: Watchlist (Manual HTML + Multiselect) ---
     st.subheader("🔭 監控雷達")
     df_watch = db.get_watchlist_view()
     
     if not df_watch.empty:
-        # 1. Prepare list for multiselect
         all_options = df_watch['code'].tolist()
         current_pinned = df_watch[df_watch['is_pinned'] == 1]['code'].tolist()
         
-        # 2. Render Multiselect
         new_pinned = st.multiselect(
             "📌 快速釘選 (選中即變色)", 
             options=all_options,
@@ -721,7 +706,6 @@ def render_live_dashboard():
             key="pinned_multiselect"
         )
         
-        # 3. Update DB if changed
         if set(new_pinned) != set(current_pinned):
             for code in all_options:
                 is_p = 1 if code in new_pinned else 0
@@ -730,7 +714,6 @@ def render_live_dashboard():
                     db.update_pinned(code, is_p)
             st.rerun()
 
-        # 4. Prepare Data for HTML
         df_watch['Pinned'] = df_watch['code'].isin(new_pinned)
         
         for col in ['net_10m', 'net_1h', 'net_day']:
@@ -743,17 +726,7 @@ def render_live_dashboard():
         if use_filter: 
             df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'].notna()) & (df_watch['pe'] < 50)]
         
-        # --- HTML Helpers ---
-        def get_color_val(val, suffix=""):
-            try:
-                v = float(val)
-                color = "#000000"
-                if v > 0: color = "#ff4d4f"
-                elif v < 0: color = "#2ecc71"
-                elif v == 0: color = "#e0e0e0"
-                return f"<span style='color:{color}'>{v:.2f}{suffix}</span>"
-            except: return str(val)
-
+        # --- HTML Generator Helpers ---
         def get_ratio_html(val):
             try:
                 v = float(val)
@@ -762,10 +735,8 @@ def render_live_dashboard():
                 return "<span style='color:#cccccc'>-</span>"
             except: return "-"
 
-        # --- Build HTML Table Manually (FIXED: Removing Indentation) ---
-        # The key fix here is removing leading spaces in the strings below
-        html_parts = []
-        html_parts.append("""
+        # --- Build HTML Table Manually (FIXED: Removing Indentation & Fixing Logic) ---
+        table_start = """
 <style>
     table.sniper-table { width: 100%; border-collapse: collapse; font-family: monospace; }
     table.sniper-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; }
@@ -782,14 +753,19 @@ def render_live_dashboard():
         </tr>
     </thead>
     <tbody>
-""")
-
+"""
+        html_rows = []
         for _, row in df_watch.iterrows():
             row_class = "pinned-row" if row['Pinned'] else ""
             pin_icon = "📌" if row['Pinned'] else ""
             
-            price_html = get_color_val(row['price'])
-            pct_html = get_color_val(row['pct'], "%")
+            # [LOGIC FIX] Price color based on PCT change
+            if row['pct'] > 0: p_color = "#ff4d4f"
+            elif row['pct'] < 0: p_color = "#2ecc71"
+            else: p_color = "#000000" if row['Pinned'] else "#e0e0e0"
+            
+            price_html = f"<span style='color:{p_color}'>{row['price']:.2f}</span>"
+            pct_html = f"<span style='color:{p_color}'>{row['pct']:.2f}%</span>"
             
             vwap_color = "#ff4d4f" if row['price'] > row['vwap'] else "#000000"
             if row['Pinned']: vwap_color = "#000000"
@@ -801,11 +777,10 @@ def render_live_dashboard():
             if row['net_10m']==0 and row['net_1h']==0: big_player = "<span style='color:#ccc'>--</span>"
             else: big_player = f"<span style='color:{'#ff4d4f' if row['net_day']>0 else '#2ecc71'}'>{big_player}</span>"
 
-            # [FIX] Single line f-string to avoid markdown code block interpretation
-            html_parts.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{row["code"]}</td><td>{row["name"]}</td><td>{row["signal_level"]}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{row["event_label"]}</td><td>{big_player}</td><td>{row["yoy"]:.1f}%</td><td>{row["eps"]:.2f}</td><td>{row["pe"]:.1f}</td></tr>')
+            html_rows.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{row["code"]}</td><td>{row["name"]}</td><td>{row["signal_level"]}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{row["event_label"]}</td><td>{big_player}</td><td>{row["yoy"]:.1f}%</td><td>{row["eps"]:.2f}</td><td>{row["pe"]:.1f}</td></tr>')
         
-        html_parts.append("</tbody></table>")
-        st.markdown("".join(html_parts), unsafe_allow_html=True)
+        final_html = table_start + "".join(html_rows) + "</tbody></table>"
+        st.markdown(final_html, unsafe_allow_html=True)
 
     else: st.info("尚無監控資料")
 
