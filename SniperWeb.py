@@ -726,6 +726,12 @@ def render_live_dashboard():
     df_watch = db.get_watchlist_view()
 
     if not df_watch.empty:
+        # [CRITICAL FIX] Data Sanitization: Ensure numeric columns are floats, not None
+        numeric_cols = ['price', 'pct', 'vwap', 'ratio', 'net_10m', 'net_1h', 'net_day', 'yoy', 'eps', 'pe']
+        for col in numeric_cols:
+            if col in df_watch.columns:
+                df_watch[col] = pd.to_numeric(df_watch[col], errors='coerce').fillna(0.0)
+
         all_options = df_watch['code'].tolist()
         current_pinned = df_watch[df_watch['is_pinned'] == 1]['code'].tolist()
 
