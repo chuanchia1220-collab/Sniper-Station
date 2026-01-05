@@ -19,7 +19,7 @@ st.set_page_config(page_title="Sniper v5.41 ColorFix", page_icon="🛡️", layo
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
-    TG_BOT_TOKEN = st.secrets.get("TG_BOT_TOKEN", "") 
+    TG_BOT_TOKEN = st.secrets.get("TG_BOT_TOKEN", "")
     TG_CHAT_ID = st.secrets.get("TG_CHAT_ID", "")
 except:
     raw_fugle_keys = os.getenv("Fugle_API_Key", "")
@@ -69,7 +69,7 @@ class Database:
         self._init_db()
         threading.Thread(target=self._writer_loop, daemon=True).start()
 
-    def _get_conn(self): 
+    def _get_conn(self):
         return sqlite3.connect(self.db_path, check_same_thread=False)
 
     def _init_db(self):
@@ -108,7 +108,7 @@ class Database:
         self.write_queue.put(('executemany', sql, data_list))
 
     def update_base_vol(self, code, vol):
-        if vol is None or vol <= 0: return 
+        if vol is None or vol <= 0: return
         sql = 'UPDATE static_info SET avg_vol = ? WHERE code = ?'
         self.write_queue.put(('execute', sql, (vol, code)))
 
@@ -152,6 +152,11 @@ class Database:
         c.execute('SELECT code FROM inventory')
         rows = c.fetchall(); conn.close(); return [r[0] for r in rows]
 
+    def get_pinned_codes(self):
+        conn = self._get_conn(); c = conn.cursor()
+        c.execute('SELECT code FROM pinned')
+        rows = c.fetchall(); conn.close(); return [r[0] for r in rows]
+
     def get_volume_map(self):
         conn = self._get_conn(); c = conn.cursor()
         c.execute('SELECT code, avg_vol FROM static_info')
@@ -193,7 +198,7 @@ def fetch_5ma_volume_hybrid(client, code):
             avg_shares = total_shares / 5
             return int(avg_shares) // 1000
     except: pass
-    
+
     return None
 
 def fetch_fundamental_data(code):
@@ -218,7 +223,7 @@ def get_stock_name(symbol):
     except: return symbol
 
 def get_dynamic_thresholds(price):
-    if price >= 1200: return 2.0, 1.2, 1.8 
+    if price >= 1200: return 2.0, 1.2, 1.8
     elif price >= 1000: return 2.0, 1.2, 2.0
     elif price >= 800:  return 2.0, 1.2, 2.5
     elif price >= 650:  return 2.0, 1.2, 3.0
@@ -231,14 +236,21 @@ def get_dynamic_thresholds(price):
 def _calc_est_vol(current_vol):
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    if now < market_open: return 0 
+    if now < market_open: return 0
     elapsed_minutes = (now - market_open).seconds / 60
     if elapsed_minutes <= 0: return 0
     if elapsed_minutes >= 270: return current_vol
     return int(current_vol * (270 / elapsed_minutes))
 
-def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, ambush_ratio, is_breakdown, price, vwap, has_attacked):
+def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, ambush_ratio, is_breakdown, price, vwap, has_attacked, now_time, vol_lots):
     if pct >= 9.5: return "漲停"
+
+    # [NEW] End Game Strategy
+    if dt_time(13, 0) <= now_time.time() <= dt_time(13, 25):
+        if (3.0 <= pct <= 9.0) and (price > vwap) and (net_1h > 0):
+             if vol_lots > 0 and (net_day / vol_lots >= 0.05):
+                 return "尾盤"
+
     if ratio > 0:
         if (ratio >= ambush_ratio) and (abs(price - vwap) / vwap <= 0.01) and (pct <= 2.0) and (net_1h > 0) and (not has_attacked): return "伏擊"
         if is_bullish and net_day > 200 and pct >= tgt_pct and ratio >= tgt_ratio: return "攻擊"
@@ -255,9 +267,9 @@ class NotificationManager:
     COOLDOWN_SECONDS = 600
     RATE_LIMIT_DELAY = 1.0
     EMOJI_MAP = {
-        "攻擊": "🚀", "伏擊": "💣", "量增": "👀", 
+        "攻擊": "🚀", "伏擊": "💣", "量增": "👀",
         "出貨": "💀", "跌破": "⚠️", "漲停": "👑",
-        "價強": "💪", "誘多": "🎣"
+        "價強": "💪", "誘多": "🎣", "尾盤": "🔥"
     }
 
     def __init__(self):
@@ -318,7 +330,7 @@ class SniperEngine:
         self.targets = []
         self.inventory_codes = []
         # [BLOCK 1] Bunker Cache
-        self.base_vol_cache = {} 
+        self.base_vol_cache = {}
         # [BLOCK 2] Live Data
         self.daily_net = {}
         self.vol_queues = {}
@@ -327,7 +339,7 @@ class SniperEngine:
         self.daily_risk_flags = {}
         # [BLOCK 3] Market Stats - Init Time to 0 to force immediate update
         self.market_stats = {"TSE": 0, "OTC": 0, "Time": 0}
-        
+
         self.last_reset = datetime.now().date()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
 
@@ -354,7 +366,7 @@ class SniperEngine:
             for code in self.targets:
                 if not self.running: break
                 if code in self.base_vol_cache and self.base_vol_cache[code] > 0:
-                    continue 
+                    continue
                 try:
                     client = next(self.client_cycle) if self.client_cycle else None
                     if client:
@@ -363,16 +375,16 @@ class SniperEngine:
                             self.base_vol_cache[code] = vol
                             db.update_base_vol(code, vol)
                 except: pass
-                time.sleep(1.0) 
+                time.sleep(1.0)
             time.sleep(10)
 
     def _update_market_thermometer(self):
         """[BLOCK 3] Robust Fetch: Fugle -> Yahoo Backup"""
         if time.time() - self.market_stats["Time"] < 15: return
-        
+
         tse_val = 0
         otc_val = 0
-        
+
         # 1. Try Fugle First
         try:
             client = next(self.client_cycle) if self.client_cycle else None
@@ -389,7 +401,7 @@ class SniperEngine:
                 # Yahoo: ^TWII (TSE), ^TWO (OTC)
                 tickers = yf.Tickers("^TWII ^TWO")
                 if tse_val == 0:
-                    try: 
+                    try:
                         # Fallback to history for last close if intraday fails
                         hist = tickers.tickers['^TWII'].history(period="1d")
                         if not hist.empty:
@@ -398,14 +410,14 @@ class SniperEngine:
                             pass
                     except: pass
             except: pass
-            
+
         # Update State (Even if 0, to reset timer)
         old_tse = self.market_stats.get("TSE", 0)
         old_otc = self.market_stats.get("OTC", 0)
-        
+
         final_tse = tse_val if tse_val > 0 else old_tse
         final_otc = otc_val if otc_val > 0 else old_otc
-        
+
         self.market_stats = {
             "TSE": final_tse,
             "OTC": final_otc,
@@ -415,31 +427,32 @@ class SniperEngine:
     def _dispatch_event(self, ev: SniperEvent):
         notification_manager.enqueue(ev)
 
-    def _fetch_stock(self, code):
+    def _fetch_stock(self, code, now_time=None):
         try:
+            if now_time is None: now_time = datetime.now(timezone.utc) + timedelta(hours=8)
             client = next(self.client_cycle) if self.client_cycle else None
             if not client: return None
-            
+
             base_vol = self.base_vol_cache.get(code, 0)
-            
+
             q = client.stock.intraday.quote(symbol=code)
             price = q.get('lastPrice', 0)
             if not price: return None
-            
+
             pct = q.get('changePercent', 0)
             vol_lots = q.get('total', {}).get('tradeVolume', 0)
-            
+
             if vol_lots == 0 and code in self.prev_data:
                 vol_lots = self.prev_data[code]['vol']
-            
-            vol = vol_lots * 1000 
-            
+
+            vol = vol_lots * 1000
+
             est_lots = _calc_est_vol(vol_lots)
             ratio = est_lots / base_vol if base_vol > 0 else 0
-            
+
             total_val = q.get('total', {}).get('tradeValue', 0)
             vwap = (total_val / vol) if vol > 0 else price
-            
+
             delta_net = 0
             if code in self.prev_data:
                 prev_v = self.prev_data[code]['vol']
@@ -449,37 +462,38 @@ class SniperEngine:
                 if delta_v >= threshold:
                     if price >= prev_p: delta_net = int(delta_v)
                     elif price < prev_p: delta_net = -int(delta_v)
-            
+
             self.prev_data[code] = {'vol': vol_lots, 'price': price}
             now_ts = time.time()
             if code not in self.vol_queues: self.vol_queues[code] = []
             if delta_net != 0: self.vol_queues[code].append((now_ts, delta_net))
-            
+
             self.daily_net[code] = self.daily_net.get(code, 0) + delta_net
             self.vol_queues[code] = [x for x in self.vol_queues[code] if x[0] > now_ts - 3600]
             net_1h = sum(x[1] for x in self.vol_queues[code])
             net_10m = sum(x[1] for x in self.vol_queues[code] if x[0] > now_ts - 600)
             net_day = self.daily_net.get(code, 0)
-            
+
             tgt_pct, tgt_ratio, ambush_ratio = get_dynamic_thresholds(price)
-            
-            raw_state = check_signal(pct, price >= vwap, net_day, net_1h, ratio, tgt_pct, tgt_ratio, ambush_ratio, price < vwap*0.99, price, vwap, code in self.active_flags)
-            
+
+            raw_state = check_signal(pct, price >= vwap, net_day, net_1h, ratio, tgt_pct, tgt_ratio, ambush_ratio, price < vwap*0.99, price, vwap, code in self.active_flags, now_time, vol_lots)
+
             event_label = None
             scope = "inventory" if code in self.inventory_codes else "watchlist"
-            
+
             if "攻擊" in raw_state and code not in self.active_flags: event_label = "攻擊"
             elif "漲停" in raw_state and scope == "inventory": event_label = "漲停"
             elif "出貨" in raw_state and code not in self.daily_risk_flags and scope == "inventory": event_label = "出貨"
             elif "伏擊" in raw_state and scope == "watchlist": event_label = "伏擊"
+            elif "尾盤" in raw_state: event_label = "尾盤"
 
             if event_label:
                 if event_label == "攻擊": self.active_flags[code] = True
                 if event_label == "出貨": self.daily_risk_flags[code] = True
                 ev = SniperEvent(
-                    code=code, name=get_stock_name(code), scope=scope, 
-                    event_kind="STRATEGY", event_label=event_label, 
-                    price=price, pct=pct, vwap=vwap, ratio=ratio, 
+                    code=code, name=get_stock_name(code), scope=scope,
+                    event_kind="STRATEGY", event_label=event_label,
+                    price=price, pct=pct, vwap=vwap, ratio=ratio,
                     net_10m=net_10m, net_1h=net_1h, net_day=net_day
                 )
                 self._dispatch_event(ev)
@@ -496,10 +510,10 @@ class SniperEngine:
                 self.daily_net = {}
                 self.prev_data = {}
                 self.vol_queues = {}
-                self.base_vol_cache = {} 
+                self.base_vol_cache = {}
                 notification_manager.reset_daily_state()
                 self.last_reset = now.date()
-            
+
             # [BLOCK 3 Update]
             current_tse = self.market_stats.get("TSE", 0)
             if MarketSession.is_market_open(now) or current_tse == 0:
@@ -507,11 +521,23 @@ class SniperEngine:
 
             targets = db.get_all_codes()
             self.inventory_codes = db.get_inventory_codes()
-            
+            pinned_codes = db.get_pinned_codes()
+
             if not targets: time.sleep(2); continue
-            
+
+            # [PRIORITY FIX]
+            inv_set = set(self.inventory_codes)
+            pin_set = set(pinned_codes)
+
+            def priority_key(code):
+                if code in inv_set: return 0
+                if code in pin_set: return 1
+                return 2
+
+            targets.sort(key=priority_key)
+
             batch = []
-            futures = [self.executor.submit(self._fetch_stock, c) for c in targets]
+            futures = [self.executor.submit(self._fetch_stock, c, now) for c in targets]
             for f in concurrent.futures.as_completed(futures):
                 if f.result(): batch.append(f.result())
             db.upsert_realtime_batch(batch)
@@ -528,9 +554,9 @@ class LegacyDispatcher:
     def dispatch(self, event_dict):
         ev = SniperEvent(
             code=event_dict['code'], name=event_dict['name'], scope=event_dict['scope'],
-            event_kind=event_dict.get('event_kind', 'TEST'), event_label=event_dict['event_label'], 
-            price=event_dict['price'], pct=event_dict['pct'], vwap=event_dict.get('vwap', 0), 
-            ratio=event_dict['ratio'], net_1h=event_dict['net_1h'], net_10m=event_dict['net_10m'], 
+            event_kind=event_dict.get('event_kind', 'TEST'), event_label=event_dict['event_label'],
+            price=event_dict['price'], pct=event_dict['pct'], vwap=event_dict.get('vwap', 0),
+            ratio=event_dict['ratio'], net_1h=event_dict['net_1h'], net_10m=event_dict['net_10m'],
             net_day=event_dict['net_day'], timestamp=event_dict['timestamp'], is_test=event_dict.get('is_test', False)
         )
         notification_manager.enqueue(ev)
@@ -539,22 +565,22 @@ dispatcher = LegacyDispatcher()
 
 with st.sidebar:
     st.title("🛡️ 戰情室 v5.41")
-    
+
     # --- [TOP] Market Thermometer ---
     st.subheader("🌡️ 大盤溫度計")
-    
+
     tse_val = engine.market_stats.get("TSE", 0)
     otc_val = engine.market_stats.get("OTC", 0)
-    
+
     est_tse = int(_calc_est_vol(tse_val) / 100000000)
     est_otc = int(_calc_est_vol(otc_val) / 100000000)
-    
+
     st.metric("上市預估量 (億)", f"{est_tse}", delta=None, help=">4000億:熱, <2500億:冷")
     if est_tse >= 4000: st.caption("🔥 資金狂潮 (攻擊)")
     elif est_tse <= 2500 and est_tse > 0: st.caption("🧊 量能急凍 (盤整)")
     elif est_tse == 0: st.caption("⏳ 數據讀取中...")
     else: st.caption("☁️ 溫和換手 (中性)")
-    
+
     st.divider()
 
     st.metric("上櫃預估量 (億)", f"{est_otc}", delta=None)
@@ -562,14 +588,14 @@ with st.sidebar:
     elif est_otc <= 600 and est_otc > 0: st.caption("🧊 內資縮手")
     elif est_otc == 0: st.caption("⏳ 數據讀取中...")
     else: st.caption("☁️ 正常輪動")
-    
+
     st.markdown("---")
 
     # --- [BOTTOM] Controls ---
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
     st.subheader("🔍 濾網設定")
     use_filter = st.checkbox("只看基本面良好")
-    
+
     if mode == "👨‍✈️ 指揮官":
         with st.expander("📦 庫存管理 (Inventory)", expanded=False):
             inv_input = st.text_area("庫存清單 (代碼,成本,張數)", DEFAULT_INVENTORY, height=100)
@@ -592,27 +618,27 @@ with st.sidebar:
                     status = st.status("正在初始化數據 (含5日均量)...", expanded=True)
                     static_list = []
                     progress_bar = status.progress(0)
-                    
+
                     for i, code in enumerate(targets):
                         current_key = API_KEYS[i % len(API_KEYS)]
                         client = RestClient(api_key=current_key)
-                        
+
                         yoy, eps, pe = fetch_fundamental_data(code)
                         vol = fetch_5ma_volume_hybrid(client, code)
                         if vol and vol > 0:
                             db.update_base_vol(code, vol)
                         else:
                             vol = 0
-                        
+
                         static_list.append((code, 0, 0, yoy, eps, pe, vol))
                         progress_bar.progress((i + 1) / len(targets))
                         time.sleep(0.1)
-                        
+
                     db.upsert_static(static_list)
                     engine.update_targets()
                     status.update(label="初始化完成！", state="complete")
                     st.rerun()
-            
+
             col_a, col_b = st.columns(2)
             with col_a:
                 if st.button("🟢 啟動監控", disabled=engine.running):
@@ -626,13 +652,13 @@ with st.sidebar:
                     st.rerun()
 
     st.caption(f"Engine: {'🟢 RUNNING' if engine.running else '🔴 STOPPED'}")
-    
+
     st.subheader("🧪 系統測試")
     if st.button("🔥 測試攻擊"):
         dispatcher.dispatch({
-            "code": "2330", "name": "台積電 (測試)", "scope": "watchlist", 
-            "event_kind": "TEST", "event_label": "攻擊",  
-            "price": 888.0, "pct": 3.5, "vwap": 870.0, "ratio": 2.5, "net_10m": 150, "net_1h": 500, "net_day": 1200, 
+            "code": "2330", "name": "台積電 (測試)", "scope": "watchlist",
+            "event_kind": "TEST", "event_label": "攻擊",
+            "price": 888.0, "pct": 3.5, "vwap": 870.0, "ratio": 2.5, "net_10m": 150, "net_1h": 500, "net_day": 1200,
             "timestamp": time.time(), "is_test": True
         })
         st.toast("測試訊號已發送")
@@ -657,17 +683,17 @@ except ImportError:
 def render_live_dashboard():
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     st.caption(f"⚡ Live Refresh: {now.strftime('%H:%M:%S')} (Rate: 1.5s)")
-    
+
     # --- Part 1: Inventory (Top - Editor Mode) ---
     st.subheader("📦 庫存損益")
     df_inv = db.get_inventory_view()
     if not df_inv.empty:
         df_inv = df_inv.rename(columns={'net_1h': '大戶1H', 'net_day': '大戶日', 'ratio': '量比', 'vwap': '均價', 'pct': '漲跌%', 'price': '現價', 'code': '代碼', 'name': '名稱', 'event_label': '訊號', 'yoy': '營收YoY', 'eps': 'EPS', 'pe': 'PE', 'cost': '成本', 'profit_val': '損益$', 'profit_pct': '報酬%', 'risk_status': '狀態'})
         cols = ['代碼', '名稱', '狀態', '漲跌%', '現價', '均價', '量比', '訊號', '大戶1H', '大戶日', '營收YoY', 'EPS', 'PE', '成本', '損益$', '報酬%']
-        for c in cols: 
+        for c in cols:
             if c not in df_inv.columns: df_inv[c] = 0
         df_inv_show = df_inv[cols].copy()
-        
+
         for col in ['營收YoY', 'EPS', 'PE']:
             df_inv_show[col] = df_inv_show[col].fillna(0).infer_objects(copy=False)
 
@@ -698,19 +724,19 @@ def render_live_dashboard():
     # --- Part 2: Watchlist (Manual HTML + Multiselect) ---
     st.subheader("🔭 監控雷達")
     df_watch = db.get_watchlist_view()
-    
+
     if not df_watch.empty:
         all_options = df_watch['code'].tolist()
         current_pinned = df_watch[df_watch['is_pinned'] == 1]['code'].tolist()
-        
+
         new_pinned = st.multiselect(
-            "📌 快速釘選 (選中即變色)", 
+            "📌 快速釘選 (選中即變色)",
             options=all_options,
             default=current_pinned,
             format_func=lambda x: f"{x} {get_stock_name(x)}",
             key="pinned_multiselect"
         )
-        
+
         if set(new_pinned) != set(current_pinned):
             for code in all_options:
                 is_p = 1 if code in new_pinned else 0
@@ -720,17 +746,17 @@ def render_live_dashboard():
             st.rerun()
 
         df_watch['Pinned'] = df_watch['code'].isin(new_pinned)
-        
+
         for col in ['net_10m', 'net_1h', 'net_day']:
             if col not in df_watch.columns: df_watch[col] = 0
             df_watch[col] = df_watch[col].fillna(0).infer_objects(copy=False)
 
         df_watch['yoy'] = df_watch['yoy'].fillna(0).infer_objects(copy=False)
         df_watch['eps'] = df_watch['eps'].fillna(0).infer_objects(copy=False)
-        
-        if use_filter: 
+
+        if use_filter:
             df_watch = df_watch[(df_watch['yoy'] > 0) & (df_watch['eps'] > 0) & (df_watch['pe'].notna()) & (df_watch['pe'] < 50)]
-        
+
         def get_ratio_html(val):
             try:
                 v = float(val)
@@ -771,32 +797,31 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
         for _, row in df_watch.iterrows():
             row_class = "pinned-row" if row['Pinned'] else ""
             pin_icon = "📌" if row['Pinned'] else ""
-            
+
             # [LOGIC FIX] Price color purely based on PCT (Independent of Pinned)
-            if row['pct'] > 0: 
+            if row['pct'] > 0:
                 main_color = "#ff4d4f"
-            elif row['pct'] < 0: 
+            elif row['pct'] < 0:
                 main_color = "#2ecc71"
-            else: 
+            else:
                 main_color = "#999999" # Neutral
-            
-            price_html = f"<span style='color:{main_color}'>{row['price']:.2f}</span>"
+
+            price_html = f"<span style='color:#000000'>{row['price']:.2f}</span>"
             pct_html = f"<span style='color:{main_color}'>{row['pct']:.2f}%</span>"
-            
-            # VWAP Logic: Red if Price > VWAP, Green if Price < VWAP
+
+            # VWAP Logic: Red if Price > VWAP, Black if Price <= VWAP
             if row['price'] > row['vwap']: vwap_color = "#ff4d4f"
-            elif row['price'] < row['vwap']: vwap_color = "#2ecc71"
-            else: vwap_color = "#999999"
-            
+            else: vwap_color = "#000000"
+
             vwap_html = f"<span style='color:{vwap_color}'>{row['vwap']:.2f}</span>"
-            
+
             ratio_html = get_ratio_html(row['ratio'])
-            
+
             # [LOGIC FIX] Independent Big Player Coloring
             big_player = f"{bp_span(row['net_10m'])} / {bp_span(row['net_1h'])} / {bp_span(row['net_day'])}"
 
             html_rows.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{row["code"]}</td><td>{row["name"]}</td><td>{row["signal_level"]}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{row["event_label"]}</td><td>{big_player}</td><td>{row["yoy"]:.1f}%</td><td>{row["eps"]:.2f}</td><td>{row["pe"]:.1f}</td></tr>')
-        
+
         final_html = table_start + "".join(html_rows) + "</tbody></table>"
         st.markdown(final_html, unsafe_allow_html=True)
 
