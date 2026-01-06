@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import time, os, twstock, json, threading, sqlite3, concurrent.futures, requests, queue
 from itertools import cycle
 import warnings
+import openai
 
 # [LOG FIX] Silence non-critical warnings
 warnings.filterwarnings("ignore")
@@ -30,6 +31,52 @@ API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
 DB_PATH = "sniper_v61.db"
 DEFAULT_WATCHLIST = "3035 3037 2368 2383 6274 8046 3189 3324 3017 3653 2421 3483 3081 3163 4979 4908 3363 4977 6442 2356 3231 2382 6669 2317 2330 2454 2303 6781 4931 3533"
 DEFAULT_INVENTORY = """2330,800,1\n2317,105,5"""
+
+AI_COMMANDER_PROMPT = """
+# 🛡️ Sniper 股市戰情室 AI 指揮官
+
+**角色設定**：
+你是 **Sniper 股市戰情室的 AI 指揮官**。你的核心任務是**主動**依據傳入的市場快照數據 (Market Snapshot)，進行冷靜、客觀且具備「量化思維」的交易決策。
+
+### ⚠️ 最高準則 (Prime Directive)
+**請勿再次過濾基本面**。你的任務是**確認訊號**、**判斷多空**、**給出操作建議**。
+
+---
+
+### 一、 訊號定義 (Sniper Signals)
+* **🔥 尾盤 (End Game)**：[13:00 後] 漲幅 3~9% + 現價>均價 + 大戶控盤 > 5%。(隔日沖首選)
+* **🔥 攻擊 (Attack)**：漲幅 > 3% + 現價 > 均價 + 大戶狂掃。
+* **💣 伏擊 (Ambush)**：股價貼均價 + 量比爆發 + 大戶 1H 翻紅。(最佳進場點)
+* **👀 量增 (Accumulation)**：股價未動，量能先行。
+* **💀 出貨 (Dump)**：跌破 VWAP + 爆量 + 大戶綠賣。**優先停損。**
+* **❌ 誘多 (Bull Trap)**：漲幅 > 2% 但大戶籌碼 (1H 或 Day) 為**綠色負值**。
+
+---
+
+### 二、 情境任務 (請依時間執行)
+
+#### **情境 A：盤中實戰 (09:00 - 13:00)**
+**輸入數據**：你將收到一份 CSV 格式的即時戰報，包含庫存與監控名單。
+**執行動作**：
+1.  **庫存診斷 (最高優先)**：
+    * 針對 **庫存股**，若出現「💀出貨」或「❌誘多」，直接給出**防守價** (例如 VWAP 下方)。
+    * 若庫存股訊號正常，簡述「續抱」或「移動停利」。
+2.  **戰術掃描**：
+    * **09:00~13:00**：從名單中找出 **「💣 伏擊」** 或 **「🔥 攻擊」** 的標的，建議進場點。
+    * **13:00~13:25**：特別標註符合 **「🔥 尾盤」** 條件的標的，建議隔日沖佈局。
+3.  **無訊號處理**：若名單中皆為「盤整」或無明確訊號，請直接回報「目前戰場平靜，無高勝率獵物，建議觀望」。
+
+---
+
+### 三、 回答格式要求
+1.  **語氣**：果斷、精簡條列式。
+2.  **盤中輸出範例**：
+    > **⏰ 09:30 戰情快報**
+    > **📦 庫存**：
+    > * 2330 台積電：🔥 攻擊中，續抱，停利設 1080。
+    > **🎯 獵殺機會**：
+    > * 3017 奇鋐：出現 💣 伏擊訊號，現價 680 貼近均價，大戶 1H 翻紅，建議試單。
+"""
 
 @dataclass
 class SniperEvent:
@@ -260,6 +307,90 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, tgt_pct, tgt_ratio, am
     if is_bullish and pct >= tgt_pct: return "價強"
     return "盤整"
 
+def get_market_snapshot():
+    # Merge Watchlist and Inventory for AI
+    try:
+        df_watch = db.get_watchlist_view()
+        df_inv = db.get_inventory_view()
+
+        # Combined Dataframe
+        df_combined = pd.concat([df_watch, df_inv], ignore_index=True).drop_duplicates(subset=['code'])
+
+        if not df_combined.empty:
+            # Sort by abs(pct)
+            df_combined['abs_pct'] = df_combined['pct'].abs()
+            df_combined = df_combined.sort_values(by='abs_pct', ascending=False)
+
+            # Limit to 40
+            if len(df_combined) > 40:
+                df_combined = df_combined.head(40)
+
+            # Select Columns: Code, Name, Price, Pct, Signal, Net_1H, Net_Day
+            out_cols = ['code', 'name', 'price', 'pct', 'event_label', 'net_1h', 'net_day']
+            # Handle missing cols
+            for c in out_cols:
+                if c not in df_combined.columns:
+                    df_combined[c] = None
+
+            csv_data = df_combined[out_cols].copy()
+            csv_data.columns = ['Code', 'Name', 'Price', 'Pct', 'Signal', 'Net_1H', 'Net_Day']
+            return csv_data.to_csv(index=False)
+    except: pass
+
+    return "No Data"
+
+def call_ai_commander(snapshot_text):
+    if not snapshot_text or snapshot_text == "No Data":
+        return
+
+    # Get API Key
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+    except:
+        api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        error_msg = "❌ OpenAI API Key Not Found"
+        try:
+             if "ai_log" not in st.session_state: st.session_state.ai_log = []
+             st.session_state.ai_log.insert(0, {"time": datetime.now().strftime('%H:%M:%S'), "content": error_msg})
+        except: pass
+        return
+
+    try:
+        client = openai.OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": AI_COMMANDER_PROMPT},
+                {"role": "user", "content": snapshot_text}
+            ]
+        )
+        content = response.choices[0].message.content
+
+        # Save Log (Try best effort for session state)
+        try:
+            if "ai_log" not in st.session_state: st.session_state.ai_log = []
+            st.session_state.ai_log.insert(0, {"time": datetime.now().strftime('%H:%M:%S'), "content": content})
+        except: pass
+
+        # Send Telegram
+        if TG_BOT_TOKEN and TG_CHAT_ID:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                    data={"chat_id": TG_CHAT_ID, "text": f"🤖 **AI 指揮官**\n\n{content}", "parse_mode": "Markdown"},
+                    timeout=5
+                )
+            except: pass
+
+    except Exception as e:
+        err_msg = f"AI Error: {str(e)}"
+        try:
+             if "ai_log" not in st.session_state: st.session_state.ai_log = []
+             st.session_state.ai_log.insert(0, {"time": datetime.now().strftime('%H:%M:%S'), "content": err_msg})
+        except: pass
+
 # ==========================================
 # 5. Notification
 # ==========================================
@@ -341,6 +472,7 @@ class SniperEngine:
         self.market_stats = {"TSE": 0, "OTC": 0, "Time": 0}
 
         self.last_reset = datetime.now().date()
+        self.last_ai_trigger_time = None
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
 
     def update_targets(self):
@@ -519,6 +651,14 @@ class SniperEngine:
             if MarketSession.is_market_open(now) or current_tse == 0:
                 self._update_market_thermometer()
 
+            # [AI Scheduler]
+            ai_schedule = ['09:06', '09:30', '10:00', '10:25', '10:50', '11:15', '11:40', '12:05', '12:30', '13:00', '13:25']
+            now_hm = now.strftime('%H:%M')
+            if now_hm in ai_schedule and self.last_ai_trigger_time != now_hm:
+                self.last_ai_trigger_time = now_hm
+                snapshot = get_market_snapshot()
+                threading.Thread(target=call_ai_commander, args=(snapshot,)).start()
+
             targets = db.get_all_codes()
             self.inventory_codes = db.get_inventory_codes()
             pinned_codes = db.get_pinned_codes()
@@ -588,6 +728,31 @@ with st.sidebar:
     elif est_otc <= 600 and est_otc > 0: st.caption("🧊 內資縮手")
     elif est_otc == 0: st.caption("⏳ 數據讀取中...")
     else: st.caption("☁️ 正常輪動")
+
+    st.markdown("---")
+
+    # --- AI Commander Log ---
+    with st.expander("🤖 AI 指揮官日誌", expanded=True):
+        if "ai_log" not in st.session_state:
+            st.session_state.ai_log = []
+
+        if st.button("⚡ 強制呼叫指揮官"):
+            snapshot = get_market_snapshot()
+            threading.Thread(target=call_ai_commander, args=(snapshot,)).start()
+            st.toast("指揮官連線中...")
+
+        if st.session_state.ai_log:
+            latest = st.session_state.ai_log[0]
+            st.markdown(f"**⏰ {latest['time']}**")
+            st.info(latest['content'])
+
+            with st.expander("📜 歷史戰報"):
+                for log in st.session_state.ai_log[1:]:
+                    st.text(f"[{log['time']}]")
+                    st.markdown(log['content'])
+                    st.divider()
+        else:
+            st.caption("尚無戰報")
 
     st.markdown("---")
 
