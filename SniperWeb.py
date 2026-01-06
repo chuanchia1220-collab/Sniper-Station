@@ -71,7 +71,7 @@ AI_COMMANDER_PROMPT = """
 ### 三、 回答格式要求
 1.  **語氣**：果斷、精簡條列式。
 2.  **盤中輸出範例**：
-    > **⏰ 09:30 戰情快報**
+    > **⏰ {現在時間} 戰情快報**
     > **📦 庫存**：
     > * 2330 台積電：🔥 攻擊中，續抱，停利設 1080。
     > **🎯 獵殺機會**：
@@ -358,12 +358,15 @@ def call_ai_commander(snapshot_text):
         return
 
     try:
+        current_time_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%H:%M')
+        user_content = f"現在時間：{current_time_str}\n\n數據快照：\n{snapshot_text}"
+
         client = openai.OpenAI(api_key=api_key)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": AI_COMMANDER_PROMPT},
-                {"role": "user", "content": snapshot_text}
+                {"role": "user", "content": user_content}
             ]
         )
         content = response.choices[0].message.content
