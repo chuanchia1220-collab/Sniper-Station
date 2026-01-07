@@ -8,6 +8,7 @@ import time, os, twstock, json, threading, sqlite3, concurrent.futures, requests
 from itertools import cycle
 import warnings
 import openai
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 # [LOG FIX] Silence non-critical warnings
 warnings.filterwarnings("ignore")
@@ -660,7 +661,9 @@ class SniperEngine:
             if now_hm in ai_schedule and self.last_ai_trigger_time != now_hm:
                 self.last_ai_trigger_time = now_hm
                 snapshot = get_market_snapshot()
-                threading.Thread(target=call_ai_commander, args=(snapshot,)).start()
+                t = threading.Thread(target=call_ai_commander, args=(snapshot,))
+                add_script_run_ctx(t)
+                t.start()
 
             targets = db.get_all_codes()
             self.inventory_codes = db.get_inventory_codes()
@@ -741,7 +744,9 @@ with st.sidebar:
 
         if st.button("⚡ 強制呼叫指揮官"):
             snapshot = get_market_snapshot()
-            threading.Thread(target=call_ai_commander, args=(snapshot,)).start()
+            t = threading.Thread(target=call_ai_commander, args=(snapshot,))
+            add_script_run_ctx(t)
+            t.start()
             st.toast("指揮官連線中...")
 
         if st.session_state.ai_log:
