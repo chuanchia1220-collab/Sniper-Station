@@ -8,6 +8,7 @@ import time, os, twstock, json, threading, sqlite3, concurrent.futures, requests
 from itertools import cycle
 import warnings
 import logging
+import numpy as np
 
 # [LOG FIX] Silence yfinance and other non-critical warnings
 warnings.filterwarnings("ignore")
@@ -17,7 +18,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.6 Elite", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v6.7 Elite", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -29,7 +30,7 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v66.db"
+DB_PATH = "sniper_v67.db"
 
 # [01/29 Elite List] 70-400元 精選清單
 DEFAULT_WATCHLIST = "3006 3037 1513 3189 1795 3491 8046 6274 2383 6213"
@@ -87,7 +88,15 @@ class Database:
         c.execute('''CREATE TABLE IF NOT EXISTS inventory (code TEXT PRIMARY KEY, cost REAL, qty REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS pinned (code TEXT PRIMARY KEY)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, vol_5ma REAL, vol_yest REAL, price_5ma REAL)''')
+        # [修改] static_info 新增 win_rate 和 avg_ret
+        c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, vol_5ma REAL, vol_yest REAL, price_5ma REAL, win_rate REAL DEFAULT 0, avg_ret REAL DEFAULT 0)''')
+        
+        # [遷移] 如果舊表沒有新欄位，嘗試新增
+        try:
+            c.execute("ALTER TABLE static_info ADD COLUMN win_rate REAL DEFAULT 0")
+            c.execute("ALTER TABLE static_info ADD COLUMN avg_ret REAL DEFAULT 0")
+        except: pass
+        
         conn.commit(); conn.close()
 
     def _writer_loop(self):
@@ -113,7 +122,8 @@ class Database:
         self.write_queue.put(('executemany', sql, data_list))
 
     def upsert_static(self, data_list):
-        sql = 'INSERT OR REPLACE INTO static_info (code, vol_5ma, vol_yest, price_5ma) VALUES (?, ?, ?, ?)'
+        # [修改] 寫入 6 個欄位
+        sql = 'INSERT OR REPLACE INTO static_info (code, vol_5ma, vol_yest, price_5ma, win_rate, avg_ret) VALUES (?, ?, ?, ?, ?, ?)'
         self.write_queue.put(('executemany', sql, data_list))
 
     def update_pinned(self, code, is_pinned):
@@ -136,7 +146,8 @@ class Database:
 
     def get_watchlist_view(self):
         conn = self._get_conn()
-        query = '''SELECT w.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.ratio_yest, r.signal as event_label, r.net_10m, r.net_1h, r.net_day, r.situation, s.price_5ma, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM watchlist w LEFT JOIN realtime r ON w.code = r.code LEFT JOIN static_info s ON w.code = s.code LEFT JOIN pinned p ON w.code = p.code'''
+        # [修改] 讀取 win_rate 和 avg_ret
+        query = '''SELECT w.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.ratio_yest, r.signal as event_label, r.net_10m, r.net_1h, r.net_day, r.situation, s.price_5ma, s.win_rate, s.avg_ret, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM watchlist w LEFT JOIN realtime r ON w.code = r.code LEFT JOIN static_info s ON w.code = s.code LEFT JOIN pinned p ON w.code = p.code'''
         df = pd.read_sql(query, conn)
         conn.close(); return df
 
@@ -173,19 +184,94 @@ db = Database(DB_PATH)
 # 4. Utilities
 # ==========================================
 def fetch_static_stats(client, code):
+    """
+    抓取靜態數據 (5MA, 昨日量) + 執行簡易回測 (勝率, 平均報酬)
+    回測策略: 站上均價0.5%進場, 停利2%, 停損均價下1.5%
+    """
     try:
         suffix = ".TW"
         if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
-        hist = yf.Ticker(f"{code}{suffix}").history(period="10d", auto_adjust=True)
-        if not hist.empty and len(hist) >= 5:
-            vol_yest = int(hist['Volume'].iloc[-2]) // 1000
-            last_5_days = hist.iloc[-6:-1]
-            if last_5_days.empty: last_5_days = hist.tail(5)
+        
+        # 1. 抓取 5MA 所需資料 (近10日)
+        hist_10d = yf.Ticker(f"{code}{suffix}").history(period="10d", auto_adjust=True)
+        vol_5ma, vol_yest, price_5ma = 0, 0, 0
+        if not hist_10d.empty and len(hist_10d) >= 5:
+            vol_yest = int(hist_10d['Volume'].iloc[-2]) // 1000
+            last_5_days = hist_10d.iloc[-6:-1]
+            if last_5_days.empty: last_5_days = hist_10d.tail(5)
             vol_5ma = int(last_5_days['Volume'].mean()) // 1000
             price_5ma = float(last_5_days['Close'].mean())
-            return vol_5ma, vol_yest, price_5ma
-    except: pass
-    return 0, 0, 0
+
+        # 2. 執行回測 (近60日, 5分K)
+        win_rate, avg_ret = _run_quick_backtest(f"{code}{suffix}")
+
+        return vol_5ma, vol_yest, price_5ma, win_rate, avg_ret
+    except: 
+        return 0, 0, 0, 0, 0
+
+def _run_quick_backtest(target_code):
+    """背景執行 60天 5K 回測"""
+    try:
+        df = yf.download(target_code, period="60d", interval="5m", progress=False, auto_adjust=True)
+        if df.empty: return 0, 0
+        
+        # 壓平 MultiIndex
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        df.index = pd.to_datetime(df.index)
+        df['Date'] = df.index.date
+        df['TP_Vol'] = df['Close'] * df['Volume']
+        df['Cum_Vol'] = df.groupby('Date')['Volume'].cumsum()
+        df['Cum_Val'] = df.groupby('Date')['TP_Vol'].cumsum()
+        df['VWAP'] = df['Cum_Val'] / df['Cum_Vol']
+        df = df.dropna()
+
+        results = []
+        unique_dates = sorted(list(set(df.index.date)))
+        wins = 0
+        losses = 0
+        
+        ENTRY = 1.005
+        TP = 1.02
+        SL = 0.985
+
+        for trade_date in unique_dates:
+            mask = df['Date'] == trade_date
+            day_data = df.loc[mask]
+            if day_data.empty: continue
+
+            in_pos = False
+            entry_p = 0
+            entry_v = 0
+            
+            for ts, row in day_data.iterrows():
+                p = float(row['Close'])
+                v = float(row['VWAP'])
+                t = ts.time()
+                
+                if not in_pos:
+                    if t.hour==9 and t.minute<5: continue
+                    if t.hour>=13: continue
+                    if p > v * ENTRY:
+                        in_pos = True; entry_p = p; entry_v = v
+                elif in_pos:
+                    if p >= entry_p * TP:
+                        results.append((p-entry_p)/entry_p); wins+=1; in_pos=False; break
+                    elif p <= entry_v * SL:
+                        results.append((p-entry_p)/entry_p); losses+=1; in_pos=False; break
+                    elif t.hour==13 and t.minute>=25:
+                        res = (p-entry_p)/entry_p
+                        results.append(res)
+                        if res>0: wins+=1
+                        else: losses+=1
+                        in_pos=False; break
+                        
+        total = wins + losses
+        wr = (wins/total*100) if total > 0 else 0
+        av = np.mean(results)*100 if results else 0
+        return wr, av
+    except: return 0, 0
 
 def get_stock_name(symbol):
     try: return twstock.codes[symbol].name if symbol in twstock.codes else symbol
@@ -363,7 +449,8 @@ class SniperEngine:
                 'net_10m': 0, 'net_1h': 0, 'net_day': 0,
                 'situation': '市場指標',
                 'event_label': '大盤',
-                'is_pinned': 1
+                'is_pinned': 1,
+                'win_rate': 0, 'avg_ret': 0 # 大盤無回測
             }
             
             self.market_stats["Time"] = time.time()
@@ -409,6 +496,7 @@ class SniperEngine:
             total_val = q.get('total', {}).get('tradeValue', 0)
             vwap = (total_val / vol) if vol > 0 else price
 
+            # 大戶籌碼計算
             delta_net = 0
             if code in self.prev_data:
                 prev_v = self.prev_data[code]['vol']
@@ -486,7 +574,6 @@ class SniperEngine:
                 notification_manager.reset_daily_state()
                 self.last_reset = now.date()
 
-            # 更新大盤資訊
             self._update_market_thermometer()
 
             targets = db.get_all_codes()
@@ -520,9 +607,7 @@ engine = st.session_state.sniper_engine_core
 # 7. UI (Table Layout)
 # ==========================================
 with st.sidebar:
-    st.title("🛡️ 戰情室 v6.6 Elite")
-    # [移除] 大盤溫度計相關的 metric 程式碼
-    
+    st.title("🛡️ 戰情室 v6.7 Elite")
     st.caption(f"Update: {datetime.now().strftime('%H:%M:%S')}")
     st.markdown("---")
 
@@ -538,6 +623,8 @@ with st.sidebar:
 
         with st.expander("🔭 監控設定", expanded=True):
             raw_input = st.text_area("新選清單", DEFAULT_WATCHLIST, height=150)
+            
+            # [核心修改] 初始化按鈕邏輯升級：同步執行回測
             if st.button("1. 初始化並更新清單", type="primary"):
                 if not API_KEYS: st.error("缺 API Key")
                 else:
@@ -545,21 +632,27 @@ with st.sidebar:
                     time.sleep(0.5)
                     engine.update_targets()
                     targets = engine.targets
-                    status = st.status("正在抓取 5MA 與昨日量數據...", expanded=True)
+                    
+                    status = st.status("正在建立戰略數據 (含60天回測)...", expanded=True)
                     static_list = []
                     progress_bar = status.progress(0)
 
                     for i, code in enumerate(targets):
+                        status.write(f"正在分析 {code} 歷史戰報...")
                         current_key = API_KEYS[i % len(API_KEYS)]
                         client = RestClient(api_key=current_key)
-                        vol_5ma, vol_yest, price_5ma = fetch_static_stats(client, code)
-                        static_list.append((code, vol_5ma, vol_yest, price_5ma))
+                        
+                        # 同步抓取 5MA 與 回測數據
+                        vol_5ma, vol_yest, price_5ma, wr, ar = fetch_static_stats(client, code)
+                        
+                        # 儲存回測結果
+                        static_list.append((code, vol_5ma, vol_yest, price_5ma, wr, ar))
                         progress_bar.progress((i + 1) / len(targets))
                         time.sleep(0.1)
 
                     db.upsert_static(static_list)
                     engine.update_targets()
-                    status.update(label="初始化完成！", state="complete")
+                    status.update(label="戰略數據建立完成！", state="complete")
                     st.rerun()
 
             col_a, col_b = st.columns(2)
@@ -589,7 +682,6 @@ except ImportError:
 
 @fragment(run_every=1.5)
 def render_live_dashboard():
-    # --- Part 1: Inventory (Table) ---
     with st.expander("📦 庫存戰況 (Inventory)", expanded=False):
         df_inv = db.get_inventory_view()
         if not df_inv.empty:
@@ -601,7 +693,6 @@ def render_live_dashboard():
 
     df_watch = db.get_watchlist_view()
     
-    # [核心修改] 強制插入加權指數作為第一列
     if engine.twii_data:
         twii_row = pd.DataFrame([engine.twii_data])
         if not df_watch.empty:
@@ -617,7 +708,7 @@ def render_live_dashboard():
         return
 
     # Data Sanitization
-    numeric_cols = ['price', 'pct', 'vwap', 'ratio', 'ratio_yest', 'net_10m', 'net_1h', 'net_day', 'price_5ma']
+    numeric_cols = ['price', 'pct', 'vwap', 'ratio', 'ratio_yest', 'net_10m', 'net_1h', 'net_day', 'price_5ma', 'win_rate', 'avg_ret']
     for col in numeric_cols:
         if col in df_watch.columns:
             df_watch[col] = pd.to_numeric(df_watch[col], errors='coerce').fillna(0.0)
@@ -625,7 +716,6 @@ def render_live_dashboard():
     if use_filter:
         df_watch = df_watch[df_watch['price'] > 70]
 
-    # --- HTML Table Construction (High Density) ---
     table_start = """
 <style>
 table.sniper-table { width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; }
@@ -645,7 +735,6 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
 """
     html_rows = []
     for _, row in df_watch.iterrows():
-        # [防呆修正] 強制處理 None 為字串，避免 TypeError
         situation = str(row.get('situation') or '盤整')
         event_label = str(row.get('event_label') or '')
         
@@ -654,6 +743,17 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
         pin_icon = "📌" if is_pinned else ""
         
         is_twii = str(row['code']) == "0000"
+
+        # [核心修改] 高風險標籤邏輯
+        # 條件: 勝率 < 50% 或 平均報酬 < 0.2%
+        name_display = row["name"]
+        win_rate = row.get("win_rate", 0)
+        avg_ret = row.get("avg_ret", 0)
+        
+        if not is_twii and (win_rate < 50 or avg_ret < 0.2):
+            # 只有在非大盤且符合條件時才加上標籤
+            # 使用 span 縮小字體並標紅
+            name_display += " <span style='color:#ff4d4f; font-size:0.8em;'>(高風險)</span>"
 
         # 1. Price
         main_color = "#ff4d4f" if row['pct'] > 0 else "#2ecc71" if row['pct'] < 0 else "#999999"
@@ -674,26 +774,23 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
         # 4. Volume Dual Track
         thresholds = get_dynamic_thresholds(row['price'])
         tgt_ratio = thresholds['tgt_ratio']
-        
         r_yest = row.get('ratio_yest', 0)
         r_5ma = row['ratio']
-        
         is_vol_strong = r_5ma >= tgt_ratio
         vol_light = "🟢" if is_vol_strong else "🔴"
         c_5ma_r = "#ff4d4f" if is_vol_strong else "#999999"
-        
         ratio_html = f"{r_yest:.1f} / <span style='color:{c_5ma_r}; font-weight:bold'>{r_5ma:.1f} {vol_light}</span>"
 
-        # 5. Situation (Apply Clean String Logic)
+        # 5. Situation
         sit_color = "#ff4d4f" if "吸籌" in situation or "攻擊" in situation else "#2ecc71" if "倒貨" in situation else "#e67e22" if "吃盤" in situation else "#999999"
         clean_situation = situation.replace("🔥", "").replace("🛡️", "").replace("💀", "").replace("🎣", "").replace("⚖️", "")
         situation_html = f"<span style='color:{sit_color}; font-weight:bold'>{clean_situation}</span>"
         
-        # 6. Link
+        # 6. Link with Name Display
         if is_twii:
-             name_html = f'<span style="font-weight:bold;">{row["name"]}</span>'
+             name_html = f'<span style="font-weight:bold;">{name_display}</span>'
         else:
-             name_html = f'<a href="https://tw.stock.yahoo.com/quote/{row["code"]}.TW" target="_blank" style="text-decoration:none; color:#3498db; font-weight:bold;">{row["name"]}</a>'
+             name_html = f'<a href="https://tw.stock.yahoo.com/quote/{row["code"]}.TW" target="_blank" style="text-decoration:none; color:#3498db; font-weight:bold;">{name_display}</a>'
 
         # 7. Big Player
         if is_twii:
@@ -702,13 +799,10 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
             n10 = int(row['net_10m'])
             n1h = int(row['net_1h'])
             nd = int(row['net_day'])
-            
             bp_light = "🟢" if n1h > 0 else "🔴"
-            
             c10 = "#ff4d4f" if n10 > 0 else "#2ecc71" if n10 < 0 else "#999999"
             c1h = "#ff4d4f" if n1h > 0 else "#2ecc71" if n1h < 0 else "#999999"
             cd  = "#ff4d4f" if nd > 0 else "#2ecc71" if nd < 0 else "#999999"
-
             bp_html = f"<span style='color:{c10}'>{n10}</span> / <span style='color:{c1h}'>{n1h} {bp_light}</span> / <span style='color:{cd}'>{nd}</span>"
 
         html_rows.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{row["code"]}</td><td>{name_html}</td><td>{event_label}</td><td>{ma_html}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{situation_html}</td><td>{bp_html}</td></tr>')
