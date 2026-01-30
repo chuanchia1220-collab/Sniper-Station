@@ -9,6 +9,7 @@ from itertools import cycle
 import warnings
 import logging
 import numpy as np
+import math
 
 # [LOG FIX] Silence yfinance and other non-critical warnings
 warnings.filterwarnings("ignore")
@@ -18,7 +19,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.7 Elite", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v6.10 Elite", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -30,7 +31,7 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v67.db"
+DB_PATH = "sniper_v610.db"
 
 # [01/29 Elite List] 70-400元 精選清單
 DEFAULT_WATCHLIST = "3006 3037 1513 3189 1795 3491 8046 6274 2383 6213"
@@ -52,9 +53,12 @@ class SniperEvent:
     pct: float
     vwap: float
     ratio: float
+    ratio_yest: float
     net_10m: int
     net_1h: int
     net_day: int
+    tp_price: float
+    sl_price: float
     timestamp: float = field(default_factory=time.time)
     data_status: str = "DATA_OK"
     is_test: bool = False
@@ -88,10 +92,8 @@ class Database:
         c.execute('''CREATE TABLE IF NOT EXISTS inventory (code TEXT PRIMARY KEY, cost REAL, qty REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS pinned (code TEXT PRIMARY KEY)''')
-        # [修改] static_info 新增 win_rate 和 avg_ret
         c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, vol_5ma REAL, vol_yest REAL, price_5ma REAL, win_rate REAL DEFAULT 0, avg_ret REAL DEFAULT 0)''')
         
-        # [遷移] 如果舊表沒有新欄位，嘗試新增
         try:
             c.execute("ALTER TABLE static_info ADD COLUMN win_rate REAL DEFAULT 0")
             c.execute("ALTER TABLE static_info ADD COLUMN avg_ret REAL DEFAULT 0")
@@ -122,7 +124,6 @@ class Database:
         self.write_queue.put(('executemany', sql, data_list))
 
     def upsert_static(self, data_list):
-        # [修改] 寫入 6 個欄位
         sql = 'INSERT OR REPLACE INTO static_info (code, vol_5ma, vol_yest, price_5ma, win_rate, avg_ret) VALUES (?, ?, ?, ?, ?, ?)'
         self.write_queue.put(('executemany', sql, data_list))
 
@@ -146,7 +147,6 @@ class Database:
 
     def get_watchlist_view(self):
         conn = self._get_conn()
-        # [修改] 讀取 win_rate 和 avg_ret
         query = '''SELECT w.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.ratio_yest, r.signal as event_label, r.net_10m, r.net_1h, r.net_day, r.situation, s.price_5ma, s.win_rate, s.avg_ret, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM watchlist w LEFT JOIN realtime r ON w.code = r.code LEFT JOIN static_info s ON w.code = s.code LEFT JOIN pinned p ON w.code = p.code'''
         df = pd.read_sql(query, conn)
         conn.close(); return df
@@ -183,16 +183,26 @@ db = Database(DB_PATH)
 # ==========================================
 # 4. Utilities
 # ==========================================
+
+# [核心新增] 自動校正股價檔位函式
+def adjust_to_tick(price):
+    """將價格校正為符合台股檔位的合法數值 (採無條件捨去 floor)"""
+    if price < 10: tick = 0.01
+    elif price < 50: tick = 0.05
+    elif price < 100: tick = 0.1
+    elif price < 500: tick = 0.5
+    elif price < 1000: tick = 1.0
+    else: tick = 5.0
+    
+    # 邏輯: 先除以 tick，無條件捨去取整，再乘回 tick
+    # 範例: 188.7 / 0.5 = 377.4 -> 377 -> 377 * 0.5 = 188.5
+    return math.floor(price / tick) * tick
+
 def fetch_static_stats(client, code):
-    """
-    抓取靜態數據 (5MA, 昨日量) + 執行簡易回測 (勝率, 平均報酬)
-    回測策略: 站上均價0.5%進場, 停利2%, 停損均價下1.5%
-    """
     try:
         suffix = ".TW"
         if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
         
-        # 1. 抓取 5MA 所需資料 (近10日)
         hist_10d = yf.Ticker(f"{code}{suffix}").history(period="10d", auto_adjust=True)
         vol_5ma, vol_yest, price_5ma = 0, 0, 0
         if not hist_10d.empty and len(hist_10d) >= 5:
@@ -202,7 +212,6 @@ def fetch_static_stats(client, code):
             vol_5ma = int(last_5_days['Volume'].mean()) // 1000
             price_5ma = float(last_5_days['Close'].mean())
 
-        # 2. 執行回測 (近60日, 5分K)
         win_rate, avg_ret = _run_quick_backtest(f"{code}{suffix}")
 
         return vol_5ma, vol_yest, price_5ma, win_rate, avg_ret
@@ -210,12 +219,10 @@ def fetch_static_stats(client, code):
         return 0, 0, 0, 0, 0
 
 def _run_quick_backtest(target_code):
-    """背景執行 60天 5K 回測"""
     try:
         df = yf.download(target_code, period="60d", interval="5m", progress=False, auto_adjust=True)
         if df.empty: return 0, 0
         
-        # 壓平 MultiIndex
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
             
@@ -300,8 +307,13 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdo
     if pct >= 9.5: return "👑漲停"
     if now_time.time() < dt_time(9, 5): return "⏳暖機"
 
+    if ratio >= thresholds['tgt_ratio']:
+        if is_bullish and net_1h > 0:
+            if not has_attacked: return "🔥攻擊"
+        elif net_1h < 0:
+            return "💀出貨"
+        
     if not is_bullish:
-        if ratio >= thresholds['tgt_ratio'] and net_1h < 0: return "💀出貨"
         return "📉線下"
 
     bias = ((price - vwap) / vwap) * 100 if vwap > 0 else 0
@@ -309,10 +321,6 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdo
 
     if dt_time(13, 0) <= now_time.time() <= dt_time(13, 25):
         if (3.0 <= pct <= 9.0) and (net_1h > 0) and (net_day / (vol_lots+1) >= 0.05): return "🔥尾盤"
-
-    if ratio >= thresholds['tgt_ratio']:
-        if is_bullish and net_1h > 0:
-            if not has_attacked: return "🔥攻擊"
         
     if pct > 2.0 and net_1h < 0: return "❌誘多"
     if pct >= thresholds['tgt_pct']: return "⚠️價強"
@@ -378,9 +386,13 @@ class NotificationManager:
         if not TG_BOT_TOKEN or not TG_CHAT_ID: return
         emoji = self.EMOJI_MAP.get(event.event_label, "📌")
         up_dn = "UP" if event.pct >= 0 else "DN"
+        
         msg = (f"<b>{emoji} {event.event_label}｜{event.code} {event.name}</b>\n"
                f"現價：{event.price:.2f} ({event.pct:.2f}% {up_dn})　均價：{event.vwap:.2f}\n"
-               f"大戶10M：{event.net_10m}　大戶1H：{event.net_1h}")
+               f"<b>🎯 止盈：{event.tp_price:.1f} (2%)｜🛡️ 止損：{event.sl_price:.1f} (均-1.5%)</b>\n"
+               f"📊 量比：{event.ratio_yest:.1f} / <b>{event.ratio:.1f}</b>\n"
+               f"💰 大戶：{event.net_10m} / <b>{event.net_1h}</b> / {event.net_day}")
+               
         buttons = [[{"text": "📈 Yahoo", "url": f"https://tw.stock.yahoo.com/quote/{event.code}.TW"}]]
         try: requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage", data={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML", "reply_markup": json.dumps({"inline_keyboard": buttons})}, timeout=5)
         except: pass
@@ -450,7 +462,7 @@ class SniperEngine:
                 'situation': '市場指標',
                 'event_label': '大盤',
                 'is_pinned': 1,
-                'win_rate': 0, 'avg_ret': 0 # 大盤無回測
+                'win_rate': 0, 'avg_ret': 0 
             }
             
             self.market_stats["Time"] = time.time()
@@ -496,7 +508,6 @@ class SniperEngine:
             total_val = q.get('total', {}).get('tradeValue', 0)
             vwap = (total_val / vol) if vol > 0 else price
 
-            # 大戶籌碼計算
             delta_net = 0
             if code in self.prev_data:
                 prev_v = self.prev_data[code]['vol']
@@ -522,7 +533,9 @@ class SniperEngine:
             net_10m = sum(x[1] for x in self.vol_queues[code] if x[0] > now_ts - 600)
             net_day = self.daily_net.get(code, 0)
 
-            is_bullish = price >= vwap
+            is_bullish = price >= (vwap * 1.005)
+            is_breakdown = price < (vwap * 0.99)
+            
             situation = "⚖️觀望"
             if net_1h > 0:
                 if is_bullish: situation = "🔥主動吸籌"
@@ -532,12 +545,15 @@ class SniperEngine:
                 else: situation = "🎣拉高出貨"
 
             thresholds = get_dynamic_thresholds(price)
-            is_breakdown = price < (vwap * 0.99)
             
             raw_state = check_signal(pct, is_bullish, net_day, net_1h, ratio_5ma, thresholds, is_breakdown, price, vwap, code in self.active_flags, now_time, vol_lots)
 
             event_label = None
             scope = "inventory" if code in self.inventory_codes else "watchlist"
+            
+            # [核心應用] 自動校正檔位
+            tp_calc = adjust_to_tick(price * 1.02)
+            sl_calc = adjust_to_tick(vwap * 0.985)
 
             if "攻擊" in raw_state and code not in self.active_flags: event_label = "🔥攻擊"
             elif "漲停" in raw_state and scope == "inventory": event_label = "👑漲停"
@@ -553,8 +569,9 @@ class SniperEngine:
                 ev = SniperEvent(
                     code=code, name=get_stock_name(code), scope=scope,
                     event_kind="STRATEGY", event_label=event_label,
-                    price=price, pct=pct, vwap=vwap, ratio=ratio_5ma,
-                    net_10m=net_10m, net_1h=net_1h, net_day=net_day
+                    price=price, pct=pct, vwap=vwap, ratio=ratio_5ma, ratio_yest=ratio_yest,
+                    net_10m=net_10m, net_1h=net_1h, net_day=net_day,
+                    tp_price=tp_calc, sl_price=sl_calc
                 )
                 self._dispatch_event(ev)
 
@@ -607,7 +624,7 @@ engine = st.session_state.sniper_engine_core
 # 7. UI (Table Layout)
 # ==========================================
 with st.sidebar:
-    st.title("🛡️ 戰情室 v6.7 Elite")
+    st.title("🛡️ 戰情室 v6.10 Elite")
     st.caption(f"Update: {datetime.now().strftime('%H:%M:%S')}")
     st.markdown("---")
 
@@ -624,7 +641,6 @@ with st.sidebar:
         with st.expander("🔭 監控設定", expanded=True):
             raw_input = st.text_area("新選清單", DEFAULT_WATCHLIST, height=150)
             
-            # [核心修改] 初始化按鈕邏輯升級：同步執行回測
             if st.button("1. 初始化並更新清單", type="primary"):
                 if not API_KEYS: st.error("缺 API Key")
                 else:
@@ -641,11 +657,7 @@ with st.sidebar:
                         status.write(f"正在分析 {code} 歷史戰報...")
                         current_key = API_KEYS[i % len(API_KEYS)]
                         client = RestClient(api_key=current_key)
-                        
-                        # 同步抓取 5MA 與 回測數據
                         vol_5ma, vol_yest, price_5ma, wr, ar = fetch_static_stats(client, code)
-                        
-                        # 儲存回測結果
                         static_list.append((code, vol_5ma, vol_yest, price_5ma, wr, ar))
                         progress_bar.progress((i + 1) / len(targets))
                         time.sleep(0.1)
@@ -707,7 +719,6 @@ def render_live_dashboard():
         st.info("尚未加入監控標的")
         return
 
-    # Data Sanitization
     numeric_cols = ['price', 'pct', 'vwap', 'ratio', 'ratio_yest', 'net_10m', 'net_1h', 'net_day', 'price_5ma', 'win_rate', 'avg_ret']
     for col in numeric_cols:
         if col in df_watch.columns:
@@ -728,7 +739,7 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
 <thead>
 <tr>
 <th>📌</th><th>代碼</th><th>名稱 (Link)</th><th>訊號</th><th>5MA</th><th>現價</th><th>漲跌%</th>
-<th>均價 (燈)</th><th>量比 (昨/5日)</th><th>局勢</th><th>大戶 (10m/1H/日)</th>
+<th>均價 (燈/TP/SL)</th><th>量比 (昨/5日)</th><th>局勢</th><th>大戶 (10m/1H/日)</th>
 </tr>
 </thead>
 <tbody>
@@ -744,15 +755,11 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
         
         is_twii = str(row['code']) == "0000"
 
-        # [核心修改] 高風險標籤邏輯
-        # 條件: 勝率 < 50% 或 平均報酬 < 0.2%
+        # 高風險標籤
         name_display = row["name"]
         win_rate = row.get("win_rate", 0)
-        avg_ret = row.get("avg_ret", 0)
         
-        if not is_twii and (win_rate < 50 or avg_ret < 0.2):
-            # 只有在非大盤且符合條件時才加上標籤
-            # 使用 span 縮小字體並標紅
+        if not is_twii and win_rate < 50:
             name_display += " <span style='color:#ff4d4f; font-size:0.8em;'>(高風險)</span>"
 
         # 1. Price
@@ -760,11 +767,18 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
         price_html = f"<span style='color:{main_color}; font-weight:bold'>{row['price']:.2f}</span>"
         pct_html = f"<span style='color:{main_color}'>{row['pct']:.2f}%</span>"
 
-        # 2. VWAP Light
-        is_bullish = row['price'] >= row['vwap']
+        # 2. VWAP Light (Logic: Price > VWAP * 1.005)
+        is_bullish = row['price'] >= (row['vwap'] * 1.005)
         vwap_color = "#ff4d4f" if is_bullish else "#2ecc71"
         vwap_light = "🟢" if is_bullish else "🔴"
+        
         vwap_html = f"<span style='color:{vwap_color}'>{row['vwap']:.2f} {vwap_light}</span>"
+        
+        # [核心應用] 顯示校正後的 TP/SL
+        if is_bullish and not is_twii:
+            tp_price = adjust_to_tick(row['price'] * 1.02)
+            sl_price = adjust_to_tick(row['vwap'] * 0.985)
+            vwap_html += f"<br><span style='font-size:0.85em; color:#888'>(TP:{tp_price:.1f} / SL:{sl_price:.1f})</span>"
 
         # 3. 5MA
         p_5ma = row.get('price_5ma', 0)
@@ -786,7 +800,7 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
         clean_situation = situation.replace("🔥", "").replace("🛡️", "").replace("💀", "").replace("🎣", "").replace("⚖️", "")
         situation_html = f"<span style='color:{sit_color}; font-weight:bold'>{clean_situation}</span>"
         
-        # 6. Link with Name Display
+        # 6. Link
         if is_twii:
              name_html = f'<span style="font-weight:bold;">{name_display}</span>'
         else:
