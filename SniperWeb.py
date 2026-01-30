@@ -17,7 +17,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.5 Elite", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v6.6 Elite", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -29,7 +29,7 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v65.db"
+DB_PATH = "sniper_v66.db"
 
 # [01/29 Elite List] 70-400元 精選清單
 DEFAULT_WATCHLIST = "3006 3037 1513 3189 1795 3491 8046 6274 2383 6213"
@@ -318,7 +318,7 @@ class SniperEngine:
         self.active_flags = {}
         self.daily_risk_flags = {}
         self.market_stats = {"Time": 0}
-        self.twii_data = None # 新增：存放加權指數資料
+        self.twii_data = None 
         self.last_reset = datetime.now().date()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
 
@@ -338,38 +338,32 @@ class SniperEngine:
     def stop(self): self.running = False
 
     def _update_market_thermometer(self):
-        # 15秒更新一次大盤資訊
         if time.time() - self.market_stats.get("Time", 0) < 15: return
         try:
-            # 抓取加權指數資訊
             tse = yf.Ticker("^TWII")
-            # 使用 fast_info 抓最新價格
             fi = tse.fast_info
             price = fi.last_price
             prev = fi.previous_close
             pct = ((price - prev) / prev) * 100 if prev else 0
             
-            # 抓 5MA
             hist = tse.history(period="10d", auto_adjust=True)
             if not hist.empty:
-                # 取最近 5 天 (不含今天) 的均價
                 price_5ma = hist['Close'].iloc[-6:-1].mean() if len(hist) >= 6 else hist['Close'].mean()
             else:
                 price_5ma = price
 
-            # 存入 twii_data 供前端渲染
             self.twii_data = {
-                'code': '0000', # 虛擬代碼
+                'code': '0000', 
                 'name': '加權指數',
                 'price': price,
                 'pct': pct,
-                'vwap': price, # 指數沒有 VWAP，暫用現價代替
+                'vwap': price, 
                 'price_5ma': price_5ma,
                 'ratio': 1.0, 'ratio_yest': 1.0,
                 'net_10m': 0, 'net_1h': 0, 'net_day': 0,
                 'situation': '市場指標',
                 'event_label': '大盤',
-                'is_pinned': 1 # 強制置頂
+                'is_pinned': 1
             }
             
             self.market_stats["Time"] = time.time()
@@ -393,7 +387,6 @@ class SniperEngine:
             price = q.get('lastPrice', 0)
             if not price: return None
 
-            # 買賣壓計算已移除，只保留資料獲取
             order_book = q.get('order', {})
             best_asks = order_book.get('bestAsks', []) or []
             best_bids = order_book.get('bestBids', []) or []
@@ -416,7 +409,6 @@ class SniperEngine:
             total_val = q.get('total', {}).get('tradeValue', 0)
             vwap = (total_val / vol) if vol > 0 else price
 
-            # 大戶籌碼計算
             delta_net = 0
             if code in self.prev_data:
                 prev_v = self.prev_data[code]['vol']
@@ -528,8 +520,8 @@ engine = st.session_state.sniper_engine_core
 # 7. UI (Table Layout)
 # ==========================================
 with st.sidebar:
-    st.title("🛡️ 戰情室 v6.5 Elite")
-    # [移除] 大盤溫度計 UI
+    st.title("🛡️ 戰情室 v6.6 Elite")
+    # [移除] 大盤溫度計相關的 metric 程式碼
     
     st.caption(f"Update: {datetime.now().strftime('%H:%M:%S')}")
     st.markdown("---")
@@ -611,14 +603,11 @@ def render_live_dashboard():
     
     # [核心修改] 強制插入加權指數作為第一列
     if engine.twii_data:
-        # 將 dict 轉為 DataFrame row
         twii_row = pd.DataFrame([engine.twii_data])
-        # 確保與 df_watch 欄位一致，缺少的補上
         if not df_watch.empty:
             for col in df_watch.columns:
                 if col not in twii_row.columns:
-                    twii_row[col] = 0 # 補 0 或空值
-            # 串接
+                    twii_row[col] = 0
             df_watch = pd.concat([twii_row, df_watch], ignore_index=True)
         else:
             df_watch = twii_row
@@ -656,11 +645,14 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
 """
     html_rows = []
     for _, row in df_watch.iterrows():
+        # [防呆修正] 強制處理 None 為字串，避免 TypeError
+        situation = str(row.get('situation') or '盤整')
+        event_label = str(row.get('event_label') or '')
+        
         is_pinned = row.get('is_pinned', 0)
         row_class = "pinned-row" if is_pinned else ""
         pin_icon = "📌" if is_pinned else ""
         
-        # 針對大盤做特殊顯示 (代碼 0000)
         is_twii = str(row['code']) == "0000"
 
         # 1. Price
@@ -679,24 +671,20 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
         c_5ma = "#ff4d4f" if row['price'] > p_5ma else "#2ecc71"
         ma_html = f"<span style='color:{c_5ma}'>{p_5ma:.2f}</span>"
 
-        # 4. Volume Dual Track (New: Traffic Light)
+        # 4. Volume Dual Track
         thresholds = get_dynamic_thresholds(row['price'])
         tgt_ratio = thresholds['tgt_ratio']
         
         r_yest = row.get('ratio_yest', 0)
         r_5ma = row['ratio']
         
-        # 🟢 如果量比 > 系統門檻, 顯示綠燈 (Go), 否則紅燈
         is_vol_strong = r_5ma >= tgt_ratio
         vol_light = "🟢" if is_vol_strong else "🔴"
-        
-        # 文字顏色跟隨燈號
         c_5ma_r = "#ff4d4f" if is_vol_strong else "#999999"
         
         ratio_html = f"{r_yest:.1f} / <span style='color:{c_5ma_r}; font-weight:bold'>{r_5ma:.1f} {vol_light}</span>"
 
-        # 5. Situation
-        situation = row.get('situation', '盤整')
+        # 5. Situation (Apply Clean String Logic)
         sit_color = "#ff4d4f" if "吸籌" in situation or "攻擊" in situation else "#2ecc71" if "倒貨" in situation else "#e67e22" if "吃盤" in situation else "#999999"
         clean_situation = situation.replace("🔥", "").replace("🛡️", "").replace("💀", "").replace("🎣", "").replace("⚖️", "")
         situation_html = f"<span style='color:{sit_color}; font-weight:bold'>{clean_situation}</span>"
@@ -707,8 +695,7 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
         else:
              name_html = f'<a href="https://tw.stock.yahoo.com/quote/{row["code"]}.TW" target="_blank" style="text-decoration:none; color:#3498db; font-weight:bold;">{row["name"]}</a>'
 
-        # 7. Big Player (Multi-Timeframe + Traffic Light on 1H)
-        # 大盤沒有大戶數據，顯示 "-"
+        # 7. Big Player
         if is_twii:
             bp_html = "<span style='color:#777'>- / - / -</span>"
         else:
@@ -724,7 +711,7 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
 
             bp_html = f"<span style='color:{c10}'>{n10}</span> / <span style='color:{c1h}'>{n1h} {bp_light}</span> / <span style='color:{cd}'>{nd}</span>"
 
-        html_rows.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{row["code"]}</td><td>{name_html}</td><td>{row["event_label"]}</td><td>{ma_html}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{situation_html}</td><td>{bp_html}</td></tr>')
+        html_rows.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{row["code"]}</td><td>{name_html}</td><td>{event_label}</td><td>{ma_html}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{situation_html}</td><td>{bp_html}</td></tr>')
 
     st.markdown(table_start + "".join(html_rows) + "</tbody></table>", unsafe_allow_html=True)
 
