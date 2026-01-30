@@ -19,7 +19,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.10 Elite", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v6.12 Elite", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -31,7 +31,7 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v610.db"
+DB_PATH = "sniper_v612.db"
 
 # [01/29 Elite List] 70-400元 精選清單
 DEFAULT_WATCHLIST = "3006 3037 1513 3189 1795 3491 8046 6274 2383 6213"
@@ -184,9 +184,7 @@ db = Database(DB_PATH)
 # 4. Utilities
 # ==========================================
 
-# [核心新增] 自動校正股價檔位函式
-def adjust_to_tick(price):
-    """將價格校正為符合台股檔位的合法數值 (採無條件捨去 floor)"""
+def adjust_to_tick(price, method='floor'):
     if price < 10: tick = 0.01
     elif price < 50: tick = 0.05
     elif price < 100: tick = 0.1
@@ -194,9 +192,10 @@ def adjust_to_tick(price):
     elif price < 1000: tick = 1.0
     else: tick = 5.0
     
-    # 邏輯: 先除以 tick，無條件捨去取整，再乘回 tick
-    # 範例: 188.7 / 0.5 = 377.4 -> 377 -> 377 * 0.5 = 188.5
-    return math.floor(price / tick) * tick
+    if method == 'round':
+        return round(price / tick) * tick
+    else:
+        return math.floor(price / tick) * tick
 
 def fetch_static_stats(client, code):
     try:
@@ -551,9 +550,12 @@ class SniperEngine:
             event_label = None
             scope = "inventory" if code in self.inventory_codes else "watchlist"
             
-            # [核心應用] 自動校正檔位
-            tp_calc = adjust_to_tick(price * 1.02)
-            sl_calc = adjust_to_tick(vwap * 0.985)
+            # [核心修正] TP 錨定在 (VWAP * 1.005) 觸發價上，SL 錨定在 VWAP 上
+            # 這樣不管現價怎麼飛，戰術目標都是固定的
+            trigger_price = vwap * 1.005
+            
+            tp_calc = adjust_to_tick(trigger_price * 1.02, method='round')
+            sl_calc = adjust_to_tick(vwap * 0.985, method='floor')
 
             if "攻擊" in raw_state and code not in self.active_flags: event_label = "🔥攻擊"
             elif "漲停" in raw_state and scope == "inventory": event_label = "👑漲停"
@@ -624,7 +626,7 @@ engine = st.session_state.sniper_engine_core
 # 7. UI (Table Layout)
 # ==========================================
 with st.sidebar:
-    st.title("🛡️ 戰情室 v6.10 Elite")
+    st.title("🛡️ 戰情室 v6.12 Elite")
     st.caption(f"Update: {datetime.now().strftime('%H:%M:%S')}")
     st.markdown("---")
 
@@ -755,8 +757,8 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
         
         is_twii = str(row['code']) == "0000"
 
-        # 高風險標籤
-        name_display = row["name"]
+        # [新增] 顯示勝率並保留高風險標籤
+        name_display = f"{row['name']} ({row.get('win_rate', 0):.0f}%)"
         win_rate = row.get("win_rate", 0)
         
         if not is_twii and win_rate < 50:
@@ -774,10 +776,11 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
         
         vwap_html = f"<span style='color:{vwap_color}'>{row['vwap']:.2f} {vwap_light}</span>"
         
-        # [核心應用] 顯示校正後的 TP/SL
+        # [修正] TP 錨定 Trigger Price
         if is_bullish and not is_twii:
-            tp_price = adjust_to_tick(row['price'] * 1.02)
-            sl_price = adjust_to_tick(row['vwap'] * 0.985)
+            trigger_price = row['vwap'] * 1.005
+            tp_price = adjust_to_tick(trigger_price * 1.02, method='round')
+            sl_price = adjust_to_tick(row['vwap'] * 0.985, method='floor')
             vwap_html += f"<br><span style='font-size:0.85em; color:#888'>(TP:{tp_price:.1f} / SL:{sl_price:.1f})</span>"
 
         # 3. 5MA
