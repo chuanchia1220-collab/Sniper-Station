@@ -19,7 +19,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.12 Elite", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v6.13 Elite", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -31,7 +31,7 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v612.db"
+DB_PATH = "sniper_v613.db"
 
 # [01/29 Elite List] 70-400元 精選清單
 DEFAULT_WATCHLIST = "3006 3037 1513 3189 1795 3491 8046 6274 2383 6213"
@@ -218,6 +218,9 @@ def fetch_static_stats(client, code):
         return 0, 0, 0, 0, 0
 
 def _run_quick_backtest(target_code):
+    """
+    [核心修正] V2.4.1 回測邏輯：避開前 10 分鐘
+    """
     try:
         df = yf.download(target_code, period="60d", interval="5m", progress=False, auto_adjust=True)
         if df.empty: return 0, 0
@@ -257,7 +260,8 @@ def _run_quick_backtest(target_code):
                 t = ts.time()
                 
                 if not in_pos:
-                    if t.hour==9 and t.minute<5: continue
+                    # [修改] 9:10 以前不動作
+                    if t.hour==9 and t.minute<10: continue
                     if t.hour>=13: continue
                     if p > v * ENTRY:
                         in_pos = True; entry_p = p; entry_v = v
@@ -304,7 +308,9 @@ def _calc_est_vol(current_vol):
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdown, price, vwap, has_attacked, now_time, vol_lots):
     if is_breakdown: return "🚨撤退"
     if pct >= 9.5: return "👑漲停"
-    if now_time.time() < dt_time(9, 5): return "⏳暖機"
+    
+    # [核心修正] 訊號引擎同步：09:10 前皆為暖機，不發攻擊訊號
+    if now_time.time() < dt_time(9, 10): return "⏳暖機"
 
     if ratio >= thresholds['tgt_ratio']:
         if is_bullish and net_1h > 0:
@@ -550,8 +556,6 @@ class SniperEngine:
             event_label = None
             scope = "inventory" if code in self.inventory_codes else "watchlist"
             
-            # [核心修正] TP 錨定在 (VWAP * 1.005) 觸發價上，SL 錨定在 VWAP 上
-            # 這樣不管現價怎麼飛，戰術目標都是固定的
             trigger_price = vwap * 1.005
             
             tp_calc = adjust_to_tick(trigger_price * 1.02, method='round')
@@ -626,7 +630,7 @@ engine = st.session_state.sniper_engine_core
 # 7. UI (Table Layout)
 # ==========================================
 with st.sidebar:
-    st.title("🛡️ 戰情室 v6.12 Elite")
+    st.title("🛡️ 戰情室 v6.13 Elite")
     st.caption(f"Update: {datetime.now().strftime('%H:%M:%S')}")
     st.markdown("---")
 
