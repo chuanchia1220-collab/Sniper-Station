@@ -19,7 +19,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.13 Elite", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v6.15 Elite", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -31,10 +31,10 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v613.db"
+DB_PATH = "sniper_v615.db"
 
-# [01/29 Elite List] 70-400元 精選清單
-DEFAULT_WATCHLIST = "3006 3037 1513 3189 1795 3491 8046 6274 2383 6213"
+# [01/29 Elite List] 預設清單
+DEFAULT_WATCHLIST = "3006 3037 1513 3189 1795 3491 8046 6274"
 
 # [User Inventory] 指揮官最新庫存狀態
 DEFAULT_INVENTORY = """2481,84.4,3
@@ -59,6 +59,7 @@ class SniperEvent:
     net_day: int
     tp_price: float
     sl_price: float
+    win_rate: float
     timestamp: float = field(default_factory=time.time)
     data_status: str = "DATA_OK"
     is_test: bool = False
@@ -174,9 +175,9 @@ class Database:
 
     def get_volume_map(self):
         conn = self._get_conn(); c = conn.cursor()
-        c.execute('SELECT code, vol_5ma, vol_yest, price_5ma FROM static_info')
+        c.execute('SELECT code, vol_5ma, vol_yest, price_5ma, win_rate FROM static_info')
         rows = c.fetchall(); conn.close()
-        return {r[0]: {'vol_5ma': r[1], 'vol_yest': r[2], 'price_5ma': r[3]} for r in rows}
+        return {r[0]: {'vol_5ma': r[1], 'vol_yest': r[2], 'price_5ma': r[3], 'win_rate': r[4]} for r in rows}
 
 db = Database(DB_PATH)
 
@@ -219,7 +220,9 @@ def fetch_static_stats(client, code):
 
 def _run_quick_backtest(target_code):
     """
-    [核心修正] V2.4.1 回測邏輯：避開前 10 分鐘
+    [核心修正] V2.4.2 回測邏輯：
+    1. 避開前 5 分鐘 (09:05 後開始)
+    2. 乖離率限制：進場時股價不得超過 VWAP * 1.015 (避免追高)
     """
     try:
         df = yf.download(target_code, period="60d", interval="5m", progress=False, auto_adjust=True)
@@ -241,7 +244,8 @@ def _run_quick_backtest(target_code):
         wins = 0
         losses = 0
         
-        ENTRY = 1.005
+        ENTRY_MIN = 1.005  # 地板: +0.5%
+        ENTRY_MAX = 1.015  # 天花板: +1.5% (超過不買)
         TP = 1.02
         SL = 0.985
 
@@ -260,11 +264,14 @@ def _run_quick_backtest(target_code):
                 t = ts.time()
                 
                 if not in_pos:
-                    # [修改] 9:10 以前不動作
-                    if t.hour==9 and t.minute<10: continue
+                    # [修改] 09:05 前不動作
+                    if t.hour==9 and t.minute<5: continue
                     if t.hour>=13: continue
-                    if p > v * ENTRY:
+                    
+                    # [核心] 精準區間：0.5% ~ 1.5% 之間才出手
+                    if (v * ENTRY_MIN) < p < (v * ENTRY_MAX):
                         in_pos = True; entry_p = p; entry_v = v
+                        
                 elif in_pos:
                     if p >= entry_p * TP:
                         results.append((p-entry_p)/entry_p); wins+=1; in_pos=False; break
@@ -304,22 +311,33 @@ def _calc_est_vol(current_vol):
     weight = 2.0 if elapsed_minutes < 15 else 1.0
     return int(current_vol * (270 / elapsed_minutes) / weight)
 
-# --- 訊號判斷邏輯 ---
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdown, price, vwap, has_attacked, now_time, vol_lots):
     if is_breakdown: return "🚨撤退"
     if pct >= 9.5: return "👑漲停"
     
-    # [核心修正] 訊號引擎同步：09:10 前皆為暖機，不發攻擊訊號
-    if now_time.time() < dt_time(9, 10): return "⏳暖機"
+    # [修正] 09:05 前暖機
+    if now_time.time() < dt_time(9, 5): return "⏳暖機"
+
+    # [核心] 檢查是否在「黃金走廊」(0.5% ~ 1.5%)
+    # is_bullish 已經代表 > 0.5%
+    # 這裡額外檢查是否 > 1.5% (過熱)
+    in_golden_zone = False
+    if is_bullish and price <= (vwap * 1.015):
+        in_golden_zone = True
 
     if ratio >= thresholds['tgt_ratio']:
-        if is_bullish and net_1h > 0:
+        if in_golden_zone and net_1h > 0:
             if not has_attacked: return "🔥攻擊"
         elif net_1h < 0:
             return "💀出貨"
         
     if not is_bullish:
         return "📉線下"
+        
+    # 如果是牛市但超過 1.5%，顯示「追高風險」而不是攻擊訊號
+    if is_bullish and not in_golden_zone:
+         # 這裡可以選擇不回傳任何訊號，或者回傳一個警告
+         return "⚠️追高"
 
     bias = ((price - vwap) / vwap) * 100 if vwap > 0 else 0
     if bias > thresholds['overheat']: return "⚠️過熱"
@@ -342,7 +360,7 @@ class NotificationManager:
         "🔥攻擊": "🚀", "💣伏擊": "💣", "👀量增": "👀",
         "💀出貨": "💀", "🚨撤退": "⚠️", "👑漲停": "👑",
         "⚠️價強": "💪", "❌誘多": "🎣", "🔥尾盤": "🔥",
-        "⚠️過熱": "🚫", "⏳暖機": "⏳", "📉線下": "📉"
+        "⚠️過熱": "🚫", "⏳暖機": "⏳", "📉線下": "📉", "⚠️追高": "🚫"
     }
 
     def __init__(self):
@@ -357,6 +375,15 @@ class NotificationManager:
         if event.is_test: return True
         if not MarketSession.is_market_open(): return False
         
+        # [核心過濾] 勝率 < 50% 且不是庫存撤退訊號 -> 直接靜音
+        if event.scope == "watchlist" and event.event_label == "🔥攻擊":
+            if event.win_rate < 50:
+                return False
+
+        # [新增] 追高訊號不推播
+        if event.event_label == "⚠️追高":
+            return False
+
         key = f"{event.code}_{event.scope}_{event.event_label}"
         
         if event.scope == "inventory":
@@ -392,7 +419,7 @@ class NotificationManager:
         emoji = self.EMOJI_MAP.get(event.event_label, "📌")
         up_dn = "UP" if event.pct >= 0 else "DN"
         
-        msg = (f"<b>{emoji} {event.event_label}｜{event.code} {event.name}</b>\n"
+        msg = (f"<b>{emoji} {event.event_label}｜{event.code} {event.name} ({event.win_rate:.0f}%)</b>\n"
                f"現價：{event.price:.2f} ({event.pct:.2f}% {up_dn})　均價：{event.vwap:.2f}\n"
                f"<b>🎯 止盈：{event.tp_price:.1f} (2%)｜🛡️ 止損：{event.sl_price:.1f} (均-1.5%)</b>\n"
                f"📊 量比：{event.ratio_yest:.1f} / <b>{event.ratio:.1f}</b>\n"
@@ -486,6 +513,7 @@ class SniperEngine:
             base_vol_5ma = static_data.get('vol_5ma', 0)
             base_vol_yest = static_data.get('vol_yest', 0)
             price_5ma = static_data.get('price_5ma', 0)
+            win_rate = static_data.get('win_rate', 0)
 
             q = client.stock.intraday.quote(symbol=code)
             price = q.get('lastPrice', 0)
@@ -577,7 +605,7 @@ class SniperEngine:
                     event_kind="STRATEGY", event_label=event_label,
                     price=price, pct=pct, vwap=vwap, ratio=ratio_5ma, ratio_yest=ratio_yest,
                     net_10m=net_10m, net_1h=net_1h, net_day=net_day,
-                    tp_price=tp_calc, sl_price=sl_calc
+                    tp_price=tp_calc, sl_price=sl_calc, win_rate=win_rate
                 )
                 self._dispatch_event(ev)
 
@@ -597,7 +625,7 @@ class SniperEngine:
                 notification_manager.reset_daily_state()
                 self.last_reset = now.date()
 
-            self._update_market_thermometer()
+            self._update_market_thermometer(now)
 
             targets = db.get_all_codes()
             self.inventory_codes = db.get_inventory_codes()
@@ -630,7 +658,7 @@ engine = st.session_state.sniper_engine_core
 # 7. UI (Table Layout)
 # ==========================================
 with st.sidebar:
-    st.title("🛡️ 戰情室 v6.13 Elite")
+    st.title("🛡️ 戰情室 v6.15 Elite")
     st.caption(f"Update: {datetime.now().strftime('%H:%M:%S')}")
     st.markdown("---")
 
@@ -761,7 +789,7 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
         
         is_twii = str(row['code']) == "0000"
 
-        # [新增] 顯示勝率並保留高風險標籤
+        # 顯示勝率
         name_display = f"{row['name']} ({row.get('win_rate', 0):.0f}%)"
         win_rate = row.get("win_rate", 0)
         
@@ -774,13 +802,18 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
         pct_html = f"<span style='color:{main_color}'>{row['pct']:.2f}%</span>"
 
         # 2. VWAP Light (Logic: Price > VWAP * 1.005)
+        # 這裡的燈號同步更新：必須在黃金走廊內才亮綠燈
         is_bullish = row['price'] >= (row['vwap'] * 1.005)
+        is_in_zone = row['price'] <= (row['vwap'] * 1.015)
+        
         vwap_color = "#ff4d4f" if is_bullish else "#2ecc71"
-        vwap_light = "🟢" if is_bullish else "🔴"
+        if is_bullish:
+             vwap_light = "🟢" if is_in_zone else "⚠️" # 超過1.5%顯示警告
+        else:
+             vwap_light = "🔴"
         
         vwap_html = f"<span style='color:{vwap_color}'>{row['vwap']:.2f} {vwap_light}</span>"
         
-        # [修正] TP 錨定 Trigger Price
         if is_bullish and not is_twii:
             trigger_price = row['vwap'] * 1.005
             tp_price = adjust_to_tick(trigger_price * 1.02, method='round')
