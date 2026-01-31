@@ -19,7 +19,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.15 Elite", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v6.15.1 Elite", page_icon="🛡️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -219,11 +219,6 @@ def fetch_static_stats(client, code):
         return 0, 0, 0, 0, 0
 
 def _run_quick_backtest(target_code):
-    """
-    [核心修正] V2.4.2 回測邏輯：
-    1. 避開前 5 分鐘 (09:05 後開始)
-    2. 乖離率限制：進場時股價不得超過 VWAP * 1.015 (避免追高)
-    """
     try:
         df = yf.download(target_code, period="60d", interval="5m", progress=False, auto_adjust=True)
         if df.empty: return 0, 0
@@ -319,8 +314,6 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdo
     if now_time.time() < dt_time(9, 5): return "⏳暖機"
 
     # [核心] 檢查是否在「黃金走廊」(0.5% ~ 1.5%)
-    # is_bullish 已經代表 > 0.5%
-    # 這裡額外檢查是否 > 1.5% (過熱)
     in_golden_zone = False
     if is_bullish and price <= (vwap * 1.015):
         in_golden_zone = True
@@ -336,7 +329,6 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdo
         
     # 如果是牛市但超過 1.5%，顯示「追高風險」而不是攻擊訊號
     if is_bullish and not in_golden_zone:
-         # 這裡可以選擇不回傳任何訊號，或者回傳一個警告
          return "⚠️追高"
 
     bias = ((price - vwap) / vwap) * 100 if vwap > 0 else 0
@@ -625,7 +617,7 @@ class SniperEngine:
                 notification_manager.reset_daily_state()
                 self.last_reset = now.date()
 
-            self._update_market_thermometer(now)
+            self._update_market_thermometer() # 確保無參數呼叫
 
             targets = db.get_all_codes()
             self.inventory_codes = db.get_inventory_codes()
@@ -658,7 +650,7 @@ engine = st.session_state.sniper_engine_core
 # 7. UI (Table Layout)
 # ==========================================
 with st.sidebar:
-    st.title("🛡️ 戰情室 v6.15 Elite")
+    st.title("🛡️ 戰情室 v6.15.1 Elite")
     st.caption(f"Update: {datetime.now().strftime('%H:%M:%S')}")
     st.markdown("---")
 
@@ -802,13 +794,13 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
         pct_html = f"<span style='color:{main_color}'>{row['pct']:.2f}%</span>"
 
         # 2. VWAP Light (Logic: Price > VWAP * 1.005)
-        # 這裡的燈號同步更新：必須在黃金走廊內才亮綠燈
         is_bullish = row['price'] >= (row['vwap'] * 1.005)
+        # 精準區間判斷
         is_in_zone = row['price'] <= (row['vwap'] * 1.015)
         
         vwap_color = "#ff4d4f" if is_bullish else "#2ecc71"
         if is_bullish:
-             vwap_light = "🟢" if is_in_zone else "⚠️" # 超過1.5%顯示警告
+             vwap_light = "🟢" if is_in_zone else "⚠️"
         else:
              vwap_light = "🔴"
         
