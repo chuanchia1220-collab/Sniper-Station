@@ -19,7 +19,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.16.2 LogicFix", page_icon="🔧", layout="wide")
+st.set_page_config(page_title="Sniper v6.16.3 VisualFix", page_icon="🎨", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -652,7 +652,7 @@ engine = st.session_state.sniper_engine_core
 # 7. UI (Table Layout)
 # ==========================================
 with st.sidebar:
-    st.title("🛡️ 戰情室 v6.16.2 LogicFix")
+    st.title("🛡️ 戰情室 v6.16.3 VisualFix")
     st.caption(f"Update: {datetime.now().strftime('%H:%M:%S')}")
     st.markdown("---")
 
@@ -761,6 +761,7 @@ table.sniper-table { width: 100%; border-collapse: collapse; font-family: 'Couri
 table.sniper-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; white-space: nowrap; }
 table.sniper-table td { padding: 6px; border-bottom: 1px solid #444; font-size: 15px; vertical-align: middle; white-space: nowrap; }
 table.sniper-table tr.pinned-row { background-color: #fff9c4 !important; color: black !important; }
+table.sniper-table tr.golden-row { background-color: #fff9c4 !important; color: black !important; font-weight: bold; }
 table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
 </style>
 <table class="sniper-table">
@@ -847,12 +848,24 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
             n10 = int(row['net_10m'])
             n1h = int(row['net_1h'])
             nd = int(row['net_day'])
-            # [修正] 台股紅買綠賣： 大於0 顯示綠色，小於0 顯示紅色
+            # [修正] 台股紅買綠賣： 大於0 顯示綠色(這裡的邏輯是: 程式碼中 綠色代表正向訊號)，小於0 顯示紅色
+            # 注意：您的代碼中 bp_light = "🟢" if n1h > 0 else "🔴"
+            # 這代表 "🟢" 是正向(買進)，"🔴" 是負向(賣出)
             bp_light = "🟢" if n1h > 0 else "🔴"
             c10 = "#ff4d4f" if n10 > 0 else "#2ecc71" if n10 < 0 else "#999999"
             c1h = "#ff4d4f" if n1h > 0 else "#2ecc71" if n1h < 0 else "#999999"
             cd  = "#ff4d4f" if nd > 0 else "#2ecc71" if nd < 0 else "#999999"
             bp_html = f"<span style='color:{c10}'>{n10}</span> / <span style='color:{c1h}'>{n1h} {bp_light}</span> / <span style='color:{cd}'>{nd}</span>"
+
+        # [新增] 三燈全亮(綠)檢查 -> 變更底色
+        is_three_lights = (vwap_light == "🟢") and (vol_light == "🟢") and (bp_light == "🟢")
+        
+        if is_three_lights:
+            row_class = "golden-row"
+        elif is_pinned:
+            row_class = "pinned-row"
+        else:
+            row_class = ""
 
         html_rows.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{row["code"]}</td><td>{name_html}</td><td>{event_label}</td><td>{ma_html}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{situation_html}</td><td>{bp_html}</td></tr>')
 
