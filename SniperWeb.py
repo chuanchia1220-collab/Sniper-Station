@@ -847,8 +847,8 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
             n10 = int(row['net_10m'])
             n1h = int(row['net_1h'])
             nd = int(row['net_day'])
-            # [修正] 台股紅買綠賣： 大於0 顯示紅色，小於0 顯示綠色
-            bp_light = "🔴" if n1h > 0 else "🟢"
+            # [修正] 台股紅買綠賣： 大於0 顯示綠色，小於0 顯示紅色
+            bp_light = "🟢" if n1h > 0 else "🔴"
             c10 = "#ff4d4f" if n10 > 0 else "#2ecc71" if n10 < 0 else "#999999"
             c1h = "#ff4d4f" if n1h > 0 else "#2ecc71" if n1h < 0 else "#999999"
             cd  = "#ff4d4f" if nd > 0 else "#2ecc71" if nd < 0 else "#999999"
