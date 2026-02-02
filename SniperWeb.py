@@ -19,7 +19,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.15.1 Elite", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sniper v6.16.2 LogicFix", page_icon="🔧", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -31,12 +31,12 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v615.db"
+DB_PATH = "sniper_v616.db"
 
-# [01/29 Elite List] 預設清單
+# [Final Target List]
 DEFAULT_WATCHLIST = "3006 3037 1513 3189 1795 3491 8046 6274"
 
-# [User Inventory] 指揮官最新庫存狀態
+# [User Inventory]
 DEFAULT_INVENTORY = """2481,84.4,3
 3231,150.14,7
 4566,54.94,2
@@ -239,8 +239,8 @@ def _run_quick_backtest(target_code):
         wins = 0
         losses = 0
         
-        ENTRY_MIN = 1.005  # 地板: +0.5%
-        ENTRY_MAX = 1.015  # 天花板: +1.5% (超過不買)
+        ENTRY_MIN = 1.005  
+        ENTRY_MAX = 1.015  # 黃金走廊天花板 (乖離限制)
         TP = 1.02
         SL = 0.985
 
@@ -259,11 +259,9 @@ def _run_quick_backtest(target_code):
                 t = ts.time()
                 
                 if not in_pos:
-                    # [修改] 09:05 前不動作
-                    if t.hour==9 and t.minute<5: continue
+                    if t.hour==9 and t.minute<5: continue # 09:05 前不回測
                     if t.hour>=13: continue
                     
-                    # [核心] 精準區間：0.5% ~ 1.5% 之間才出手
                     if (v * ENTRY_MIN) < p < (v * ENTRY_MAX):
                         in_pos = True; entry_p = p; entry_v = v
                         
@@ -310,24 +308,21 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdo
     if is_breakdown: return "🚨撤退"
     if pct >= 9.5: return "👑漲停"
     
-    # [修正] 09:05 前暖機
     if now_time.time() < dt_time(9, 5): return "⏳暖機"
 
-    # [核心] 檢查是否在「黃金走廊」(0.5% ~ 1.5%)
     in_golden_zone = False
     if is_bullish and price <= (vwap * 1.015):
         in_golden_zone = True
 
     if ratio >= thresholds['tgt_ratio']:
         if in_golden_zone and net_1h > 0:
-            if not has_attacked: return "🔥攻擊"
+            return "🔥攻擊"
         elif net_1h < 0:
             return "💀出貨"
         
     if not is_bullish:
         return "📉線下"
         
-    # 如果是牛市但超過 1.5%，顯示「追高風險」而不是攻擊訊號
     if is_bullish and not in_golden_zone:
          return "⚠️追高"
 
@@ -367,12 +362,11 @@ class NotificationManager:
         if event.is_test: return True
         if not MarketSession.is_market_open(): return False
         
-        # [核心過濾] 勝率 < 50% 且不是庫存撤退訊號 -> 直接靜音
+        # [Win Rate Filter] 勝率 < 50% 且不是庫存撤退訊號 -> 直接靜音
         if event.scope == "watchlist" and event.event_label == "🔥攻擊":
             if event.win_rate < 50:
                 return False
 
-        # [新增] 追高訊號不推播
         if event.event_label == "⚠️追高":
             return False
 
@@ -515,8 +509,9 @@ class SniperEngine:
             best_asks = order_book.get('bestAsks', []) or []
             best_bids = order_book.get('bestBids', []) or []
             
-            best_ask = best_asks[0].get('price', price) if best_asks else price
-            best_bid = best_bids[0].get('price', price) if best_bids else price
+            # [Fix] Logic Fix: 如果抓不到五檔，給定 None，後續邏輯改用價格比較
+            best_ask = best_asks[0].get('price') if best_asks else None
+            best_bid = best_bids[0].get('price') if best_bids else None
 
             pct = q.get('changePercent', 0)
             vol_lots = q.get('total', {}).get('tradeVolume', 0)
@@ -538,13 +533,19 @@ class SniperEngine:
                 prev_v = self.prev_data[code]['vol']
                 delta_v = vol_lots - prev_v
                 
+                # [Fix] 計算內外盤邏輯修正
                 if delta_v > 0:
-                    if price >= best_ask: delta_net = int(delta_v)
-                    elif price <= best_bid: delta_net = -int(delta_v)
+                    # 1. 有五檔數據，優先用五檔判定
+                    if best_ask and price >= best_ask: 
+                        delta_net = int(delta_v)
+                    elif best_bid and price <= best_bid: 
+                        delta_net = -int(delta_v)
                     else:
+                        # 2. 沒五檔數據 (或價格在中間)，改用「價格趨勢」判定
                         prev_p = self.prev_data[code]['price']
                         if price > prev_p: delta_net = int(delta_v)
                         elif price < prev_p: delta_net = -int(delta_v)
+                        # 如果價格沒變 (price == prev_p)，視為中性，delta_net = 0
 
             self.prev_data[code] = {'vol': vol_lots, 'price': price}
             now_ts = time.time()
@@ -581,7 +582,8 @@ class SniperEngine:
             tp_calc = adjust_to_tick(trigger_price * 1.02, method='round')
             sl_calc = adjust_to_tick(vwap * 0.985, method='floor')
 
-            if "攻擊" in raw_state and code not in self.active_flags: event_label = "🔥攻擊"
+            if "攻擊" in raw_state and code not in self.active_flags: 
+                event_label = "🔥攻擊"
             elif "漲停" in raw_state and scope == "inventory": event_label = "👑漲停"
             elif "撤退" in raw_state: 
                 if scope == "inventory": event_label = "🚨撤退"
@@ -617,7 +619,7 @@ class SniperEngine:
                 notification_manager.reset_daily_state()
                 self.last_reset = now.date()
 
-            self._update_market_thermometer() # 確保無參數呼叫
+            self._update_market_thermometer()
 
             targets = db.get_all_codes()
             self.inventory_codes = db.get_inventory_codes()
@@ -650,7 +652,7 @@ engine = st.session_state.sniper_engine_core
 # 7. UI (Table Layout)
 # ==========================================
 with st.sidebar:
-    st.title("🛡️ 戰情室 v6.15.1 Elite")
+    st.title("🛡️ 戰情室 v6.16.2 LogicFix")
     st.caption(f"Update: {datetime.now().strftime('%H:%M:%S')}")
     st.markdown("---")
 
@@ -845,7 +847,8 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
             n10 = int(row['net_10m'])
             n1h = int(row['net_1h'])
             nd = int(row['net_day'])
-            bp_light = "🟢" if n1h > 0 else "🔴"
+            # [修正] 台股紅買綠賣： 大於0 顯示紅色，小於0 顯示綠色
+            bp_light = "🔴" if n1h > 0 else "🟢"
             c10 = "#ff4d4f" if n10 > 0 else "#2ecc71" if n10 < 0 else "#999999"
             c1h = "#ff4d4f" if n1h > 0 else "#2ecc71" if n1h < 0 else "#999999"
             cd  = "#ff4d4f" if nd > 0 else "#2ecc71" if nd < 0 else "#999999"
