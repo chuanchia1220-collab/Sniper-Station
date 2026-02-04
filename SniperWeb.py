@@ -499,7 +499,7 @@ class SniperEngine:
                  self.market_stats["Price5MA"] = 0
         except: pass
 
-def _update_market_thermometer(self):
+    def _update_market_thermometer(self):
         # 冷卻時間：3秒更新一次
         if time.time() - self.market_stats.get("Time", 0) < 3: return
         
@@ -563,10 +563,10 @@ def _update_market_thermometer(self):
             }
              self.market_stats["Time"] = time.time()
 
-def _dispatch_event(self, ev: SniperEvent):
+    def _dispatch_event(self, ev: SniperEvent):
         notification_manager.enqueue(ev)
 
-def _fetch_stock(self, code, now_time=None):
+    def _fetch_stock(self, code, now_time=None):
         try:
             if now_time is None: now_time = datetime.now(timezone.utc) + timedelta(hours=8)
             client = next(self.client_cycle) if self.client_cycle else None
@@ -683,7 +683,7 @@ def _fetch_stock(self, code, now_time=None):
             return (code, get_stock_name(code), "一般", price, pct, vwap, vol_lots, est_lots, ratio_5ma, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m, situation, ratio_yest)
         except: return None
 
-def _run_loop(self):
+    def _run_loop(self):
         while self.running:
             now = datetime.now(timezone.utc) + timedelta(hours=8)
             if now.date() > self.last_reset:
