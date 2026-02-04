@@ -19,7 +19,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.16.6 StrategyUpdate", page_icon="⚔️", layout="wide")
+st.set_page_config(page_title="Sniper v6.16.7 IndexFix", page_icon="⚔️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -501,24 +501,47 @@ class SniperEngine:
 
     def _update_market_thermometer(self):
         if time.time() - self.market_stats.get("Time", 0) < 3: return
+        
+        current_price = 0
+        current_pct = 0
+        source_status = "Init"
+        
+        # 1. 優先嘗試 Fugle IX0001 (Real-time)
         try:
             client = self.clients[0] if self.clients else None
-            if not client: return
-            
-            q = client.stock.intraday.quote(symbol="IX0001")
-            price = q.get('lastPrice') or q.get('close') or q.get('trade', {}).get('price')
-            
-            if not price: return
+            if client:
+                q = client.stock.intraday.quote(symbol="IX0001")
+                price = q.get('lastPrice') or q.get('close') or q.get('trade', {}).get('price')
+                if price:
+                    current_price = price
+                    current_pct = q.get('changePercent', 0)
+                    source_status = f"{datetime.now().strftime('%H:%M:%S')}"
+        except:
+            pass
 
-            price_5ma = self.market_stats.get("Price5MA", price)
-            change_percent = q.get('changePercent', 0)
-            
-            self.twii_data = {
+        # 2. 失敗則備援 YFinance (Delayed)
+        if not current_price:
+            try:
+                tse = yf.Ticker("^TWII")
+                fi = tse.fast_info
+                current_price = fi.last_price
+                prev = fi.previous_close
+                if current_price and prev:
+                    current_pct = ((current_price - prev) / prev) * 100
+                    source_status = f"{datetime.now().strftime('%H:%M')} (Delay)"
+            except:
+                pass
+
+        # 3. 更新資料
+        if current_price:
+             price_5ma = self.market_stats.get("Price5MA", current_price)
+             
+             self.twii_data = {
                 'code': '0000', 
-                'name': f'加權指數 {datetime.now().strftime("%H:%M:%S")}', 
-                'price': price,
-                'pct': change_percent,
-                'vwap': price, 
+                'name': f'加權指數 {source_status}', 
+                'price': current_price,
+                'pct': current_pct,
+                'vwap': current_price, 
                 'price_5ma': price_5ma,
                 'ratio': 1.0, 'ratio_yest': 1.0,
                 'net_10m': 0, 'net_1h': 0, 'net_day': 0,
@@ -527,9 +550,7 @@ class SniperEngine:
                 'is_pinned': 1,
                 'win_rate': 0, 'avg_ret': 0 
             }
-            
-            self.market_stats["Time"] = time.time()
-        except: pass
+             self.market_stats["Time"] = time.time()
 
     def _dispatch_event(self, ev: SniperEvent):
         notification_manager.enqueue(ev)
@@ -697,7 +718,7 @@ engine = st.session_state.sniper_engine_core
 # 7. UI (Table Layout)
 # ==========================================
 with st.sidebar:
-    st.title("🛡️ 戰情室 v6.16.6 StrategyUpdate")
+    st.title("🛡️ 戰情室 v6.16.7 IndexFix")
     st.caption(f"Update: {datetime.now().strftime('%H:%M:%S')}")
     st.markdown("---")
 
