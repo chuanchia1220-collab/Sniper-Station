@@ -563,10 +563,10 @@ def _update_market_thermometer(self):
             }
              self.market_stats["Time"] = time.time()
 
-    def _dispatch_event(self, ev: SniperEvent):
+def _dispatch_event(self, ev: SniperEvent):
         notification_manager.enqueue(ev)
 
-    def _fetch_stock(self, code, now_time=None):
+def _fetch_stock(self, code, now_time=None):
         try:
             if now_time is None: now_time = datetime.now(timezone.utc) + timedelta(hours=8)
             client = next(self.client_cycle) if self.client_cycle else None
