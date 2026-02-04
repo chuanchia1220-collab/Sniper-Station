@@ -19,7 +19,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.16.4 IndexFix", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Sniper v6.16.5 IndexRealtime", page_icon="⚡", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -433,10 +433,11 @@ class SniperEngine:
         self.prev_data = {}
         self.active_flags = {}
         self.daily_risk_flags = {}
-        self.market_stats = {"Time": 0}
+        self.market_stats = {"Time": 0, "Price5MA": 0} # Add 5MA cache
         self.twii_data = None 
         self.last_reset = datetime.now().date()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
+        self._init_market_stats() # Initialize 5MA on start
 
     def update_targets(self):
         self.targets = db.get_all_codes()
@@ -452,32 +453,45 @@ class SniperEngine:
         threading.Thread(target=self._run_loop, daemon=True).start()
 
     def stop(self): self.running = False
+    
+    def _init_market_stats(self):
+        # Fetch 5MA only ONCE on startup
+        try:
+             tse = yf.Ticker("^TWII")
+             hist = tse.history(period="10d", auto_adjust=True)
+             if not hist.empty:
+                 self.market_stats["Price5MA"] = hist['Close'].iloc[-6:-1].mean() if len(hist) >= 6 else hist['Close'].mean()
+             else:
+                 self.market_stats["Price5MA"] = 0
+        except: pass
 
     def _update_market_thermometer(self):
-        # [修改] 縮短大盤更新時間至 3 秒
+        # [Fix] Switch to Fugle API for Real-time Index (IX0001)
+        # Update every 3 seconds
         if time.time() - self.market_stats.get("Time", 0) < 3: return
         try:
-            tse = yf.Ticker("^TWII")
-            fi = tse.fast_info
-            price = fi.last_price
-            prev = fi.previous_close
+            client = self.clients[0] if self.clients else None
+            if not client: return
             
-            # [修改] 增加防呆，確保有數據才更新
-            if not price or not prev: return
-
-            pct = ((price - prev) / prev) * 100 if prev else 0
+            # Fugle IX0001 = TWSE Weighted Index
+            q = client.stock.intraday.quote(symbol="IX0001")
             
-            hist = tse.history(period="10d", auto_adjust=True)
-            if not hist.empty:
-                price_5ma = hist['Close'].iloc[-6:-1].mean() if len(hist) >= 6 else hist['Close'].mean()
-            else:
-                price_5ma = price
+            # Fugle Index API returns 'lastPrice' or 'close'
+            price = q.get('lastPrice') or q.get('close') or q.get('trade', {}).get('price')
+            
+            if not price: return # Safety check
 
+            # Use cached 5MA from startup
+            price_5ma = self.market_stats.get("Price5MA", price)
+            
+            # Calculate change percent locally if needed, or use API
+            change_percent = q.get('changePercent', 0)
+            
             self.twii_data = {
                 'code': '0000', 
-                'name': f'加權指數 {datetime.now().strftime("%H:%M:%S")}', # [修改] 顯示時間，確認心跳
+                'name': f'加權指數 {datetime.now().strftime("%H:%M:%S")}', # Add heartbeat
                 'price': price,
-                'pct': pct,
+                'pct': change_percent,
                 'vwap': price, 
                 'price_5ma': price_5ma,
                 'ratio': 1.0, 'ratio_yest': 1.0,
@@ -657,7 +671,7 @@ engine = st.session_state.sniper_engine_core
 # 7. UI (Table Layout)
 # ==========================================
 with st.sidebar:
-    st.title("🛡️ 戰情室 v6.16.4 IndexFix")
+    st.title("🛡️ 戰情室 v6.16.5 IndexRealtime")
     st.caption(f"Update: {datetime.now().strftime('%H:%M:%S')}")
     st.markdown("---")
 
