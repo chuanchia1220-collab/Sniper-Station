@@ -10,6 +10,7 @@ import warnings
 import logging
 import numpy as np
 import math
+from bs4 import BeautifulSoup  # 新增爬蟲庫
 
 # [LOG FIX] Silence yfinance and other non-critical warnings
 warnings.filterwarnings("ignore")
@@ -19,7 +20,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.16.7 IndexFix", page_icon="⚔️", layout="wide")
+st.set_page_config(page_title="Sniper v6.16.8 YahooCrawler", page_icon="⚔️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -505,30 +506,43 @@ class SniperEngine:
         
         current_price = 0
         current_pct = 0
-        source_status = "Init"
-        
-        # === 方案 A: 優先嘗試 Fugle API (秒級同步) ===
+        now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%H:%M:%S')
+        source_status = f"{now_str} (Crawler)"
+
+        # === 方案: Yahoo 網頁爬蟲 (Requests + BeautifulSoup) ===
         try:
-            client = self.clients[0] if self.clients else None
-            if client:
-                # 指揮官注意：富果的指數代碼是 "IX0001"
-                q = client.stock.intraday.quote(symbol="IX0001")
+            url = "https://tw.stock.yahoo.com/quote/^TWII"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+            r = requests.get(url, headers=headers, timeout=3)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, 'html.parser')
                 
-                # [關鍵修正] 指數的 JSON 結構不同，價格通常在最外層
-                # 優先抓 lastPrice (盤中)，沒有則抓 close (收盤)
-                price = q.get('lastPrice') or q.get('close')
-                
-                if price:
-                    current_price = price
-                    current_pct = q.get('changePercent', 0)
-                    source_status = f"{datetime.now().strftime('%H:%M:%S')}"
+                # Yahoo 股市網頁結構經常變動，這裡抓取特定的 Class (Fz(32px) 通常是當前價格)
+                # 備註：這是寫死的爬蟲邏輯，Yahoo 改版即失效
+                price_elem = soup.find('span', class_='Fz(32px)')
+                if price_elem:
+                    current_price = float(price_elem.text.replace(',', ''))
+                    
+                    # 抓取漲跌幅 (通常在價格旁邊的 span)
+                    # 嘗試抓取包含 % 的 span
+                    pct_elem = None
+                    for span in soup.find_all('span'):
+                        if span.text and '%' in span.text and ('+' in span.text or '-' in span.text or '0.00%' in span.text):
+                             # 簡單過濾一下，避免抓到其他雜訊
+                             if len(span.text) < 15: 
+                                 pct_elem = span
+                                 break
+                    
+                    if pct_elem:
+                         current_pct = float(pct_elem.text.replace('%', '').replace('+', ''))
+
         except Exception as e:
-            # 如果 Fugle 失敗 (例如權限不足或連線逾時)，默默進入備援
-            # print(f"Fugle Index Error: {e}") # 除錯用
+            # print(f"Yahoo Crawler Error: {e}")
             pass
 
-        # === 方案 B: 備援 Yahoo Finance (延遲報價) ===
-        # 如果方案 A 沒抓到價格，才啟動 B 計畫
+        # === 備援: 若爬蟲失敗，回退到 Yahoo Finance API (yfinance) ===
         if not current_price:
             try:
                 tse = yf.Ticker("^TWII")
@@ -537,14 +551,12 @@ class SniperEngine:
                 prev = fi.previous_close
                 if current_price and prev:
                     current_pct = ((current_price - prev) / prev) * 100
-                    # 標註 (Delay) 讓您知道現在看的是舊資料
-                    source_status = f"{datetime.now().strftime('%H:%M')} (Delay)"
+                    source_status = f"{now_str} (Backup API)"
             except:
                 pass
 
         # === 更新戰情看板 ===
         if current_price:
-             # 取得 5MA (若無則用現價代替)
              price_5ma = self.market_stats.get("Price5MA", current_price)
              
              self.twii_data = {
@@ -729,8 +741,8 @@ engine = st.session_state.sniper_engine_core
 # 7. UI (Table Layout)
 # ==========================================
 with st.sidebar:
-    st.title("🛡️ 戰情室 v6.16.7 IndexFix")
-    st.caption(f"Update: {datetime.now().strftime('%H:%M:%S')}")
+    st.title("🛡️ 戰情室 v6.16.8 YahooCrawler")
+    st.caption(f"Update: {datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')}")
     st.markdown("---")
 
     mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
@@ -925,9 +937,6 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
             n10 = int(row['net_10m'])
             n1h = int(row['net_1h'])
             nd = int(row['net_day'])
-            # [修正] 台股紅買綠賣： 大於0 顯示綠色(這裡的邏輯是: 程式碼中 綠色代表正向訊號)，小於0 顯示紅色
-            # 注意：您的代碼中 bp_light = "🟢" if n1h > 0 else "🔴"
-            # 這代表 "🟢" 是正向(買進)，"🔴" 是負向(賣出)
             bp_light = "🟢" if n1h > 0 else "🔴"
             c10 = "#ff4d4f" if n10 > 0 else "#2ecc71" if n10 < 0 else "#999999"
             c1h = "#ff4d4f" if n1h > 0 else "#2ecc71" if n1h < 0 else "#999999"
