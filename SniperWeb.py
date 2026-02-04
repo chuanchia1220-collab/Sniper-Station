@@ -19,7 +19,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.16.3 VisualFix", page_icon="🎨", layout="wide")
+st.set_page_config(page_title="Sniper v6.16.4 IndexFix", page_icon="⚡", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -454,12 +454,17 @@ class SniperEngine:
     def stop(self): self.running = False
 
     def _update_market_thermometer(self):
-        if time.time() - self.market_stats.get("Time", 0) < 15: return
+        # [修改] 縮短大盤更新時間至 3 秒
+        if time.time() - self.market_stats.get("Time", 0) < 3: return
         try:
             tse = yf.Ticker("^TWII")
             fi = tse.fast_info
             price = fi.last_price
             prev = fi.previous_close
+            
+            # [修改] 增加防呆，確保有數據才更新
+            if not price or not prev: return
+
             pct = ((price - prev) / prev) * 100 if prev else 0
             
             hist = tse.history(period="10d", auto_adjust=True)
@@ -470,7 +475,7 @@ class SniperEngine:
 
             self.twii_data = {
                 'code': '0000', 
-                'name': '加權指數',
+                'name': f'加權指數 {datetime.now().strftime("%H:%M:%S")}', # [修改] 顯示時間，確認心跳
                 'price': price,
                 'pct': pct,
                 'vwap': price, 
@@ -652,7 +657,7 @@ engine = st.session_state.sniper_engine_core
 # 7. UI (Table Layout)
 # ==========================================
 with st.sidebar:
-    st.title("🛡️ 戰情室 v6.16.3 VisualFix")
+    st.title("🛡️ 戰情室 v6.16.4 IndexFix")
     st.caption(f"Update: {datetime.now().strftime('%H:%M:%S')}")
     st.markdown("---")
 
