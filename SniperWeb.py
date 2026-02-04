@@ -683,7 +683,7 @@ def _fetch_stock(self, code, now_time=None):
             return (code, get_stock_name(code), "一般", price, pct, vwap, vol_lots, est_lots, ratio_5ma, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m, situation, ratio_yest)
         except: return None
 
-    def _run_loop(self):
+def _run_loop(self):
         while self.running:
             now = datetime.now(timezone.utc) + timedelta(hours=8)
             if now.date() > self.last_reset:
