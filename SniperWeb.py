@@ -19,7 +19,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.16.5 IndexRealtime", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Sniper v6.16.6 StrategyUpdate", page_icon="⚔️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -220,6 +220,11 @@ def fetch_static_stats(client, code):
 
 def _run_quick_backtest(target_code):
     try:
+        # [Strategy Update] 
+        # Trigger: VWAP * 1.015 (1.5%)
+        # Trailing: 0.5% Pullback
+        # Stop Loss: VWAP * 0.985 (1.5%)
+        
         df = yf.download(target_code, period="60d", interval="5m", progress=False, auto_adjust=True)
         if df.empty: return 0, 0
         
@@ -240,9 +245,11 @@ def _run_quick_backtest(target_code):
         losses = 0
         
         ENTRY_MIN = 1.005  
-        ENTRY_MAX = 1.015  # 黃金走廊天花板 (乖離限制)
-        TP = 1.02
-        SL = 0.985
+        ENTRY_MAX = 1.015
+        
+        TRIGGER_PCT = 1.015  # 1.5% Trigger
+        TRAILING_CALLBACK = 0.005 # 0.5% Callback
+        SL_PCT = 0.985       # 1.5% Stop Loss
 
         for trade_date in unique_dates:
             mask = df['Date'] == trade_date
@@ -252,6 +259,8 @@ def _run_quick_backtest(target_code):
             in_pos = False
             entry_p = 0
             entry_v = 0
+            max_p_after_entry = 0
+            trailing_active = False
             
             for ts, row in day_data.iterrows():
                 p = float(row['Close'])
@@ -259,23 +268,49 @@ def _run_quick_backtest(target_code):
                 t = ts.time()
                 
                 if not in_pos:
-                    if t.hour==9 and t.minute<5: continue # 09:05 前不回測
+                    if t.hour==9 and t.minute<5: continue
                     if t.hour>=13: continue
                     
                     if (v * ENTRY_MIN) < p < (v * ENTRY_MAX):
-                        in_pos = True; entry_p = p; entry_v = v
+                        in_pos = True
+                        entry_p = p
+                        entry_v = v
+                        max_p_after_entry = p
+                        trailing_active = False
                         
                 elif in_pos:
-                    if p >= entry_p * TP:
-                        results.append((p-entry_p)/entry_p); wins+=1; in_pos=False; break
-                    elif p <= entry_v * SL:
-                        results.append((p-entry_p)/entry_p); losses+=1; in_pos=False; break
-                    elif t.hour==13 and t.minute>=25:
+                    # 1. Check Stop Loss
+                    if p <= entry_v * SL_PCT:
+                        results.append((p-entry_p)/entry_p)
+                        losses += 1
+                        in_pos = False
+                        break
+                    
+                    # 2. Update Trailing Logic
+                    if p > max_p_after_entry:
+                        max_p_after_entry = p
+                    
+                    # 3. Check Trigger
+                    if p >= entry_v * TRIGGER_PCT:
+                        trailing_active = True
+                    
+                    # 4. Check Trailing Exit
+                    if trailing_active:
+                        exit_threshold = max_p_after_entry * (1 - TRAILING_CALLBACK)
+                        if p <= exit_threshold:
+                            results.append((p-entry_p)/entry_p)
+                            wins += 1 # Locked profit
+                            in_pos = False
+                            break
+                    
+                    # 5. End of Day Exit
+                    if t.hour==13 and t.minute>=25:
                         res = (p-entry_p)/entry_p
                         results.append(res)
                         if res>0: wins+=1
                         else: losses+=1
-                        in_pos=False; break
+                        in_pos=False
+                        break
                         
         total = wins + losses
         wr = (wins/total*100) if total > 0 else 0
@@ -433,11 +468,11 @@ class SniperEngine:
         self.prev_data = {}
         self.active_flags = {}
         self.daily_risk_flags = {}
-        self.market_stats = {"Time": 0, "Price5MA": 0} # Add 5MA cache
+        self.market_stats = {"Time": 0, "Price5MA": 0} 
         self.twii_data = None 
         self.last_reset = datetime.now().date()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
-        self._init_market_stats() # Initialize 5MA on start
+        self._init_market_stats()
 
     def update_targets(self):
         self.targets = db.get_all_codes()
@@ -455,7 +490,6 @@ class SniperEngine:
     def stop(self): self.running = False
     
     def _init_market_stats(self):
-        # Fetch 5MA only ONCE on startup
         try:
              tse = yf.Ticker("^TWII")
              hist = tse.history(period="10d", auto_adjust=True)
@@ -466,30 +500,22 @@ class SniperEngine:
         except: pass
 
     def _update_market_thermometer(self):
-        # [Fix] Switch to Fugle API for Real-time Index (IX0001)
-        # Update every 3 seconds
         if time.time() - self.market_stats.get("Time", 0) < 3: return
         try:
             client = self.clients[0] if self.clients else None
             if not client: return
             
-            # Fugle IX0001 = TWSE Weighted Index
             q = client.stock.intraday.quote(symbol="IX0001")
-            
-            # Fugle Index API returns 'lastPrice' or 'close'
             price = q.get('lastPrice') or q.get('close') or q.get('trade', {}).get('price')
             
-            if not price: return # Safety check
+            if not price: return
 
-            # Use cached 5MA from startup
             price_5ma = self.market_stats.get("Price5MA", price)
-            
-            # Calculate change percent locally if needed, or use API
             change_percent = q.get('changePercent', 0)
             
             self.twii_data = {
                 'code': '0000', 
-                'name': f'加權指數 {datetime.now().strftime("%H:%M:%S")}', # Add heartbeat
+                'name': f'加權指數 {datetime.now().strftime("%H:%M:%S")}', 
                 'price': price,
                 'pct': change_percent,
                 'vwap': price, 
@@ -671,7 +697,7 @@ engine = st.session_state.sniper_engine_core
 # 7. UI (Table Layout)
 # ==========================================
 with st.sidebar:
-    st.title("🛡️ 戰情室 v6.16.5 IndexRealtime")
+    st.title("🛡️ 戰情室 v6.16.6 StrategyUpdate")
     st.caption(f"Update: {datetime.now().strftime('%H:%M:%S')}")
     st.markdown("---")
 
