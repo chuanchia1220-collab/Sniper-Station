@@ -10,3 +10,4 @@ pandas_ta
 plotly
 openai
 kaleido
+colorama
