@@ -10,7 +10,7 @@ import warnings
 import logging
 import numpy as np
 import math
-from bs4 import BeautifulSoup  # 新增爬蟲庫
+from bs4 import BeautifulSoup
 
 # [LOG FIX] Silence yfinance and other non-critical warnings
 warnings.filterwarnings("ignore")
@@ -18,9 +18,30 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 pd.set_option('future.no_silent_downcasting', True)
 
 # ==========================================
+# 0. Global Strategy Config (from v3.0.2)
+# ==========================================
+MIN_AMPLITUDE_THRESHOLD = 4.0
+
+MAD_DOG_PARAMS = {
+    'TARGET_WAVE': 2, 'MAX_TRADES_DAY': 2, 'ENTRY_CEILING_PCT': 4.0,
+    'STOP_LOSS_PCT': 2.0, 'MAX_DAY_PCT': 3.5
+}
+NORMAL_PARAMS = {
+    'TARGET_WAVE': 0, 'MAX_TRADES_DAY': 2, 'ENTRY_CEILING_PCT': 2.0,
+    'STOP_LOSS_PCT': 0.0, 'MAX_DAY_PCT': 2.5
+}
+
+# Common
+ENTRY_THRESHOLD_PCT = 0.5
+TRIGGER_PCT = 1.5
+TRAILING_CALLBACK = 1.0  # 1.0%
+PERIOD = "60d"
+INTERVAL = "5m"
+
+# ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.16.8 YahooCrawler", page_icon="⚔️", layout="wide")
+st.set_page_config(page_title="Sniper v6.16.9 BacktestIntegrated", page_icon="⚔️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -34,10 +55,7 @@ except:
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
 DB_PATH = "sniper_v616.db"
 
-# [Final Target List]
 DEFAULT_WATCHLIST = "3006 3037 1513 3189 1795 3491 8046 6274"
-
-# [User Inventory]
 DEFAULT_INVENTORY = """2481,84.4,3
 3231,150.14,7
 4566,54.94,2
@@ -199,6 +217,158 @@ def adjust_to_tick(price, method='floor'):
     else:
         return math.floor(price / tick) * tick
 
+def _calculate_intraday_vwap(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    
+    # Timezone Fix
+    df.index = pd.to_datetime(df.index)
+    if df.index.tz is None:
+        df.index = df.index.tz_localize('UTC').tz_convert('Asia/Taipei')
+    else:
+        df.index = df.index.tz_convert('Asia/Taipei')
+
+    df['Date'] = df.index.date
+    df['TP_Vol'] = df['Close'] * df['Volume']
+    df['Cum_Vol'] = df.groupby('Date')['Volume'].cumsum()
+    df['Cum_Val'] = df.groupby('Date')['TP_Vol'].cumsum()
+    df['VWAP'] = df['Cum_Val'] / df['Cum_Vol']
+    return df
+
+def _run_quick_backtest(target_code):
+    """
+    Ported from v3.0.2 Standalone Script with Touch Price Fix
+    """
+    try:
+        # 1. Download Data
+        if target_code.isdigit(): target_code += ".TW"
+        
+        # Daily for Amplitude
+        df_daily = yf.download(target_code, period=PERIOD, interval="1d", progress=False, auto_adjust=True)
+        if isinstance(df_daily.columns, pd.MultiIndex): df_daily.columns = df_daily.columns.get_level_values(0)
+        
+        df_daily['Prev_Close'] = df_daily['Close'].shift(1)
+        df_daily['Amplitude'] = (df_daily['High'] - df_daily['Low']) / df_daily['Prev_Close'] * 100
+        avg_amp_5d = df_daily['Amplitude'].dropna().tail(5).mean()
+        
+        prev_close_map = df_daily['Prev_Close'].dropna().to_dict()
+        prev_close_map = {k.date(): v for k, v in prev_close_map.items()}
+
+        # Intraday Data
+        df = yf.download(target_code, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
+        if df.empty:
+            # Try OTC
+            target_code = target_code.replace(".TW", ".TWO")
+            df = yf.download(target_code, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
+        
+        if df.empty or len(df) < 50: return 0, 0
+
+        # 2. Select Params
+        if avg_amp_5d >= MIN_AMPLITUDE_THRESHOLD: PARAMS = MAD_DOG_PARAMS
+        else: PARAMS = NORMAL_PARAMS
+
+        ENTRY_THRESHOLD = 1 + (ENTRY_THRESHOLD_PCT / 100)
+        ENTRY_CEILING = 1 + (PARAMS['ENTRY_CEILING_PCT'] / 100)
+        TRIGGER = 1 + (TRIGGER_PCT / 100)
+        CALLBACK = TRAILING_CALLBACK / 100
+        STOP_LOSS = 1 - (PARAMS['STOP_LOSS_PCT'] / 100)
+
+        # 3. Process VWAP
+        df = _calculate_intraday_vwap(df)
+        df = df.dropna()
+
+        # 4. Simulation
+        results = []
+        unique_dates = sorted(list(set(df.index.date)))
+        wins, losses = 0, 0
+
+        for trade_date in unique_dates:
+            mask = df['Date'] == trade_date
+            day_data = df.loc[mask]
+            if day_data.empty: continue
+
+            yesterday_close = prev_close_map.get(trade_date)
+            in_pos = False
+            skipping_wave = False
+            
+            entry_p = 0; entry_v = 0
+            daily_executed_trades = 0; daily_wave_count = 0
+            max_p_after_entry = 0; trailing_active = False
+
+            for ts, row in day_data.iterrows():
+                p = float(row['Close'])
+                v = float(row['VWAP'])
+                t = ts.time()
+
+                if daily_executed_trades >= PARAMS['MAX_TRADES_DAY']: break
+
+                # Entry
+                if not in_pos and not skipping_wave:
+                    if t.hour == 9 and t.minute < 10: continue
+                    if t.hour >= 13: continue
+                    
+                    if (v * ENTRY_THRESHOLD) < p < (v * ENTRY_CEILING):
+                        is_chasing_high = False
+                        if yesterday_close:
+                            day_pct_change = (p - yesterday_close) / yesterday_close * 100
+                            if day_pct_change > PARAMS['MAX_DAY_PCT']: is_chasing_high = True
+                        
+                        if not is_chasing_high:
+                            daily_wave_count += 1
+                            should_trade = False
+                            if PARAMS['TARGET_WAVE'] == 0: should_trade = True
+                            elif daily_wave_count == PARAMS['TARGET_WAVE']: should_trade = True
+
+                            if should_trade:
+                                in_pos = True
+                                entry_p = p; entry_v = v
+                                daily_executed_trades += 1
+                                max_p_after_entry = p
+                                trailing_active = False
+                            else: skipping_wave = True
+                        else: skipping_wave = True
+                    else: skipping_wave = True
+                
+                elif skipping_wave:
+                    if p < v * ENTRY_THRESHOLD: skipping_wave = False
+                    if t.hour == 13 and t.minute >= 25: skipping_wave = False
+                
+                # Exit
+                elif in_pos:
+                    exit_price = 0
+                    
+                    # Stop Loss
+                    if p <= entry_v * STOP_LOSS: exit_price = p
+                    
+                    # Trailing Profit (Fixed Logic)
+                    if p > max_p_after_entry: max_p_after_entry = p
+                    if p >= entry_p * TRIGGER: trailing_active = True
+                    
+                    if trailing_active and exit_price == 0:
+                        dynamic_exit = max_p_after_entry * (1 - CALLBACK)
+                        if p <= dynamic_exit:
+                            exit_price = dynamic_exit # <--- Key Fix: Use Calculated Exit
+
+                    # EOD
+                    if t.hour == 13 and t.minute >= 25 and exit_price == 0: exit_price = p
+                    
+                    if exit_price > 0:
+                        ret = (exit_price - entry_p) / entry_p * 100
+                        results.append(ret / 100) # Store as float
+                        if ret > 0: wins += 1
+                        else: losses += 1
+                        in_pos = False
+
+        total = wins + losses
+        win_rate = (wins/total*100) if total > 0 else 0
+        avg_ret = np.mean(results) * 100 if results else 0 # Return as percentage value (e.g. 0.45)
+        
+        return win_rate, avg_ret
+
+    except Exception as e:
+        # print(f"Backtest Error: {e}")
+        return 0, 0
+
 def fetch_static_stats(client, code):
     try:
         suffix = ".TW"
@@ -213,111 +383,11 @@ def fetch_static_stats(client, code):
             vol_5ma = int(last_5_days['Volume'].mean()) // 1000
             price_5ma = float(last_5_days['Close'].mean())
 
-        win_rate, avg_ret = _run_quick_backtest(f"{code}{suffix}")
+        win_rate, avg_ret = _run_quick_backtest(code) # Logic integrated inside
 
         return vol_5ma, vol_yest, price_5ma, win_rate, avg_ret
     except: 
         return 0, 0, 0, 0, 0
-
-def _run_quick_backtest(target_code):
-    try:
-        # [Strategy Update] 
-        # Trigger: VWAP * 1.015 (1.5%)
-        # Trailing: 0.5% Pullback
-        # Stop Loss: VWAP * 0.985 (1.5%)
-        
-        df = yf.download(target_code, period="60d", interval="5m", progress=False, auto_adjust=True)
-        if df.empty: return 0, 0
-        
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-            
-        df.index = pd.to_datetime(df.index)
-        df['Date'] = df.index.date
-        df['TP_Vol'] = df['Close'] * df['Volume']
-        df['Cum_Vol'] = df.groupby('Date')['Volume'].cumsum()
-        df['Cum_Val'] = df.groupby('Date')['TP_Vol'].cumsum()
-        df['VWAP'] = df['Cum_Val'] / df['Cum_Vol']
-        df = df.dropna()
-
-        results = []
-        unique_dates = sorted(list(set(df.index.date)))
-        wins = 0
-        losses = 0
-        
-        ENTRY_MIN = 1.005  
-        ENTRY_MAX = 1.015
-        
-        TRIGGER_PCT = 1.015  # 1.5% Trigger
-        TRAILING_CALLBACK = 0.005 # 0.5% Callback
-        SL_PCT = 0.985       # 1.5% Stop Loss
-
-        for trade_date in unique_dates:
-            mask = df['Date'] == trade_date
-            day_data = df.loc[mask]
-            if day_data.empty: continue
-
-            in_pos = False
-            entry_p = 0
-            entry_v = 0
-            max_p_after_entry = 0
-            trailing_active = False
-            
-            for ts, row in day_data.iterrows():
-                p = float(row['Close'])
-                v = float(row['VWAP'])
-                t = ts.time()
-                
-                if not in_pos:
-                    if t.hour==9 and t.minute<5: continue
-                    if t.hour>=13: continue
-                    
-                    if (v * ENTRY_MIN) < p < (v * ENTRY_MAX):
-                        in_pos = True
-                        entry_p = p
-                        entry_v = v
-                        max_p_after_entry = p
-                        trailing_active = False
-                        
-                elif in_pos:
-                    # 1. Check Stop Loss
-                    if p <= entry_v * SL_PCT:
-                        results.append((p-entry_p)/entry_p)
-                        losses += 1
-                        in_pos = False
-                        break
-                    
-                    # 2. Update Trailing Logic
-                    if p > max_p_after_entry:
-                        max_p_after_entry = p
-                    
-                    # 3. Check Trigger
-                    if p >= entry_v * TRIGGER_PCT:
-                        trailing_active = True
-                    
-                    # 4. Check Trailing Exit
-                    if trailing_active:
-                        exit_threshold = max_p_after_entry * (1 - TRAILING_CALLBACK)
-                        if p <= exit_threshold:
-                            results.append((p-entry_p)/entry_p)
-                            wins += 1 # Locked profit
-                            in_pos = False
-                            break
-                    
-                    # 5. End of Day Exit
-                    if t.hour==13 and t.minute>=25:
-                        res = (p-entry_p)/entry_p
-                        results.append(res)
-                        if res>0: wins+=1
-                        else: losses+=1
-                        in_pos=False
-                        break
-                        
-        total = wins + losses
-        wr = (wins/total*100) if total > 0 else 0
-        av = np.mean(results)*100 if results else 0
-        return wr, av
-    except: return 0, 0
 
 def get_stock_name(symbol):
     try: return twstock.codes[symbol].name if symbol in twstock.codes else symbol
@@ -741,7 +811,7 @@ engine = st.session_state.sniper_engine_core
 # 7. UI (Table Layout)
 # ==========================================
 with st.sidebar:
-    st.title("🛡️ 戰情室 v6.16.8 YahooCrawler")
+    st.title("🛡️ 戰情室 v6.16.9 Integrated")
     st.caption(f"Update: {datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')}")
     st.markdown("---")
 
@@ -873,9 +943,14 @@ table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
         
         is_twii = str(row['code']) == "0000"
 
-        # 顯示勝率
-        name_display = f"{row['name']} ({row.get('win_rate', 0):.0f}%)"
+        # [NEW FORMAT] Name (Win%, ExpRet)
         win_rate = row.get("win_rate", 0)
+        avg_ret = row.get("avg_ret", 0)
+        
+        if is_twii:
+            name_display = row['name']
+        else:
+            name_display = f"{row['name']} ({win_rate:.0f}%, Exp{avg_ret:.2f})"
         
         if not is_twii and win_rate < 50:
             name_display += " <span style='color:#ff4d4f; font-size:0.8em;'>(高風險)</span>"
