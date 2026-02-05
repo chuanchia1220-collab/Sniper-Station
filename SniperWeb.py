@@ -553,7 +553,7 @@ class SniperEngine:
         self.market_stats = {"Time": 0, "Price5MA": 0} 
         self.twii_data = None 
         self.last_reset = datetime.now().date()
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=12)
         self._init_market_stats()
 
     def update_targets(self):
