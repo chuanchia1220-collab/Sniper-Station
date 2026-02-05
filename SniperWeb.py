@@ -11,14 +11,17 @@ import logging
 import numpy as np
 import math
 from bs4 import BeautifulSoup
+import colorama
+from colorama import Fore, Style
 
 # [LOG FIX] Silence yfinance and other non-critical warnings
 warnings.filterwarnings("ignore")
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 pd.set_option('future.no_silent_downcasting', True)
+colorama.init(autoreset=True)
 
 # ==========================================
-# 0. Global Strategy Config (Strictly synced with Backtest)
+# 0. Global Strategy Config (Strictly synced)
 # ==========================================
 MIN_AMPLITUDE_THRESHOLD = 4.0  # 瘋狗股判定標準
 
@@ -50,7 +53,7 @@ INTERVAL = "5m"
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.16.11 TimeWave", page_icon="⚔️", layout="wide")
+st.set_page_config(page_title="Sniper v6.16.12 Full", page_icon="⚔️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -239,125 +242,141 @@ def _calculate_intraday_vwap(df):
     df['VWAP'] = df['Cum_Val'] / df['Cum_Vol']
     return df
 
+# === 終端機/網頁版共用回測邏輯 ===
+def _run_core_backtest(df, params):
+    """
+    核心回測運算 (含波次時間冷卻邏輯)
+    """
+    results = []
+    wins, losses = 0, 0
+    unique_dates = sorted(list(set(df.index.date)))
+
+    ENTRY_THRESHOLD = 1 + (ENTRY_THRESHOLD_PCT / 100)
+    ENTRY_CEILING = 1 + (params['ENTRY_CEILING_PCT'] / 100)
+    TRIGGER = 1 + (TRIGGER_PCT / 100)
+    CALLBACK = TRAILING_CALLBACK / 100
+    STOP_LOSS = 1 - (params['STOP_LOSS_PCT'] / 100)
+
+    for trade_date in unique_dates:
+        mask = df['Date'] == trade_date
+        day_data = df.loc[mask]
+        if day_data.empty: continue
+
+        in_pos = False
+        entry_p = 0; entry_v = 0
+        daily_executed_trades = 0
+        
+        # 波次計數器 (Daily Reset)
+        wave_count = 0
+        last_wave_ts = 0
+        is_holding_wave = False
+        
+        # 取得當日第一根昨收 (模擬用)
+        try: yesterday_close = day_data['Close'].iloc[0] # 簡化
+        except: continue
+
+        max_p_after_entry = 0; trailing_active = False
+
+        for ts, row in day_data.iterrows():
+            p = float(row['Close'])
+            v = float(row['VWAP'])
+            t = ts.time()
+            curr_ts = ts.timestamp()
+
+            if daily_executed_trades >= params['MAX_TRADES_DAY']: break
+
+            # 1. 更新波次 (Time Cool-down Logic)
+            entry_line = v * ENTRY_THRESHOLD
+            if p >= entry_line:
+                if not is_holding_wave:
+                    # 剛突破，檢查冷卻
+                    if (curr_ts - last_wave_ts) > 300: # 5 mins
+                        wave_count += 1
+                        last_wave_ts = curr_ts
+                is_holding_wave = True
+            else:
+                is_holding_wave = False
+
+            # 2. 進場邏輯
+            if not in_pos:
+                if t.hour == 9 and t.minute < 10: continue
+                if t.hour >= 13: continue
+                
+                # 基本價格區間檢查
+                if (v * ENTRY_THRESHOLD) < p < (v * ENTRY_CEILING):
+                    # 追高檢查
+                    day_pct = (p - yesterday_close) / yesterday_close * 100
+                    if day_pct <= params['MAX_DAY_PCT']:
+                        # 波次檢查
+                        should_trade = False
+                        if params['TARGET_WAVE'] == 0: should_trade = True
+                        elif wave_count == params['TARGET_WAVE']: should_trade = True
+                        
+                        if should_trade:
+                            in_pos = True
+                            entry_p = p; entry_v = v
+                            daily_executed_trades += 1
+                            max_p_after_entry = p
+                            trailing_active = False
+
+            # 3. 出場邏輯
+            elif in_pos:
+                exit_price = 0
+                if p <= entry_v * STOP_LOSS: exit_price = p
+                
+                if p > max_p_after_entry: max_p_after_entry = p
+                if p >= entry_p * TRIGGER: trailing_active = True
+                
+                if trailing_active and exit_price == 0:
+                    dynamic_exit = max_p_after_entry * (1 - CALLBACK)
+                    if p <= dynamic_exit: exit_price = dynamic_exit
+
+                if t.hour == 13 and t.minute >= 25 and exit_price == 0: exit_price = p
+                
+                if exit_price > 0:
+                    ret = (exit_price - entry_p) / entry_p * 100
+                    results.append(ret / 100)
+                    if ret > 0: wins += 1
+                    else: losses += 1
+                    in_pos = False
+
+    return results, wins, losses
+
+# 網頁版用的快速回測
 def _run_quick_backtest(target_code):
     try:
         if target_code.isdigit(): target_code += ".TW"
         
-        # Daily for Amplitude
+        # 1. 下載日線算震幅
         df_daily = yf.download(target_code, period=PERIOD, interval="1d", progress=False, auto_adjust=True)
         if isinstance(df_daily.columns, pd.MultiIndex): df_daily.columns = df_daily.columns.get_level_values(0)
-        
         df_daily['Prev_Close'] = df_daily['Close'].shift(1)
         df_daily['Amplitude'] = (df_daily['High'] - df_daily['Low']) / df_daily['Prev_Close'] * 100
         avg_amp_5d = df_daily['Amplitude'].dropna().tail(5).mean()
         if np.isnan(avg_amp_5d): avg_amp_5d = 0
         
-        prev_close_map = df_daily['Prev_Close'].dropna().to_dict()
-        prev_close_map = {k.date(): v for k, v in prev_close_map.items()}
-
-        # Intraday
+        # 2. 下載分K
         df = yf.download(target_code, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
         if df.empty:
             target_code = target_code.replace(".TW", ".TWO")
             df = yf.download(target_code, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
-        
         if df.empty or len(df) < 50: return 0, 0, avg_amp_5d
 
-        # Select Params
+        # 3. 參數選擇
         if avg_amp_5d >= MIN_AMPLITUDE_THRESHOLD: PARAMS = MAD_DOG_PARAMS
         else: PARAMS = NORMAL_PARAMS
 
-        ENTRY_THRESHOLD = 1 + (ENTRY_THRESHOLD_PCT / 100)
-        ENTRY_CEILING = 1 + (PARAMS['ENTRY_CEILING_PCT'] / 100)
-        TRIGGER = 1 + (TRIGGER_PCT / 100)
-        CALLBACK = TRAILING_CALLBACK / 100
-        STOP_LOSS = 1 - (PARAMS['STOP_LOSS_PCT'] / 100)
-
-        df = _calculate_intraday_vwap(df)
-        df = df.dropna()
-
-        results = []
-        unique_dates = sorted(list(set(df.index.date)))
-        wins, losses = 0, 0
-
-        for trade_date in unique_dates:
-            mask = df['Date'] == trade_date
-            day_data = df.loc[mask]
-            if day_data.empty: continue
-
-            yesterday_close = prev_close_map.get(trade_date)
-            in_pos = False
-            skipping_wave = False
-            
-            entry_p = 0; entry_v = 0
-            daily_executed_trades = 0; daily_wave_count = 0
-            max_p_after_entry = 0; trailing_active = False
-
-            for ts, row in day_data.iterrows():
-                p = float(row['Close'])
-                v = float(row['VWAP'])
-                t = ts.time()
-
-                if daily_executed_trades >= PARAMS['MAX_TRADES_DAY']: break
-
-                if not in_pos and not skipping_wave:
-                    if t.hour == 9 and t.minute < 10: continue
-                    if t.hour >= 13: continue
-                    
-                    if (v * ENTRY_THRESHOLD) < p < (v * ENTRY_CEILING):
-                        is_chasing_high = False
-                        if yesterday_close:
-                            day_pct_change = (p - yesterday_close) / yesterday_close * 100
-                            if day_pct_change > PARAMS['MAX_DAY_PCT']: is_chasing_high = True
-                        
-                        if not is_chasing_high:
-                            daily_wave_count += 1
-                            should_trade = False
-                            if PARAMS['TARGET_WAVE'] == 0: should_trade = True
-                            elif daily_wave_count == PARAMS['TARGET_WAVE']: should_trade = True
-
-                            if should_trade:
-                                in_pos = True
-                                entry_p = p; entry_v = v
-                                daily_executed_trades += 1
-                                max_p_after_entry = p
-                                trailing_active = False
-                            else: skipping_wave = True
-                        else: skipping_wave = True
-                    else: skipping_wave = True
-                
-                elif skipping_wave:
-                    if p < v * ENTRY_THRESHOLD: skipping_wave = False
-                    if t.hour == 13 and t.minute >= 25: skipping_wave = False
-                
-                elif in_pos:
-                    exit_price = 0
-                    if p <= entry_v * STOP_LOSS: exit_price = p
-                    
-                    if p > max_p_after_entry: max_p_after_entry = p
-                    if p >= entry_p * TRIGGER: trailing_active = True
-                    
-                    if trailing_active and exit_price == 0:
-                        dynamic_exit = max_p_after_entry * (1 - CALLBACK)
-                        if p <= dynamic_exit: exit_price = dynamic_exit
-
-                    if t.hour == 13 and t.minute >= 25 and exit_price == 0: exit_price = p
-                    
-                    if exit_price > 0:
-                        ret = (exit_price - entry_p) / entry_p * 100
-                        results.append(ret / 100)
-                        if ret > 0: wins += 1
-                        else: losses += 1
-                        in_pos = False
+        df = _calculate_intraday_vwap(df).dropna()
+        
+        # 4. 執行核心回測
+        results, wins, losses = _run_core_backtest(df, PARAMS)
 
         total = wins + losses
         win_rate = (wins/total*100) if total > 0 else 0
         avg_ret = np.mean(results) * 100 if results else 0
         
         return win_rate, avg_ret, avg_amp_5d
-
-    except Exception as e:
-        return 0, 0, 0
+    except: return 0, 0, 0
 
 def fetch_static_stats(client, code):
     try:
@@ -673,7 +692,7 @@ class SniperEngine:
                 self.wave_tracker[code] = {
                     'count': 0,
                     'last_trigger_ts': 0,
-                    'is_holding': False # 紀錄上一刻是否在線之上
+                    'is_holding': False 
                 }
 
             entry_threshold = vwap * 1.005
@@ -681,16 +700,13 @@ class SniperEngine:
             current_ts = now_ts
 
             if price >= entry_threshold:
-                # 如果現在價格在線上
+                # 價格在線上
                 if not tracker['is_holding']:
-                    # 且上一刻在線下 (發生向上突破)
+                    # 剛從線下突破上來
                     # 檢查時間冷卻 (5分鐘 = 300秒)
                     if (current_ts - tracker['last_trigger_ts']) > 300:
                         tracker['count'] += 1
                         tracker['last_trigger_ts'] = current_ts
-                        # 只有在有效計數時，才更新觸發時間
-                    else:
-                        pass # 冷卻中，這次突破不算新的波次
                 tracker['is_holding'] = True
             else:
                 # 價格在線下
@@ -779,199 +795,389 @@ engine = st.session_state.sniper_engine_core
 # ==========================================
 # 7. UI (Table Layout)
 # ==========================================
-with st.sidebar:
-    st.title("🛡️ 戰情室 v6.16.11 TimeWave")
-    st.caption(f"Update: {datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')}")
-    st.markdown("---")
+def render_streamlit_ui():
+    with st.sidebar:
+        st.title("🛡️ 戰情室 v6.16.12 Full")
+        st.caption(f"Update: {datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')}")
+        st.markdown("---")
 
-    mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
-    use_filter = st.checkbox("只看局勢活躍 (>70元)")
+        mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
+        use_filter = st.checkbox("只看局勢活躍 (>70元)")
 
-    if mode == "👨‍✈️ 指揮官":
-        with st.expander("📦 庫存管理", expanded=False):
-            inv_input = st.text_area("庫存清單", DEFAULT_INVENTORY, height=100)
-            if st.button("更新庫存"):
-                db.update_inventory_list(inv_input)
-                time.sleep(0.5); engine.update_targets(); st.rerun()
+        if mode == "👨‍✈️ 指揮官":
+            with st.expander("📦 庫存管理", expanded=False):
+                inv_input = st.text_area("庫存清單", DEFAULT_INVENTORY, height=100)
+                if st.button("更新庫存"):
+                    db.update_inventory_list(inv_input)
+                    time.sleep(0.5); engine.update_targets(); st.rerun()
 
-        with st.expander("🔭 監控設定", expanded=True):
-            raw_input = st.text_area("新選清單", DEFAULT_WATCHLIST, height=150)
-            if st.button("1. 初始化並更新清單", type="primary"):
-                if not API_KEYS: st.error("缺 API Key")
-                else:
-                    db.update_watchlist(raw_input)
-                    time.sleep(0.5)
-                    engine.update_targets()
-                    targets = engine.targets
-                    status = st.status("正在建立戰略數據 (含60天回測)...", expanded=True)
-                    static_list = []
-                    progress_bar = status.progress(0)
+            with st.expander("🔭 監控設定", expanded=True):
+                raw_input = st.text_area("新選清單", DEFAULT_WATCHLIST, height=150)
+                if st.button("1. 初始化並更新清單", type="primary"):
+                    if not API_KEYS: st.error("缺 API Key")
+                    else:
+                        db.update_watchlist(raw_input)
+                        time.sleep(0.5)
+                        engine.update_targets()
+                        targets = engine.targets
+                        status = st.status("正在建立戰略數據 (含60天回測)...", expanded=True)
+                        static_list = []
+                        progress_bar = status.progress(0)
 
-                    for i, code in enumerate(targets):
-                        status.write(f"正在分析 {code} 歷史戰報...")
-                        current_key = API_KEYS[i % len(API_KEYS)]
-                        client = RestClient(api_key=current_key)
-                        vol_5ma, vol_yest, price_5ma, wr, ar, amp = fetch_static_stats(client, code)
-                        static_list.append((code, vol_5ma, vol_yest, price_5ma, wr, ar, amp))
-                        progress_bar.progress((i + 1) / len(targets))
-                        time.sleep(0.1)
+                        for i, code in enumerate(targets):
+                            status.write(f"正在分析 {code} 歷史戰報...")
+                            current_key = API_KEYS[i % len(API_KEYS)]
+                            client = RestClient(api_key=current_key)
+                            vol_5ma, vol_yest, price_5ma, wr, ar, amp = fetch_static_stats(client, code)
+                            static_list.append((code, vol_5ma, vol_yest, price_5ma, wr, ar, amp))
+                            progress_bar.progress((i + 1) / len(targets))
+                            time.sleep(0.1)
 
-                    db.upsert_static(static_list)
-                    engine.update_targets()
-                    status.update(label="戰略數據建立完成！", state="complete")
-                    st.rerun()
-
-            col_a, col_b = st.columns(2)
-            with col_a:
-                if st.button("🟢 啟動監控", disabled=engine.running):
-                    engine.start(); st.toast("核心已啟動"); st.rerun()
-            with col_b:
-                if st.button("🔴 停止監控", disabled=not engine.running):
-                    engine.stop(); st.toast("核心已停止"); st.rerun()
-    st.caption(f"Engine: {'🟢 RUNNING' if engine.running else '🔴 STOPPED'}")
-
-try:
-    from streamlit import fragment
-except ImportError:
-    def fragment(run_every=None):
-        def decorator(func):
-            def wrapper(*args, **kwargs):
-                if run_every:
-                    if "last_frag_run" not in st.session_state: st.session_state.last_frag_run = time.time()
-                    if time.time() - st.session_state.last_frag_run >= run_every:
-                        st.session_state.last_frag_run = time.time()
+                        db.upsert_static(static_list)
+                        engine.update_targets()
+                        status.update(label="戰略數據建立完成！", state="complete")
                         st.rerun()
-                return func(*args, **kwargs)
-            return wrapper
-        return decorator
 
-@fragment(run_every=1.5)
-def render_live_dashboard():
-    with st.expander("📦 庫存戰況 (Inventory)", expanded=False):
-        df_inv = db.get_inventory_view()
-        if not df_inv.empty:
-             st.dataframe(df_inv[['code', 'name', 'situation', 'price', 'pct', 'profit_val', 'signal_level']], hide_index=True)
-        else: st.info("尚無庫存")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    if st.button("🟢 啟動監控", disabled=engine.running):
+                        engine.start(); st.toast("核心已啟動"); st.rerun()
+                with col_b:
+                    if st.button("🔴 停止監控", disabled=not engine.running):
+                        engine.stop(); st.toast("核心已停止"); st.rerun()
+        st.caption(f"Engine: {'🟢 RUNNING' if engine.running else '🔴 STOPPED'}")
 
-    st.markdown("---")
-    st.subheader("⚔️ 精銳監控 (Tactical Table)")
-    df_watch = db.get_watchlist_view()
+    try:
+        from streamlit import fragment
+    except ImportError:
+        def fragment(run_every=None):
+            def decorator(func):
+                def wrapper(*args, **kwargs):
+                    if run_every:
+                        if "last_frag_run" not in st.session_state: st.session_state.last_frag_run = time.time()
+                        if time.time() - st.session_state.last_frag_run >= run_every:
+                            st.session_state.last_frag_run = time.time()
+                            st.rerun()
+                    return func(*args, **kwargs)
+                return wrapper
+            return decorator
+
+    @fragment(run_every=1.5)
+    def render_live_dashboard():
+        with st.expander("📦 庫存戰況 (Inventory)", expanded=False):
+            df_inv = db.get_inventory_view()
+            if not df_inv.empty:
+                st.dataframe(df_inv[['code', 'name', 'situation', 'price', 'pct', 'profit_val', 'signal_level']], hide_index=True)
+            else: st.info("尚無庫存")
+
+        st.markdown("---")
+        st.subheader("⚔️ 精銳監控 (Tactical Table)")
+        df_watch = db.get_watchlist_view()
+        
+        if engine.twii_data:
+            twii_row = pd.DataFrame([engine.twii_data])
+            if not df_watch.empty:
+                for col in df_watch.columns:
+                    if col not in twii_row.columns: twii_row[col] = 0
+                df_watch = pd.concat([twii_row, df_watch], ignore_index=True)
+            else: df_watch = twii_row
+
+        if df_watch.empty: st.info("尚未加入監控標的"); return
+
+        numeric_cols = ['price', 'pct', 'vwap', 'ratio', 'ratio_yest', 'net_10m', 'net_1h', 'net_day', 'price_5ma', 'win_rate', 'avg_ret', 'active_light', 'avg_amp']
+        for col in numeric_cols:
+            if col in df_watch.columns: df_watch[col] = pd.to_numeric(df_watch[col], errors='coerce').fillna(0.0)
+
+        if use_filter: df_watch = df_watch[df_watch['price'] > 70]
+
+        table_start = """
+    <style>
+    table.sniper-table { width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; }
+    table.sniper-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; white-space: nowrap; }
+    table.sniper-table td { padding: 6px; border-bottom: 1px solid #444; font-size: 15px; vertical-align: middle; white-space: nowrap; }
+    table.sniper-table tr.pinned-row { background-color: #fff9c4 !important; color: black !important; }
+    table.sniper-table tr.golden-row { background-color: #fff9c4 !important; color: black !important; font-weight: bold; }
+    table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
+    </style>
+    <table class="sniper-table">
+    <thead>
+    <tr>
+    <th>📌</th><th>代碼</th><th>名稱 (Link)</th><th>訊號</th><th>5MA</th><th>現價</th><th>漲跌%</th>
+    <th>均價 (燈/TP/SL)</th><th>量比 (昨/5日)</th><th>局勢</th><th>大戶 (10m/1H/日)</th>
+    </tr>
+    </thead>
+    <tbody>
+    """
+        html_rows = []
+        for _, row in df_watch.iterrows():
+            situation = str(row.get('situation') or '盤整')
+            event_label = str(row.get('event_label') or '')
+            is_pinned = row.get('is_pinned', 0)
+            row_class = "pinned-row" if is_pinned else ""
+            pin_icon = "📌" if is_pinned else ""
+            is_twii = str(row['code']) == "0000"
+
+            # [NEW FORMAT LOGIC]
+            win_rate = row.get("win_rate", 0)
+            avg_ret = row.get("avg_ret", 0)
+            avg_amp = row.get("avg_amp", 0)
+            
+            name_part = row['name']
+            if not is_twii:
+                name_part = f"{row['name']} ({win_rate:.0f}%, Exp{avg_ret:+.2f})"
+                if win_rate < 50: name_part += " <span style='color:#ff4d4f; font-size:0.8em;'>(高風險)</span>"
+                if avg_amp >= MIN_AMPLITUDE_THRESHOLD: name_part += " <span style='color:#e67e22; font-weight:bold;'>(瘋)</span>"
+
+            # 1. Price
+            main_color = "#ff4d4f" if row['pct'] > 0 else "#2ecc71" if row['pct'] < 0 else "#999999"
+            price_html = f"<span style='color:{main_color}; font-weight:bold'>{row['price']:.2f}</span>"
+            pct_html = f"<span style='color:{main_color}'>{row['pct']:.2f}%</span>"
+
+            # 2. VWAP Light (Strict Logic from DB)
+            active_light = row.get('active_light', 0)
+            vwap_color = "#ff4d4f" if row['price'] >= row['vwap'] else "#2ecc71"
+            
+            if is_twii: vwap_light = ""
+            else:
+                if active_light == 1: vwap_light = "🟢"
+                else: vwap_light = "🔴"
+            
+            vwap_html = f"<span style='color:{vwap_color}'>{row['vwap']:.2f} {vwap_light}</span>"
+            
+            if active_light == 1 or (not is_twii and row['price'] >= row['vwap']):
+                trigger_price = row['vwap'] * 1.005
+                tp_price = adjust_to_tick(trigger_price * 1.02, method='round')
+                sl_price = adjust_to_tick(row['vwap'] * 0.985, method='floor')
+                vwap_html += f"<br><span style='font-size:0.85em; color:#888'>(TP:{tp_price:.1f} / SL:{sl_price:.1f})</span>"
+
+            # 3. 5MA
+            p_5ma = row.get('price_5ma', 0)
+            c_5ma = "#ff4d4f" if row['price'] > p_5ma else "#2ecc71"
+            ma_html = f"<span style='color:{c_5ma}'>{p_5ma:.2f}</span>"
+
+            # 4. Volume
+            thresholds = get_dynamic_thresholds(row['price'])
+            r_yest = row.get('ratio_yest', 0); r_5ma = row['ratio']
+            is_vol_strong = r_5ma >= thresholds['tgt_ratio']
+            vol_light = "🟢" if is_vol_strong else "🔴"
+            c_5ma_r = "#ff4d4f" if is_vol_strong else "#999999"
+            ratio_html = f"{r_yest:.1f} / <span style='color:{c_5ma_r}; font-weight:bold'>{r_5ma:.1f} {vol_light}</span>"
+
+            # 5. Situation
+            sit_color = "#ff4d4f" if "吸籌" in situation or "攻擊" in situation else "#2ecc71" if "倒貨" in situation else "#e67e22" if "吃盤" in situation else "#999999"
+            clean_situation = situation.replace("🔥", "").replace("🛡️", "").replace("💀", "").replace("🎣", "").replace("⚖️", "")
+            situation_html = f"<span style='color:{sit_color}; font-weight:bold'>{clean_situation}</span>"
+            
+            # 6. Link
+            if is_twii: name_html = f'<span style="font-weight:bold;">{name_part}</span>'
+            else: name_html = f'<a href="https://tw.stock.yahoo.com/quote/{row["code"]}.TW" target="_blank" style="text-decoration:none; color:#3498db; font-weight:bold;">{name_part}</a>'
+
+            # 7. Big Player
+            if is_twii: bp_html = "<span style='color:#777'>- / - / -</span>"
+            else:
+                n10 = int(row['net_10m']); n1h = int(row['net_1h']); nd = int(row['net_day'])
+                bp_light = "🟢" if n1h > 0 else "🔴"
+                c10 = "#ff4d4f" if n10 > 0 else "#2ecc71" if n10 < 0 else "#999999"
+                c1h = "#ff4d4f" if n1h > 0 else "#2ecc71" if n1h < 0 else "#999999"
+                cd  = "#ff4d4f" if nd > 0 else "#2ecc71" if nd < 0 else "#999999"
+                bp_html = f"<span style='color:{c10}'>{n10}</span> / <span style='color:{c1h}'>{n1h} {bp_light}</span> / <span style='color:{cd}'>{nd}</span>"
+
+            is_three_lights = (active_light == 1) and (vol_light == "🟢") and (bp_light == "🟢")
+            if is_three_lights: row_class = "golden-row"
+            elif is_pinned: row_class = "pinned-row"
+            else: row_class = ""
+
+            html_rows.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{row["code"]}</td><td>{name_html}</td><td>{event_label}</td><td>{ma_html}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{situation_html}</td><td>{bp_html}</td></tr>')
+
+        st.markdown(table_start + "".join(html_rows) + "</tbody></table>", unsafe_allow_html=True)
+
+    render_live_dashboard()
+
+# ==========================================
+# 8. Console Backtest Mode (Restored)
+# ==========================================
+def run_console_backtest(target_code):
+    print(f"\n{Fore.CYAN}📡 調閱 {target_code} 過去 60 天戰報...{Style.RESET_ALL}")
     
-    if engine.twii_data:
-        twii_row = pd.DataFrame([engine.twii_data])
-        if not df_watch.empty:
-            for col in df_watch.columns:
-                if col not in twii_row.columns: twii_row[col] = 0
-            df_watch = pd.concat([twii_row, df_watch], ignore_index=True)
-        else: df_watch = twii_row
-
-    if df_watch.empty: st.info("尚未加入監控標的"); return
-
-    numeric_cols = ['price', 'pct', 'vwap', 'ratio', 'ratio_yest', 'net_10m', 'net_1h', 'net_day', 'price_5ma', 'win_rate', 'avg_ret', 'active_light', 'avg_amp']
-    for col in numeric_cols:
-        if col in df_watch.columns: df_watch[col] = pd.to_numeric(df_watch[col], errors='coerce').fillna(0.0)
-
-    if use_filter: df_watch = df_watch[df_watch['price'] > 70]
-
-    table_start = """
-<style>
-table.sniper-table { width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; }
-table.sniper-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; white-space: nowrap; }
-table.sniper-table td { padding: 6px; border-bottom: 1px solid #444; font-size: 15px; vertical-align: middle; white-space: nowrap; }
-table.sniper-table tr.pinned-row { background-color: #fff9c4 !important; color: black !important; }
-table.sniper-table tr.golden-row { background-color: #fff9c4 !important; color: black !important; font-weight: bold; }
-table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
-</style>
-<table class="sniper-table">
-<thead>
-<tr>
-<th>📌</th><th>代碼</th><th>名稱 (Link)</th><th>訊號</th><th>5MA</th><th>現價</th><th>漲跌%</th>
-<th>均價 (燈/TP/SL)</th><th>量比 (昨/5日)</th><th>局勢</th><th>大戶 (10m/1H/日)</th>
-</tr>
-</thead>
-<tbody>
-"""
-    html_rows = []
-    for _, row in df_watch.iterrows():
-        situation = str(row.get('situation') or '盤整')
-        event_label = str(row.get('event_label') or '')
-        is_pinned = row.get('is_pinned', 0)
-        row_class = "pinned-row" if is_pinned else ""
-        pin_icon = "📌" if is_pinned else ""
-        is_twii = str(row['code']) == "0000"
-
-        # [NEW FORMAT LOGIC]
-        win_rate = row.get("win_rate", 0)
-        avg_ret = row.get("avg_ret", 0)
-        avg_amp = row.get("avg_amp", 0)
+    # 1. 下載數據
+    try:
+        df_daily = yf.download(target_code, period=PERIOD, interval="1d", progress=False, auto_adjust=True)
+        if isinstance(df_daily.columns, pd.MultiIndex): df_daily.columns = df_daily.columns.get_level_values(0)
+        df_daily['Prev_Close'] = df_daily['Close'].shift(1)
+        df_daily['Amplitude'] = (df_daily['High'] - df_daily['Low']) / df_daily['Prev_Close'] * 100
+        avg_amp_5d = df_daily['Amplitude'].dropna().tail(5).mean()
+        if np.isnan(avg_amp_5d): avg_amp_5d = 0
         
-        name_part = row['name']
-        if not is_twii:
-            name_part = f"{row['name']} ({win_rate:.0f}%, Exp{avg_ret:+.2f})"
-            if win_rate < 50: name_part += " <span style='color:#ff4d4f; font-size:0.8em;'>(高風險)</span>"
-            if avg_amp >= MIN_AMPLITUDE_THRESHOLD: name_part += " <span style='color:#e67e22; font-weight:bold;'>(瘋)</span>"
-
-        # 1. Price
-        main_color = "#ff4d4f" if row['pct'] > 0 else "#2ecc71" if row['pct'] < 0 else "#999999"
-        price_html = f"<span style='color:{main_color}; font-weight:bold'>{row['price']:.2f}</span>"
-        pct_html = f"<span style='color:{main_color}'>{row['pct']:.2f}%</span>"
-
-        # 2. VWAP Light (Strict Logic from DB)
-        active_light = row.get('active_light', 0)
-        vwap_color = "#ff4d4f" if row['price'] >= row['vwap'] else "#2ecc71"
+        df = yf.download(target_code, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
+        if df.empty:
+            target_code = target_code.replace(".TW", ".TWO")
+            df = yf.download(target_code, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
         
-        if is_twii: vwap_light = ""
+        if df.empty or len(df) < 50:
+             print(f"{Fore.YELLOW}⚠️ 警告：資料筆數過少或找不到{Style.RESET_ALL}"); return
+    except Exception as e:
+        print(f"{Fore.RED}❌ 下載失敗: {e}{Style.RESET_ALL}"); return
+
+    # 2. 參數選擇
+    if avg_amp_5d >= MIN_AMPLITUDE_THRESHOLD:
+        PARAMS = MAD_DOG_PARAMS
+        mode_name = f"{Fore.RED}🔥 瘋狗模式 (High Vol){Style.RESET_ALL}"
+    else:
+        PARAMS = NORMAL_PARAMS
+        mode_name = f"{Fore.GREEN}🛡️ 常規模式 (Normal){Style.RESET_ALL}"
+
+    wave_str = "全波段" if PARAMS['TARGET_WAVE'] == 0 else f"第 {PARAMS['TARGET_WAVE']} 波"
+    print(f"📊 均震幅: {avg_amp_5d:.2f}% -> 採用 {mode_name}")
+    print(f"⚙️ 設定: {wave_str} | 日限 {PARAMS['MAX_TRADES_DAY']} 次 | 漲幅限 {PARAMS['MAX_DAY_PCT']}%")
+    print(f"   - 天花板: +{PARAMS['ENTRY_CEILING_PCT']}% | 停損: -{PARAMS['STOP_LOSS_PCT']}%")
+
+    df = _calculate_intraday_vwap(df).dropna()
+
+    # 3. 執行回測 (使用共用核心)
+    # 為了顯示明細，這裡我們不呼叫 _run_core_backtest，而是展開邏輯印出 log
+    # (但邏輯需完全一致)
+    
+    trade_logs = [] 
+    results = []
+    unique_dates = sorted(list(set(df.index.date)))
+    total_wins = 0; total_losses = 0
+
+    ENTRY_THRESHOLD = 1 + (ENTRY_THRESHOLD_PCT / 100)
+    ENTRY_CEILING = 1 + (PARAMS['ENTRY_CEILING_PCT'] / 100)
+    TRIGGER = 1 + (TRIGGER_PCT / 100)
+    CALLBACK = TRAILING_CALLBACK / 100
+    STOP_LOSS = 1 - (PARAMS['STOP_LOSS_PCT'] / 100)
+
+    for trade_date in unique_dates:
+        mask = df['Date'] == trade_date
+        day_data = df.loc[mask]
+        if day_data.empty: continue
+
+        in_pos = False
+        entry_p = 0; entry_v = 0; entry_time_str = ""
+        daily_executed_trades = 0
+        
+        # 波次計數器 (Daily Reset, Time Cooldown)
+        wave_count = 0
+        last_wave_ts = 0
+        is_holding_wave = False
+        
+        try: yesterday_close = day_data['Close'].iloc[0]
+        except: continue
+        max_p_after_entry = 0; trailing_active = False
+
+        for ts, row in day_data.iterrows():
+            p = float(row['Close']); v = float(row['VWAP']); t = ts.time(); curr_ts = ts.timestamp()
+
+            if daily_executed_trades >= PARAMS['MAX_TRADES_DAY']: break
+
+            # 1. 更新波次 (Time Cooldown)
+            entry_line = v * ENTRY_THRESHOLD
+            if p >= entry_line:
+                if not is_holding_wave:
+                    if (curr_ts - last_wave_ts) > 300: # 5 mins
+                        wave_count += 1
+                        last_wave_ts = curr_ts
+                is_holding_wave = True
+            else:
+                is_holding_wave = False
+
+            # 2. 進場
+            if not in_pos:
+                if t.hour == 9 and t.minute < 10: continue
+                if t.hour >= 13: continue
+                
+                if (v * ENTRY_THRESHOLD) < p < (v * ENTRY_CEILING):
+                    day_pct = (p - yesterday_close) / yesterday_close * 100
+                    if day_pct <= PARAMS['MAX_DAY_PCT']:
+                        should_trade = False
+                        if PARAMS['TARGET_WAVE'] == 0: should_trade = True
+                        elif wave_count == PARAMS['TARGET_WAVE']: should_trade = True
+                        
+                        if should_trade:
+                            in_pos = True
+                            entry_p = p; entry_v = v; entry_time_str = t.strftime("%H:%M")
+                            daily_executed_trades += 1
+                            max_p_after_entry = p
+                            trailing_active = False
+
+            # 3. 出場
+            elif in_pos:
+                exit_price = 0; exit_reason = ""
+                if p <= entry_v * STOP_LOSS: exit_price = p; exit_reason = "停損"
+                
+                if p > max_p_after_entry: max_p_after_entry = p
+                if p >= entry_p * TRIGGER: trailing_active = True
+                
+                if trailing_active and exit_price == 0:
+                    dynamic_exit = max_p_after_entry * (1 - CALLBACK)
+                    if p <= dynamic_exit: exit_price = dynamic_exit; exit_reason = "鎖利"
+
+                if t.hour == 13 and t.minute >= 25 and exit_price == 0: exit_price = p; exit_reason = "尾盤"
+
+                if exit_price > 0:
+                    ret = (exit_price - entry_p) / entry_p * 100
+                    results.append(ret / 100)
+                    if ret > 0: total_wins += 1
+                    else: total_losses += 1
+                    color = Fore.RED if ret < 0 else Fore.GREEN
+                    trade_logs.append({"date": trade_date, "time": entry_time_str, "buy": entry_p, "sell": exit_price, "ret": ret, "reason": exit_reason, "color": color})
+                    in_pos = False
+
+    total_trades = total_wins + total_losses
+    if total_trades == 0:
+        print(f"{Fore.YELLOW}⚠️ 無交易紀錄。{Style.RESET_ALL}")
+        return
+
+    print(f"\n📝 {Fore.YELLOW}交易明細 (日期 | 時間 | 進場 | 出場 | 損益){Style.RESET_ALL}")
+    print("-" * 60)
+    for log in trade_logs:
+        print(f"{log['date']} | {log['time']} | {log['buy']:.1f} | {log['sell']:.1f} | {log['color']}{log['ret']:+5.2f}%{Style.RESET_ALL} ({log['reason']})")
+    print("-" * 60)
+
+    win_rate = (total_wins / total_trades * 100)
+    avg_profit = np.mean(results) * 100
+
+    print(f"📊 總結報告:")
+    print(f"   交易次數: {total_trades} (勝 {total_wins} / 敗 {total_losses})")
+    print(f"   勝率: {Fore.GREEN if win_rate >= 50 else Fore.RED}{win_rate:.2f}%{Style.RESET_ALL}")
+    print(f"   平均報酬: {Fore.GREEN if avg_profit > 0 else Fore.RED}{avg_profit:+.2f}%{Style.RESET_ALL} (不含稅費)")
+
+# ==========================================
+# 9. Main Dispatcher
+# ==========================================
+if __name__ == "__main__":
+    # 如果是 Streamlit 執行，會有環境變數或直接跑 script
+    # 但最簡單的方法是檢查是否在 Streamlit 環境下
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        if get_script_run_ctx():
+            render_streamlit_ui()
         else:
-             if active_light == 1: vwap_light = "🟢"
-             else: vwap_light = "🔴"
-        
-        vwap_html = f"<span style='color:{vwap_color}'>{row['vwap']:.2f} {vwap_light}</span>"
-        
-        if active_light == 1 or (not is_twii and row['price'] >= row['vwap']):
-            trigger_price = row['vwap'] * 1.005
-            tp_price = adjust_to_tick(trigger_price * 1.02, method='round')
-            sl_price = adjust_to_tick(row['vwap'] * 0.985, method='floor')
-            vwap_html += f"<br><span style='font-size:0.85em; color:#888'>(TP:{tp_price:.1f} / SL:{sl_price:.1f})</span>"
-
-        # 3. 5MA
-        p_5ma = row.get('price_5ma', 0)
-        c_5ma = "#ff4d4f" if row['price'] > p_5ma else "#2ecc71"
-        ma_html = f"<span style='color:{c_5ma}'>{p_5ma:.2f}</span>"
-
-        # 4. Volume
-        thresholds = get_dynamic_thresholds(row['price'])
-        r_yest = row.get('ratio_yest', 0); r_5ma = row['ratio']
-        is_vol_strong = r_5ma >= thresholds['tgt_ratio']
-        vol_light = "🟢" if is_vol_strong else "🔴"
-        c_5ma_r = "#ff4d4f" if is_vol_strong else "#999999"
-        ratio_html = f"{r_yest:.1f} / <span style='color:{c_5ma_r}; font-weight:bold'>{r_5ma:.1f} {vol_light}</span>"
-
-        # 5. Situation
-        sit_color = "#ff4d4f" if "吸籌" in situation or "攻擊" in situation else "#2ecc71" if "倒貨" in situation else "#e67e22" if "吃盤" in situation else "#999999"
-        clean_situation = situation.replace("🔥", "").replace("🛡️", "").replace("💀", "").replace("🎣", "").replace("⚖️", "")
-        situation_html = f"<span style='color:{sit_color}; font-weight:bold'>{clean_situation}</span>"
-        
-        # 6. Link
-        if is_twii: name_html = f'<span style="font-weight:bold;">{name_part}</span>'
-        else: name_html = f'<a href="https://tw.stock.yahoo.com/quote/{row["code"]}.TW" target="_blank" style="text-decoration:none; color:#3498db; font-weight:bold;">{name_part}</a>'
-
-        # 7. Big Player
-        if is_twii: bp_html = "<span style='color:#777'>- / - / -</span>"
-        else:
-            n10 = int(row['net_10m']); n1h = int(row['net_1h']); nd = int(row['net_day'])
-            bp_light = "🟢" if n1h > 0 else "🔴"
-            c10 = "#ff4d4f" if n10 > 0 else "#2ecc71" if n10 < 0 else "#999999"
-            c1h = "#ff4d4f" if n1h > 0 else "#2ecc71" if n1h < 0 else "#999999"
-            cd  = "#ff4d4f" if nd > 0 else "#2ecc71" if nd < 0 else "#999999"
-            bp_html = f"<span style='color:{c10}'>{n10}</span> / <span style='color:{c1h}'>{n1h} {bp_light}</span> / <span style='color:{cd}'>{nd}</span>"
-
-        is_three_lights = (active_light == 1) and (vol_light == "🟢") and (bp_light == "🟢")
-        if is_three_lights: row_class = "golden-row"
-        elif is_pinned: row_class = "pinned-row"
-        else: row_class = ""
-
-        html_rows.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{row["code"]}</td><td>{name_html}</td><td>{event_label}</td><td>{ma_html}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{situation_html}</td><td>{bp_html}</td></tr>')
-
-    st.markdown(table_start + "".join(html_rows) + "</tbody></table>", unsafe_allow_html=True)
-
-render_live_dashboard()
+            # 終端機模式
+            os.system('cls' if os.name == 'nt' else 'clear')
+            print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.12 (Time Wave){Style.RESET_ALL}")
+            while True:
+                try:
+                    user_input = input(f"\n請輸入股票代碼 (輸入 q 離開): ").strip().upper()
+                    if user_input in ['Q', 'EXIT', 'QUIT']: break
+                    if not user_input: continue
+                    if user_input.isdigit(): target = f"{user_input}.TW"
+                    else: target = user_input
+                    run_console_backtest(target)
+                except KeyboardInterrupt: break
+                except Exception as e: print(f"錯誤: {e}")
+    except ModuleNotFoundError:
+        # 如果沒裝 streamlit，直接跑終端機模式
+        os.system('cls' if os.name == 'nt' else 'clear')
+        print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.12 (Time Wave){Style.RESET_ALL}")
+        while True:
+            try:
+                user_input = input(f"\n請輸入股票代碼 (輸入 q 離開): ").strip().upper()
+                if user_input in ['Q', 'EXIT', 'QUIT']: break
+                if not user_input: continue
+                if user_input.isdigit(): target = f"{user_input}.TW"
+                else: target = user_input
+                run_console_backtest(target)
+            except KeyboardInterrupt: break
+            except Exception as e: print(f"錯誤: {e}")
