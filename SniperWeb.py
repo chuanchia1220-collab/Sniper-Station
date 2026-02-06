@@ -53,7 +53,7 @@ INTERVAL = "5m"
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.16.12 Full", page_icon="⚔️", layout="wide")
+st.set_page_config(page_title="Sniper v6.16.14 Stable", page_icon="⚔️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -700,45 +700,30 @@ class SniperEngine:
             current_ts = now_ts
 
             if price >= entry_threshold:
-                # 價格在線上
                 if not tracker['is_holding']:
-                    # 剛從線下突破上來
-                    # 檢查時間冷卻 (5分鐘 = 300秒)
                     if (current_ts - tracker['last_trigger_ts']) > 300:
                         tracker['count'] += 1
                         tracker['last_trigger_ts'] = current_ts
                 tracker['is_holding'] = True
             else:
-                # 價格在線下
                 tracker['is_holding'] = False
             
-            # === 策略參數選擇 ===
             if avg_amp >= MIN_AMPLITUDE_THRESHOLD: PARAMS = MAD_DOG_PARAMS
             else: PARAMS = NORMAL_PARAMS
             
-            # === 嚴格亮燈檢查 ===
             active_light = 0 
-            
-            # A. 時間濾網 (>09:05)
             time_ok = now_time.time() >= dt_time(9, 5)
             
-            # B. 波次濾網
             if PARAMS['TARGET_WAVE'] == 0: wave_ok = True
             else: wave_ok = (tracker['count'] == PARAMS['TARGET_WAVE'])
             
-            # C. 漲幅天花板
             pct_ok = pct <= PARAMS['MAX_DAY_PCT']
-            
-            # D. 追高天花板
             ceiling_price = vwap * (1 + PARAMS['ENTRY_CEILING_PCT']/100)
             ceiling_ok = price <= ceiling_price
-            
-            # E. 價位基本門檻
             threshold_ok = price >= entry_threshold
 
             if time_ok and wave_ok and pct_ok and ceiling_ok and threshold_ok:
                 active_light = 1
-            # ============================================
 
             thresholds = get_dynamic_thresholds(price)
             raw_state = check_signal(pct, is_bullish, net_day, net_1h, ratio_5ma, thresholds, is_breakdown, price, vwap, code in self.active_flags, now_time, vol_lots)
@@ -766,28 +751,33 @@ class SniperEngine:
 
     def _run_loop(self):
         while self.running:
-            now = datetime.now(timezone.utc) + timedelta(hours=8)
-            if now.date() > self.last_reset:
-                self.active_flags = {}; self.daily_risk_flags = {}; self.daily_net = {}; self.prev_data = {}; self.vol_queues = {}; self.base_vol_cache = {}; self.wave_tracker = {}
-                notification_manager.reset_daily_state()
-                self.last_reset = now.date()
+            try:
+                now = datetime.now(timezone.utc) + timedelta(hours=8)
+                if now.date() > self.last_reset:
+                    self.active_flags = {}; self.daily_risk_flags = {}; self.daily_net = {}; self.prev_data = {}; self.vol_queues = {}; self.base_vol_cache = {}; self.wave_tracker = {}
+                    notification_manager.reset_daily_state()
+                    self.last_reset = now.date()
 
-            self._update_market_thermometer()
-            targets = db.get_all_codes()
-            self.inventory_codes = db.get_inventory_codes()
-            pinned_codes = db.get_pinned_codes()
-            if not targets: time.sleep(2); continue
+                self._update_market_thermometer()
+                targets = db.get_all_codes()
+                self.inventory_codes = db.get_inventory_codes()
+                pinned_codes = db.get_pinned_codes()
+                if not targets: time.sleep(2); continue
 
-            inv_set = set(self.inventory_codes); pin_set = set(pinned_codes)
-            def priority_key(code): return 0 if code in inv_set else 1 if code in pin_set else 2
-            targets.sort(key=priority_key)
+                inv_set = set(self.inventory_codes); pin_set = set(pinned_codes)
+                def priority_key(code): return 0 if code in inv_set else 1 if code in pin_set else 2
+                targets.sort(key=priority_key)
 
-            batch = []
-            futures = [self.executor.submit(self._fetch_stock, c, now) for c in targets]
-            for f in concurrent.futures.as_completed(futures):
-                if f.result(): batch.append(f.result())
-            db.upsert_realtime_batch(batch)
-            time.sleep(1.5 if MarketSession.is_market_open(now) else 5)
+                batch = []
+                futures = [self.executor.submit(self._fetch_stock, c, now) for c in targets]
+                for f in concurrent.futures.as_completed(futures):
+                    if f.result(): batch.append(f.result())
+                db.upsert_realtime_batch(batch)
+                time.sleep(1.5 if MarketSession.is_market_open(now) else 5)
+            except Exception as e:
+                # [FIXED] Catch loop errors to prevent thread death
+                print(f"Engine Loop Error: {e}")
+                time.sleep(5)
 
 if "sniper_engine_core" not in st.session_state: st.session_state.sniper_engine_core = SniperEngine()
 engine = st.session_state.sniper_engine_core
@@ -797,7 +787,7 @@ engine = st.session_state.sniper_engine_core
 # ==========================================
 def render_streamlit_ui():
     with st.sidebar:
-        st.title("🛡️ 戰情室 v6.16.12 Full")
+        st.title("🛡️ 戰情室 v6.16.14 Full")
         st.caption(f"Update: {datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')}")
         st.markdown("---")
 
@@ -1034,9 +1024,6 @@ def run_console_backtest(target_code):
     df = _calculate_intraday_vwap(df).dropna()
 
     # 3. 執行回測 (使用共用核心)
-    # 為了顯示明細，這裡我們不呼叫 _run_core_backtest，而是展開邏輯印出 log
-    # (但邏輯需完全一致)
-    
     trade_logs = [] 
     results = []
     unique_dates = sorted(list(set(df.index.date)))
@@ -1147,16 +1134,13 @@ def run_console_backtest(target_code):
 # 9. Main Dispatcher
 # ==========================================
 if __name__ == "__main__":
-    # 如果是 Streamlit 執行，會有環境變數或直接跑 script
-    # 但最簡單的方法是檢查是否在 Streamlit 環境下
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
         if get_script_run_ctx():
             render_streamlit_ui()
         else:
-            # 終端機模式
             os.system('cls' if os.name == 'nt' else 'clear')
-            print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.12 (Time Wave){Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.14 (Time Wave){Style.RESET_ALL}")
             while True:
                 try:
                     user_input = input(f"\n請輸入股票代碼 (輸入 q 離開): ").strip().upper()
@@ -1168,9 +1152,8 @@ if __name__ == "__main__":
                 except KeyboardInterrupt: break
                 except Exception as e: print(f"錯誤: {e}")
     except ModuleNotFoundError:
-        # 如果沒裝 streamlit，直接跑終端機模式
         os.system('cls' if os.name == 'nt' else 'clear')
-        print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.12 (Time Wave){Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.14 (Time Wave){Style.RESET_ALL}")
         while True:
             try:
                 user_input = input(f"\n請輸入股票代碼 (輸入 q 離開): ").strip().upper()
