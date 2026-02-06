@@ -11,14 +11,22 @@ import logging
 import numpy as np
 import math
 from bs4 import BeautifulSoup
-import colorama
-from colorama import Fore, Style
+
+# [FIX] Colorama 防呆機制
+try:
+    import colorama
+    from colorama import Fore, Style
+    colorama.init(autoreset=True)
+except ImportError:
+    class MockColor:
+        def __getattr__(self, name): return ""
+    Fore = Style = MockColor()
+    colorama = None
 
 # [LOG FIX] Silence yfinance and other non-critical warnings
 warnings.filterwarnings("ignore")
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 pd.set_option('future.no_silent_downcasting', True)
-colorama.init(autoreset=True)
 
 # ==========================================
 # 0. Global Strategy Config (Strictly synced)
@@ -27,20 +35,20 @@ MIN_AMPLITUDE_THRESHOLD = 4.0  # 瘋狗股判定標準
 
 # [🅰️ 瘋狗股參數]
 MAD_DOG_PARAMS = {
-    'TARGET_WAVE': 2,           # 只做第 2 波 (嚴格執行時間冷卻)
+    'TARGET_WAVE': 2,           # 只做第 2 波
     'MAX_TRADES_DAY': 2,
-    'ENTRY_CEILING_PCT': 4.0,   # 天花板: 允許追高到 +4.0%
+    'ENTRY_CEILING_PCT': 4.0,   
     'STOP_LOSS_PCT': 2.0,
-    'MAX_DAY_PCT': 3.5          # 當日漲幅 > 3.5% 不亮燈
+    'MAX_DAY_PCT': 3.5          
 }
 
 # [🅱️ 常規股參數]
 NORMAL_PARAMS = {
-    'TARGET_WAVE': 0,           # 0=不限波次
+    'TARGET_WAVE': 0,           
     'MAX_TRADES_DAY': 2,
-    'ENTRY_CEILING_PCT': 2.0,   # 天花板: 只追到 +2.0%
+    'ENTRY_CEILING_PCT': 2.0,   
     'STOP_LOSS_PCT': 0.0,
-    'MAX_DAY_PCT': 2.5          # 當日漲幅 > 2.5% 不亮燈
+    'MAX_DAY_PCT': 2.5          
 }
 
 # [共通設定]
@@ -53,7 +61,7 @@ INTERVAL = "5m"
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.16.14 Stable", page_icon="⚔️", layout="wide")
+st.set_page_config(page_title="Sniper v6.16.15 BuySignal", page_icon="⚔️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -271,8 +279,7 @@ def _run_core_backtest(df, params):
         last_wave_ts = 0
         is_holding_wave = False
         
-        # 取得當日第一根昨收 (模擬用)
-        try: yesterday_close = day_data['Close'].iloc[0] # 簡化
+        try: yesterday_close = day_data['Close'].iloc[0] 
         except: continue
 
         max_p_after_entry = 0; trailing_active = False
@@ -302,12 +309,9 @@ def _run_core_backtest(df, params):
                 if t.hour == 9 and t.minute < 10: continue
                 if t.hour >= 13: continue
                 
-                # 基本價格區間檢查
                 if (v * ENTRY_THRESHOLD) < p < (v * ENTRY_CEILING):
-                    # 追高檢查
                     day_pct = (p - yesterday_close) / yesterday_close * 100
                     if day_pct <= params['MAX_DAY_PCT']:
-                        # 波次檢查
                         should_trade = False
                         if params['TARGET_WAVE'] == 0: should_trade = True
                         elif wave_count == params['TARGET_WAVE']: should_trade = True
@@ -347,7 +351,6 @@ def _run_quick_backtest(target_code):
     try:
         if target_code.isdigit(): target_code += ".TW"
         
-        # 1. 下載日線算震幅
         df_daily = yf.download(target_code, period=PERIOD, interval="1d", progress=False, auto_adjust=True)
         if isinstance(df_daily.columns, pd.MultiIndex): df_daily.columns = df_daily.columns.get_level_values(0)
         df_daily['Prev_Close'] = df_daily['Close'].shift(1)
@@ -355,20 +358,16 @@ def _run_quick_backtest(target_code):
         avg_amp_5d = df_daily['Amplitude'].dropna().tail(5).mean()
         if np.isnan(avg_amp_5d): avg_amp_5d = 0
         
-        # 2. 下載分K
         df = yf.download(target_code, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
         if df.empty:
             target_code = target_code.replace(".TW", ".TWO")
             df = yf.download(target_code, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
         if df.empty or len(df) < 50: return 0, 0, avg_amp_5d
 
-        # 3. 參數選擇
         if avg_amp_5d >= MIN_AMPLITUDE_THRESHOLD: PARAMS = MAD_DOG_PARAMS
         else: PARAMS = NORMAL_PARAMS
 
         df = _calculate_intraday_vwap(df).dropna()
-        
-        # 4. 執行核心回測
         results, wins, losses = _run_core_backtest(df, PARAMS)
 
         total = wins + losses
@@ -547,7 +546,6 @@ class SniperEngine:
         self.prev_data = {}
         self.active_flags = {}
         self.daily_risk_flags = {}
-        # New: Time-based Wave Tracker
         self.wave_tracker = {}
         
         self.market_stats = {"Time": 0, "Price5MA": 0} 
@@ -775,7 +773,6 @@ class SniperEngine:
                 db.upsert_realtime_batch(batch)
                 time.sleep(1.5 if MarketSession.is_market_open(now) else 5)
             except Exception as e:
-                # [FIXED] Catch loop errors to prevent thread death
                 print(f"Engine Loop Error: {e}")
                 time.sleep(5)
 
@@ -787,7 +784,7 @@ engine = st.session_state.sniper_engine_core
 # ==========================================
 def render_streamlit_ui():
     with st.sidebar:
-        st.title("🛡️ 戰情室 v6.16.14 Full")
+        st.title("🛡️ 戰情室 v6.16.15 BuySignal")
         st.caption(f"Update: {datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')}")
         st.markdown("---")
 
@@ -893,7 +890,7 @@ def render_streamlit_ui():
     <thead>
     <tr>
     <th>📌</th><th>代碼</th><th>名稱 (Link)</th><th>訊號</th><th>5MA</th><th>現價</th><th>漲跌%</th>
-    <th>均價 (燈/TP/SL)</th><th>量比 (昨/5日)</th><th>局勢</th><th>大戶 (10m/1H/日)</th>
+    <th>均價 (燈/Buy/TP/SL)</th><th>量比 (昨/5日)</th><th>局勢</th><th>大戶 (10m/1H/日)</th>
     </tr>
     </thead>
     <tbody>
@@ -927,14 +924,21 @@ def render_streamlit_ui():
             active_light = row.get('active_light', 0)
             vwap_color = "#ff4d4f" if row['price'] >= row['vwap'] else "#2ecc71"
             
-            if is_twii: vwap_light = ""
+            if is_twii: 
+                vwap_light = ""
+                buy_html = ""
             else:
                 if active_light == 1: vwap_light = "🟢"
                 else: vwap_light = "🔴"
+                
+                # Calculate Buy Price (Trigger) for display
+                trigger_val = row['vwap'] * 1.005
+                buy_price = adjust_to_tick(trigger_val, method='round')
+                buy_html = f"<span style='color:#e67e22; font-weight:bold; margin-left:4px;'>Buy:{buy_price:.2f}</span>"
             
-            vwap_html = f"<span style='color:{vwap_color}'>{row['vwap']:.2f} {vwap_light}</span>"
+            vwap_html = f"<span style='color:{vwap_color}'>{row['vwap']:.2f} {vwap_light}</span> {buy_html}"
             
-            if active_light == 1 or (not is_twii and row['price'] >= row['vwap']):
+            if not is_twii:
                 trigger_price = row['vwap'] * 1.005
                 tp_price = adjust_to_tick(trigger_price * 1.02, method='round')
                 sl_price = adjust_to_tick(row['vwap'] * 0.985, method='floor')
@@ -988,8 +992,6 @@ def render_streamlit_ui():
 # ==========================================
 def run_console_backtest(target_code):
     print(f"\n{Fore.CYAN}📡 調閱 {target_code} 過去 60 天戰報...{Style.RESET_ALL}")
-    
-    # 1. 下載數據
     try:
         df_daily = yf.download(target_code, period=PERIOD, interval="1d", progress=False, auto_adjust=True)
         if isinstance(df_daily.columns, pd.MultiIndex): df_daily.columns = df_daily.columns.get_level_values(0)
@@ -1008,7 +1010,6 @@ def run_console_backtest(target_code):
     except Exception as e:
         print(f"{Fore.RED}❌ 下載失敗: {e}{Style.RESET_ALL}"); return
 
-    # 2. 參數選擇
     if avg_amp_5d >= MIN_AMPLITUDE_THRESHOLD:
         PARAMS = MAD_DOG_PARAMS
         mode_name = f"{Fore.RED}🔥 瘋狗模式 (High Vol){Style.RESET_ALL}"
@@ -1022,11 +1023,7 @@ def run_console_backtest(target_code):
     print(f"   - 天花板: +{PARAMS['ENTRY_CEILING_PCT']}% | 停損: -{PARAMS['STOP_LOSS_PCT']}%")
 
     df = _calculate_intraday_vwap(df).dropna()
-
-    # 3. 執行回測 (使用共用核心)
-    trade_logs = [] 
-    results = []
-    unique_dates = sorted(list(set(df.index.date)))
+    trade_logs = []; results = []; unique_dates = sorted(list(set(df.index.date)))
     total_wins = 0; total_losses = 0
 
     ENTRY_THRESHOLD = 1 + (ENTRY_THRESHOLD_PCT / 100)
@@ -1040,14 +1037,8 @@ def run_console_backtest(target_code):
         day_data = df.loc[mask]
         if day_data.empty: continue
 
-        in_pos = False
-        entry_p = 0; entry_v = 0; entry_time_str = ""
-        daily_executed_trades = 0
-        
-        # 波次計數器 (Daily Reset, Time Cooldown)
-        wave_count = 0
-        last_wave_ts = 0
-        is_holding_wave = False
+        in_pos = False; entry_p = 0; entry_v = 0; entry_time_str = ""; daily_executed_trades = 0
+        wave_count = 0; last_wave_ts = 0; is_holding_wave = False
         
         try: yesterday_close = day_data['Close'].iloc[0]
         except: continue
@@ -1058,7 +1049,6 @@ def run_console_backtest(target_code):
 
             if daily_executed_trades >= PARAMS['MAX_TRADES_DAY']: break
 
-            # 1. 更新波次 (Time Cooldown)
             entry_line = v * ENTRY_THRESHOLD
             if p >= entry_line:
                 if not is_holding_wave:
@@ -1069,7 +1059,6 @@ def run_console_backtest(target_code):
             else:
                 is_holding_wave = False
 
-            # 2. 進場
             if not in_pos:
                 if t.hour == 9 and t.minute < 10: continue
                 if t.hour >= 13: continue
@@ -1088,7 +1077,6 @@ def run_console_backtest(target_code):
                             max_p_after_entry = p
                             trailing_active = False
 
-            # 3. 出場
             elif in_pos:
                 exit_price = 0; exit_reason = ""
                 if p <= entry_v * STOP_LOSS: exit_price = p; exit_reason = "停損"
@@ -1140,7 +1128,7 @@ if __name__ == "__main__":
             render_streamlit_ui()
         else:
             os.system('cls' if os.name == 'nt' else 'clear')
-            print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.14 (Time Wave){Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.15 (BuySignal){Style.RESET_ALL}")
             while True:
                 try:
                     user_input = input(f"\n請輸入股票代碼 (輸入 q 離開): ").strip().upper()
@@ -1153,7 +1141,7 @@ if __name__ == "__main__":
                 except Exception as e: print(f"錯誤: {e}")
     except ModuleNotFoundError:
         os.system('cls' if os.name == 'nt' else 'clear')
-        print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.14 (Time Wave){Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.15 (BuySignal){Style.RESET_ALL}")
         while True:
             try:
                 user_input = input(f"\n請輸入股票代碼 (輸入 q 離開): ").strip().upper()
