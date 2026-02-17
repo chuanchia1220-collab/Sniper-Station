@@ -11,6 +11,7 @@ import logging
 import numpy as np
 import math
 from bs4 import BeautifulSoup
+import plotly.graph_objects as go  # [新增] 繪圖庫
 
 # [FIX] Colorama 防呆機制
 try:
@@ -61,7 +62,7 @@ INTERVAL = "5m"
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.16.15 BuySignal", page_icon="⚔️", layout="wide")
+st.set_page_config(page_title="Sniper v6.17 ProChart", page_icon="⚔️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -73,7 +74,7 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v616.db"
+DB_PATH = "sniper_v617.db"
 
 DEFAULT_WATCHLIST = "3006 3037 1513 3189 1795 3491 8046 6274"
 DEFAULT_INVENTORY = """2481,84.4,3
@@ -233,6 +234,37 @@ def adjust_to_tick(price, method='floor'):
     else:
         return math.floor(price / tick) * tick
 
+# [新增] 繪製 K 線圖函數 (含快取)
+@st.cache_data(ttl=60)
+def get_chart_figure(code):
+    try:
+        suffix = ".TWO" if code in twstock.codes and twstock.codes[code].market == '上櫃' else ".TW"
+        # 抓取近 1 個月資料，日 K
+        df = yf.download(f"{code}{suffix}", period="1mo", interval="1d", progress=False)
+        
+        if df.empty: return None
+        
+        fig = go.Figure(data=[go.Candlestick(
+            x=df.index,
+            open=df['Open'], high=df['High'],
+            low=df['Low'], close=df['Close'],
+            increasing_line_color='#ef5350',  # 漲-紅
+            decreasing_line_color='#26a69a',  # 跌-綠
+            showlegend=False
+        )])
+        
+        fig.update_layout(
+            margin=dict(l=0, r=0, t=0, b=0),
+            height=120,
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            xaxis=dict(visible=False, fixedrange=True),
+            yaxis=dict(visible=False, fixedrange=True)
+        )
+        return fig
+    except:
+        return None
+
 def _calculate_intraday_vwap(df):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -252,9 +284,6 @@ def _calculate_intraday_vwap(df):
 
 # === 終端機/網頁版共用回測邏輯 ===
 def _run_core_backtest(df, params):
-    """
-    核心回測運算 (含波次時間冷卻邏輯)
-    """
     results = []
     wins, losses = 0, 0
     unique_dates = sorted(list(set(df.index.date)))
@@ -274,7 +303,6 @@ def _run_core_backtest(df, params):
         entry_p = 0; entry_v = 0
         daily_executed_trades = 0
         
-        # 波次計數器 (Daily Reset)
         wave_count = 0
         last_wave_ts = 0
         is_holding_wave = False
@@ -292,11 +320,9 @@ def _run_core_backtest(df, params):
 
             if daily_executed_trades >= params['MAX_TRADES_DAY']: break
 
-            # 1. 更新波次 (Time Cool-down Logic)
             entry_line = v * ENTRY_THRESHOLD
             if p >= entry_line:
                 if not is_holding_wave:
-                    # 剛突破，檢查冷卻
                     if (curr_ts - last_wave_ts) > 300: # 5 mins
                         wave_count += 1
                         last_wave_ts = curr_ts
@@ -304,7 +330,6 @@ def _run_core_backtest(df, params):
             else:
                 is_holding_wave = False
 
-            # 2. 進場邏輯
             if not in_pos:
                 if t.hour == 9 and t.minute < 10: continue
                 if t.hour >= 13: continue
@@ -323,7 +348,6 @@ def _run_core_backtest(df, params):
                             max_p_after_entry = p
                             trailing_active = False
 
-            # 3. 出場邏輯
             elif in_pos:
                 exit_price = 0
                 if p <= entry_v * STOP_LOSS: exit_price = p
@@ -784,7 +808,7 @@ engine = st.session_state.sniper_engine_core
 # ==========================================
 def render_streamlit_ui():
     with st.sidebar:
-        st.title("🛡️ 戰情室 v6.16.15 BuySignal")
+        st.title("🛡️ 戰情室 v6.17 ProChart")
         st.caption(f"Update: {datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')}")
         st.markdown("---")
 
@@ -858,9 +882,9 @@ def render_streamlit_ui():
             else: st.info("尚無庫存")
 
         st.markdown("---")
-        st.subheader("⚔️ 精銳監控 (Tactical Table)")
-        df_watch = db.get_watchlist_view()
+        st.subheader("⚔️ 戰術儀表板 (Tactical Dashboard)")
         
+        df_watch = db.get_watchlist_view()
         if engine.twii_data:
             twii_row = pd.DataFrame([engine.twii_data])
             if not df_watch.empty:
@@ -869,121 +893,63 @@ def render_streamlit_ui():
                 df_watch = pd.concat([twii_row, df_watch], ignore_index=True)
             else: df_watch = twii_row
 
-        if df_watch.empty: st.info("尚未加入監控標的"); return
+        if df_watch.empty:
+            st.info("尚未加入監控標的")
+            return
 
-        numeric_cols = ['price', 'pct', 'vwap', 'ratio', 'ratio_yest', 'net_10m', 'net_1h', 'net_day', 'price_5ma', 'win_rate', 'avg_ret', 'active_light', 'avg_amp']
-        for col in numeric_cols:
-            if col in df_watch.columns: df_watch[col] = pd.to_numeric(df_watch[col], errors='coerce').fillna(0.0)
+        if use_filter:
+            df_watch = df_watch[pd.to_numeric(df_watch['price'], errors='coerce') > 70]
 
-        if use_filter: df_watch = df_watch[df_watch['price'] > 70]
-
-        table_start = """
-    <style>
-    table.sniper-table { width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; }
-    table.sniper-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; white-space: nowrap; }
-    table.sniper-table td { padding: 6px; border-bottom: 1px solid #444; font-size: 15px; vertical-align: middle; white-space: nowrap; }
-    table.sniper-table tr.pinned-row { background-color: #fff9c4 !important; color: black !important; }
-    table.sniper-table tr.golden-row { background-color: #fff9c4 !important; color: black !important; font-weight: bold; }
-    table.sniper-table tr:hover { background-color: #f0f2f6; color: black; }
-    </style>
-    <table class="sniper-table">
-    <thead>
-    <tr>
-    <th>📌</th><th>代碼</th><th>名稱 (Link)</th><th>訊號</th><th>5MA</th><th>現價</th><th>漲跌%</th>
-    <th>均價 (燈/Buy/TP/SL)</th><th>量比 (昨/5日)</th><th>局勢</th><th>大戶 (10m/1H/日)</th>
-    </tr>
-    </thead>
-    <tbody>
-    """
-        html_rows = []
         for _, row in df_watch.iterrows():
-            situation = str(row.get('situation') or '盤整')
-            event_label = str(row.get('event_label') or '')
-            is_pinned = row.get('is_pinned', 0)
-            row_class = "pinned-row" if is_pinned else ""
-            pin_icon = "📌" if is_pinned else ""
-            is_twii = str(row['code']) == "0000"
-
-            # [NEW FORMAT LOGIC]
-            win_rate = row.get("win_rate", 0)
-            avg_ret = row.get("avg_ret", 0)
-            avg_amp = row.get("avg_amp", 0)
+            code = row['code']
+            name = row['name']
+            price = float(row['price']) if row['price'] else 0
+            pct = float(row['pct']) if row['pct'] else 0
+            vwap = float(row['vwap']) if row['vwap'] else 0
             
-            name_part = row['name']
-            if not is_twii:
-                name_part = f"{row['name']} ({win_rate:.0f}%, Exp{avg_ret:+.2f})"
-                if win_rate < 50: name_part += " <span style='color:#ff4d4f; font-size:0.8em;'>(高風險)</span>"
-                if avg_amp >= MIN_AMPLITUDE_THRESHOLD: name_part += " <span style='color:#e67e22; font-weight:bold;'>(瘋)</span>"
-
-            # 1. Price
-            main_color = "#ff4d4f" if row['pct'] > 0 else "#2ecc71" if row['pct'] < 0 else "#999999"
-            price_html = f"<span style='color:{main_color}; font-weight:bold'>{row['price']:.2f}</span>"
-            pct_html = f"<span style='color:{main_color}'>{row['pct']:.2f}%</span>"
-
-            # 2. VWAP Light (Strict Logic from DB)
-            active_light = row.get('active_light', 0)
-            vwap_color = "#ff4d4f" if row['price'] >= row['vwap'] else "#2ecc71"
+            main_color = "#ff4d4f" if pct > 0 else "#2ecc71" if pct < 0 else "#999999"
             
-            if is_twii: 
-                vwap_light = ""
-                buy_html = ""
-            else:
-                if active_light == 1: vwap_light = "🟢"
-                else: vwap_light = "🔴"
+            evt = row.get('event_label', '')
+            sit = row.get('situation', '盤整').replace("🔥", "").replace("💀", "")
+            
+            net_1h = int(row.get('net_1h', 0))
+            ratio = float(row.get('ratio', 0))
+            
+            tp = adjust_to_tick(vwap * 1.02, 'round')
+            sl = adjust_to_tick(vwap * 0.985, 'floor')
+
+            with st.container():
+                c_info, c_chart = st.columns([0.35, 0.65])
                 
-                # Calculate Buy Price (Trigger) for display
-                trigger_val = row['vwap'] * 1.005
-                buy_price = adjust_to_tick(trigger_val, method='round')
-                buy_html = f"<span style='color:#e67e22; font-weight:bold; margin-left:4px;'>Buy:{buy_price:.2f}</span>"
-            
-            vwap_html = f"<span style='color:{vwap_color}'>{row['vwap']:.2f} {vwap_light}</span> {buy_html}"
-            
-            if not is_twii:
-                trigger_price = row['vwap'] * 1.005
-                tp_price = adjust_to_tick(trigger_price * 1.02, method='round')
-                sl_price = adjust_to_tick(row['vwap'] * 0.985, method='floor')
-                vwap_html += f"<br><span style='font-size:0.85em; color:#888'>(TP:{tp_price:.1f} / SL:{sl_price:.1f})</span>"
+                with c_info:
+                    st.markdown(f"""
+                    <div style="border-left: 4px solid {main_color}; padding-left: 8px; margin-bottom: 5px;">
+                        <div style="font-size: 18px; font-weight: bold; color: white;">
+                            {code} {name} <span style="color:{main_color}; float:right;">{price} ({pct}%)</span>
+                        </div>
+                        <div style="font-size: 14px; color: #ccc; margin-top: 4px; display: flex; justify-content: space-between;">
+                            <span>均:{vwap:.1f}</span>
+                            <span>量比:{ratio:.1f}</span>
+                            <span style="color:{'#ff4d4f' if net_1h>0 else '#2ecc71'}">戶:{net_1h}</span>
+                        </div>
+                        <div style="font-size: 13px; color: #888; margin-top: 2px;">
+                            <span style="border:1px solid #555; padding:0 4px; border-radius:4px;">{sit}</span>
+                            <span style="margin-left:5px;">🎯{tp} / 🛡️{sl}</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-            # 3. 5MA
-            p_5ma = row.get('price_5ma', 0)
-            c_5ma = "#ff4d4f" if row['price'] > p_5ma else "#2ecc71"
-            ma_html = f"<span style='color:{c_5ma}'>{p_5ma:.2f}</span>"
-
-            # 4. Volume
-            thresholds = get_dynamic_thresholds(row['price'])
-            r_yest = row.get('ratio_yest', 0); r_5ma = row['ratio']
-            is_vol_strong = r_5ma >= thresholds['tgt_ratio']
-            vol_light = "🟢" if is_vol_strong else "🔴"
-            c_5ma_r = "#ff4d4f" if is_vol_strong else "#999999"
-            ratio_html = f"{r_yest:.1f} / <span style='color:{c_5ma_r}; font-weight:bold'>{r_5ma:.1f} {vol_light}</span>"
-
-            # 5. Situation
-            sit_color = "#ff4d4f" if "吸籌" in situation or "攻擊" in situation else "#2ecc71" if "倒貨" in situation else "#e67e22" if "吃盤" in situation else "#999999"
-            clean_situation = situation.replace("🔥", "").replace("🛡️", "").replace("💀", "").replace("🎣", "").replace("⚖️", "")
-            situation_html = f"<span style='color:{sit_color}; font-weight:bold'>{clean_situation}</span>"
-            
-            # 6. Link
-            if is_twii: name_html = f'<span style="font-weight:bold;">{name_part}</span>'
-            else: name_html = f'<a href="https://tw.stock.yahoo.com/quote/{row["code"]}.TW" target="_blank" style="text-decoration:none; color:#3498db; font-weight:bold;">{name_part}</a>'
-
-            # 7. Big Player
-            if is_twii: bp_html = "<span style='color:#777'>- / - / -</span>"
-            else:
-                n10 = int(row['net_10m']); n1h = int(row['net_1h']); nd = int(row['net_day'])
-                bp_light = "🟢" if n1h > 0 else "🔴"
-                c10 = "#ff4d4f" if n10 > 0 else "#2ecc71" if n10 < 0 else "#999999"
-                c1h = "#ff4d4f" if n1h > 0 else "#2ecc71" if n1h < 0 else "#999999"
-                cd  = "#ff4d4f" if nd > 0 else "#2ecc71" if nd < 0 else "#999999"
-                bp_html = f"<span style='color:{c10}'>{n10}</span> / <span style='color:{c1h}'>{n1h} {bp_light}</span> / <span style='color:{cd}'>{nd}</span>"
-
-            is_three_lights = (active_light == 1) and (vol_light == "🟢") and (bp_light == "🟢")
-            if is_three_lights: row_class = "golden-row"
-            elif is_pinned: row_class = "pinned-row"
-            else: row_class = ""
-
-            html_rows.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{row["code"]}</td><td>{name_html}</td><td>{event_label}</td><td>{ma_html}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{situation_html}</td><td>{bp_html}</td></tr>')
-
-        st.markdown(table_start + "".join(html_rows) + "</tbody></table>", unsafe_allow_html=True)
+                with c_chart:
+                    if str(code) != "0000":
+                        fig = get_chart_figure(code)
+                        if fig:
+                            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+                        else:
+                            st.caption("Loading Chart...")
+                    else:
+                        st.markdown(f"<div style='height:120px; display:flex; align-items:center; justify-content:center; color:#555;'>MARKET INDEX</div>", unsafe_allow_html=True)
+                
+                st.markdown("<hr style='margin: 5px 0; border-top: 1px solid #333;'>", unsafe_allow_html=True)
 
     render_live_dashboard()
 
@@ -1128,7 +1094,7 @@ if __name__ == "__main__":
             render_streamlit_ui()
         else:
             os.system('cls' if os.name == 'nt' else 'clear')
-            print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.15 (BuySignal){Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.17 ProChart (BuySignal){Style.RESET_ALL}")
             while True:
                 try:
                     user_input = input(f"\n請輸入股票代碼 (輸入 q 離開): ").strip().upper()
@@ -1141,7 +1107,7 @@ if __name__ == "__main__":
                 except Exception as e: print(f"錯誤: {e}")
     except ModuleNotFoundError:
         os.system('cls' if os.name == 'nt' else 'clear')
-        print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.15 (BuySignal){Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.17 ProChart (BuySignal){Style.RESET_ALL}")
         while True:
             try:
                 user_input = input(f"\n請輸入股票代碼 (輸入 q 離開): ").strip().upper()
