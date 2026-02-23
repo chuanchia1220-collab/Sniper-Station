@@ -8,9 +8,7 @@ import time, os, twstock, json, threading, sqlite3, concurrent.futures, requests
 from itertools import cycle
 import warnings
 import logging
-import numpy as np
 import math
-from bs4 import BeautifulSoup
 
 # [LOG FIX]
 warnings.filterwarnings("ignore")
@@ -18,9 +16,9 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 pd.set_option('future.no_silent_downcasting', True)
 
 # ==========================================
-# 0. Global Config v7.0
+# 0. Global Config v7.0.1 (Fix Null Pointer)
 # ==========================================
-st.set_page_config(page_title="Sniper v7.0 FirstPrinciple", page_icon="⚔️", layout="wide")
+st.set_page_config(page_title="Sniper v7.0.1 FirstPrinciple", page_icon="⚔️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -99,7 +97,6 @@ class Database:
         c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, vol_5ma REAL, vol_yest REAL, price_5ma REAL, stock_type TEXT DEFAULT 'MOM', daily_res INTEGER DEFAULT 0, prev_close REAL DEFAULT 0)''')
         
-        # Auto-patching columns for older DBs
         for col, def_val in [('divergence', 'REAL DEFAULT 0'), ('bpe', 'REAL DEFAULT 0'), ('morning_high', 'REAL DEFAULT 0'), ('vwap_test', 'INTEGER DEFAULT 0')]:
             try: c.execute(f"ALTER TABLE realtime ADD COLUMN {col} {def_val}")
             except: pass
@@ -187,29 +184,28 @@ class Database:
 db = Database(DB_PATH)
 
 # ==========================================
-# 3. Static Data & FinMind API
+# 3. Static Data & FinMind API (Fix NoneType)
 # ==========================================
 def fetch_finmind_fund_factor(code):
-    # FinMind 雙因子：營收YoY > 15% & 投信外資近5日買超 >= 3日
     stock_type = 'MOM'
     try:
-        # 1. 營收 YoY (抓近兩個月確保有資料)
         ym_start = (datetime.now() - timedelta(days=60)).strftime('%Y-%m')
         url_rev = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={code}&start_date={ym_start}"
         res_rev = requests.get(url_rev, timeout=5).json()
         yoy_ok = False
         if res_rev.get('data'):
             latest_rev = res_rev['data'][-1]
-            if latest_rev.get('RevenueYearOnYear', 0) > 15.0: yoy_ok = True
+            yoy_val = latest_rev.get('RevenueYearOnYear')
+            # [FIX] 防呆: API 可能回傳 None 導致 TypeError
+            if yoy_val is not None and float(yoy_val) > 15.0: 
+                yoy_ok = True
         
-        # 2. 法人買賣超 (近 5 日)
         d_start = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
         url_inst = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={code}&start_date={d_start}"
         res_inst = requests.get(url_inst, timeout=5).json()
         inst_ok = False
         if res_inst.get('data'):
             df_inst = pd.DataFrame(res_inst['data'])
-            # 過濾投信與外資
             df_target = df_inst[df_inst['name'].isin(['Foreign_Investor', 'Investment_Trust'])]
             if not df_target.empty:
                 daily_net = df_target.groupby('date')['buy'].sum() - df_target.groupby('date')['sell'].sum()
@@ -236,7 +232,6 @@ def fetch_static_stats(code):
             vol_5ma = int(last_5['Volume'].mean()) // 1000
             price_5ma = float(last_5['Close'].mean())
             
-            # 判斷日K套牢壓 (近5日出現 實體黑K 且 量 > 1.5倍5日均量)
             for _, row in last_5.iterrows():
                 if row['Close'] < row['Open'] and (row['Volume'] // 1000) > (vol_5ma * 1.5):
                     daily_res = True; break
@@ -246,10 +241,10 @@ def fetch_static_stats(code):
     except: return 0, 0, 0, 'MOM', 0, 0
 
 # ==========================================
-# 4. Notification Manager (Strict TG Filter)
+# 4. Notification Manager
 # ==========================================
 class NotificationManager:
-    COOLDOWN = 1800 # 同檔同方向 30 分鐘冷卻
+    COOLDOWN = 1800 
 
     def __init__(self):
         self._queue = queue.Queue()
@@ -295,7 +290,7 @@ class NotificationManager:
 nm = NotificationManager()
 
 # ==========================================
-# 5. Core Engine v7.0 (First Principles)
+# 5. Core Engine v7.0
 # ==========================================
 class SniperEngine:
     def __init__(self):
@@ -307,7 +302,7 @@ class SniperEngine:
         self.inv_cache = {}
         self.prev_data = {}
         self.vol_queues = {}
-        self.price_history_10m = {} # {code: [(ts, price)]}
+        self.price_history_10m = {} 
         self.morning_high_cache = {}
         self.vwap_test_cache = {}
         self.daily_net = {}
@@ -358,7 +353,6 @@ class SniperEngine:
             vwap = (q.get('total', {}).get('tradeValue', 0) / vol) if vol > 0 else price
             divergence = ((price - vwap) / vwap * 100) if vwap > 0 else 0
 
-            # Delta Net Volume
             delta_net = 0
             if code in self.prev_data:
                 prev_v = self.prev_data[code]['vol']; delta_v = vol_lots - prev_v
@@ -370,7 +364,6 @@ class SniperEngine:
             self.prev_data[code] = {'vol': vol_lots, 'price': price}
             now_ts = time.time()
             
-            # Update Queues
             if code not in self.vol_queues: self.vol_queues[code] = []
             if code not in self.price_history_10m: self.price_history_10m[code] = []
             
@@ -384,37 +377,33 @@ class SniperEngine:
             net_10m = sum(x[1] for x in self.vol_queues[code] if x[0] > now_ts - 600)
             net_1h = sum(x[1] for x in self.vol_queues[code])
 
-            # Track Morning High (09:00 - 09:30)
             t_obj = now_time.time()
             if t_obj <= dt_time(9, 30):
                 if price > self.morning_high_cache.get(code, 0):
                     self.morning_high_cache[code] = price
             m_high = self.morning_high_cache.get(code, 0)
 
-            # Track VWAP Test (After 10:00)
             if t_obj >= dt_time(10, 0):
                 if abs(divergence) < 0.5 and ratio_5ma < 1.2:
                     self.vwap_test_cache[code] = True
             v_test = self.vwap_test_cache.get(code, False)
 
-            # BPE Calculation
             bpe = 0.0
             if net_10m > 50 and len(self.price_history_10m[code]) > 0:
                 price_10m_ago = self.price_history_10m[code][0][1]
                 delta_ticks = (price - price_10m_ago) / get_tick_size(price)
                 bpe = round(delta_ticks / (net_10m / 100), 2)
 
-            # Signal Logic v7.0
             signal = ""
             scope = "inventory" if code in self.inv_cache else "watchlist"
             
             if scope == "inventory":
                 if stock_type == "MOM" and price < prev_close and t_obj > dt_time(9, 0):
-                    signal = "🚨緊急撤退" # T+1 破底
+                    signal = "🚨緊急撤退" 
                 elif price < vwap and net_10m < 0:
-                    signal = "🚨緊急撤退" # 日內破線
+                    signal = "🚨緊急撤退" 
                 elif bpe < 0.2 and net_10m > 100 and pct > 2:
-                    signal = "🚨緊急撤退" # 爆量不漲
+                    signal = "🚨緊急撤退" 
             
             if not signal and scope == "watchlist":
                 if dt_time(10, 30) <= t_obj <= dt_time(13, 0):
@@ -428,7 +417,6 @@ class SniperEngine:
                 if stock_type == "FUND" and pct < 0 and divergence < 0.5 and bpe > 0:
                     signal = "💣錯殺伏擊"
 
-            # Dispatch Notification
             if signal and signal != self.active_flags.get(code):
                 self.active_flags[code] = signal
                 ev = SniperEvent(code, get_stock_name(code), scope, signal, price, pct, vwap, divergence, bpe, ratio_5ma, net_10m, net_1h, self.daily_net.get(code,0), stock_type, v_test, daily_res)
@@ -470,7 +458,7 @@ engine = st.session_state.engine
 # ==========================================
 def render_ui():
     with st.sidebar:
-        st.title("🛡️ Sniper v7.0 (First Principle)")
+        st.title("🛡️ Sniper v7.0.1 (First Principle)")
         st.markdown("---")
         with st.expander("📦 庫存管理 (Format: 代碼,成本,張數,FUND/MOM)"):
             inv_input = st.text_area("庫存", DEFAULT_INVENTORY, height=80)
@@ -519,7 +507,11 @@ def render_ui():
     def render_dashboard():
         st.subheader("📦 庫存戰況")
         df_inv = db.get_inventory_view()
-        if not df_inv.empty: st.dataframe(df_inv[['code', 'name', 'stock_type', 'price', 'pct', 'profit_val', 'signal']], hide_index=True)
+        if not df_inv.empty: 
+            # [FIX] 庫存防呆機制
+            for col in ['price', 'pct', 'profit_val', 'profit_pct', 'divergence', 'bpe']:
+                if col in df_inv.columns: df_inv[col] = pd.to_numeric(df_inv[col], errors='coerce').fillna(0.0)
+            st.dataframe(df_inv[['code', 'name', 'stock_type', 'price', 'pct', 'profit_val', 'signal']], hide_index=True)
         else: st.info("無庫存")
 
         st.markdown("---")
@@ -527,24 +519,26 @@ def render_ui():
         df_w = db.get_watchlist_view()
         if df_w.empty: return
 
+        # [FIX] 監控清單空值防呆機制 (解決 TypeError: '>' not supported 崩潰問題)
+        numeric_cols = ['price', 'pct', 'vwap', 'ratio', 'net_10m', 'net_1h', 'net_day', 'divergence', 'bpe', 'morning_high']
+        for col in numeric_cols:
+            if col in df_w.columns: df_w[col] = pd.to_numeric(df_w[col], errors='coerce').fillna(0.0)
+
         html_rows = []
         for _, r in df_w.iterrows():
             c_price = "#ff4d4f" if r['pct'] > 0 else "#2ecc71" if r['pct'] < 0 else "#aaa"
             type_icon = "🛡️FUND" if r.get('stock_type') == 'FUND' else "⚡MOM"
             
-            # Divergence
-            div = r.get('divergence', 0)
+            div = r.get('divergence', 0.0)
             div_color = "#ff4d4f" if div > 3 else "#2ecc71" if div < 1 else "#e67e22"
             
-            # BPE
-            bpe = r.get('bpe', 0)
+            bpe = r.get('bpe', 0.0)
             bpe_str = f"🚀 {bpe:.1f}" if bpe > 1.5 else f"⚠️ {bpe:.1f}" if bpe < 0.2 else f"{bpe:.1f}"
             
-            # Tests
             v_test = "✔️" if r.get('vwap_test') else "❌"
             res_test = "❌(有壓)" if r.get('daily_res') else "✔️(無壓)"
             
-            signal = r.get('signal', '') or '-'
+            signal = r.get('signal') if pd.notna(r.get('signal')) and r.get('signal') else '-'
             
             html_rows.append(f"""
             <tr>
