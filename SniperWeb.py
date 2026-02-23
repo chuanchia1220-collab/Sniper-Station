@@ -16,7 +16,7 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 pd.set_option('future.no_silent_downcasting', True)
 
 # ==========================================
-# 0. Global Config v7.0.1 (Fix Null Pointer)
+# 0. Global Config v7.0.1 (Fix Null Pointer & HTML Render)
 # ==========================================
 st.set_page_config(page_title="Sniper v7.0.1 FirstPrinciple", page_icon="⚔️", layout="wide")
 
@@ -196,7 +196,6 @@ def fetch_finmind_fund_factor(code):
         if res_rev.get('data'):
             latest_rev = res_rev['data'][-1]
             yoy_val = latest_rev.get('RevenueYearOnYear')
-            # [FIX] 防呆: API 可能回傳 None 導致 TypeError
             if yoy_val is not None and float(yoy_val) > 15.0: 
                 yoy_ok = True
         
@@ -508,7 +507,6 @@ def render_ui():
         st.subheader("📦 庫存戰況")
         df_inv = db.get_inventory_view()
         if not df_inv.empty: 
-            # [FIX] 庫存防呆機制
             for col in ['price', 'pct', 'profit_val', 'profit_pct', 'divergence', 'bpe']:
                 if col in df_inv.columns: df_inv[col] = pd.to_numeric(df_inv[col], errors='coerce').fillna(0.0)
             st.dataframe(df_inv[['code', 'name', 'stock_type', 'price', 'pct', 'profit_val', 'signal']], hide_index=True)
@@ -519,7 +517,6 @@ def render_ui():
         df_w = db.get_watchlist_view()
         if df_w.empty: return
 
-        # [FIX] 監控清單空值防呆機制 (解決 TypeError: '>' not supported 崩潰問題)
         numeric_cols = ['price', 'pct', 'vwap', 'ratio', 'net_10m', 'net_1h', 'net_day', 'divergence', 'bpe', 'morning_high']
         for col in numeric_cols:
             if col in df_w.columns: df_w[col] = pd.to_numeric(df_w[col], errors='coerce').fillna(0.0)
@@ -540,31 +537,29 @@ def render_ui():
             
             signal = r.get('signal') if pd.notna(r.get('signal')) and r.get('signal') else '-'
             
-            html_rows.append(f"""
-            <tr>
-                <td>{r['code']}</td>
-                <td><a href='https://tw.stock.yahoo.com/quote/{r['code']}.TW' target='_blank' style='text-decoration:none; color:#3498db;'>{r['name']}</a> <span style='font-size:0.8em;color:#888'>{type_icon}</span></td>
-                <td><b style='color:{c_price}'>{r['price']:.2f} ({r['pct']:+.2f}%)</b></td>
-                <td>{r['vwap']:.2f} <span style='color:{div_color}; font-size:0.9em'>(乖離: {div:+.2f}%)</span></td>
-                <td>{bpe_str}</td>
-                <td>引力:{v_test} | 日K:{res_test}</td>
-                <td>{r['net_10m']:+} / {r['net_1h']:+}</td>
-                <td style='font-weight:bold;'>{signal}</td>
-            </tr>
-            """)
+            html_rows.append(
+                f"<tr><td>{r['code']}</td>"
+                f"<td><a href='https://tw.stock.yahoo.com/quote/{r['code']}.TW' target='_blank' style='text-decoration:none; color:#3498db;'>{r['name']}</a> <span style='font-size:0.8em;color:#888'>{type_icon}</span></td>"
+                f"<td><b style='color:{c_price}'>{r['price']:.2f} ({r['pct']:+.2f}%)</b></td>"
+                f"<td>{r['vwap']:.2f} <span style='color:{div_color}; font-size:0.9em'>(乖離: {div:+.2f}%)</span></td>"
+                f"<td>{bpe_str}</td>"
+                f"<td>引力:{v_test} | 日K:{res_test}</td>"
+                f"<td>{r['net_10m']:+} / {r['net_1h']:+}</td>"
+                f"<td style='font-weight:bold;'>{signal}</td></tr>"
+            )
 
         st.markdown(f"""
-        <style>
-        table.st-table {{ width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; }}
-        table.st-table th {{ background-color: #262730; color: white; padding: 8px; text-align: left; }}
-        table.st-table td {{ padding: 8px; border-bottom: 1px solid #444; }}
-        table.st-table tr:hover {{ background-color: #333; }}
-        </style>
-        <table class="st-table">
-        <tr><th>代碼</th><th>名稱 (屬性)</th><th>現價 (漲跌)</th><th>均價 (乖離率)</th><th>BPE(推升力)</th><th>防禦檢測</th><th>大戶(10m/1H)</th><th>系統訊號</th></tr>
-        {"".join(html_rows)}
-        </table>
-        """, unsafe_allow_html=True)
+<style>
+table.st-table {{ width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; }}
+table.st-table th {{ background-color: #262730; color: white; padding: 8px; text-align: left; }}
+table.st-table td {{ padding: 8px; border-bottom: 1px solid #444; }}
+table.st-table tr:hover {{ background-color: #333; }}
+</style>
+<table class="st-table">
+<tr><th>代碼</th><th>名稱 (屬性)</th><th>現價 (漲跌)</th><th>均價 (乖離率)</th><th>BPE(推升力)</th><th>防禦檢測</th><th>大戶(10m/1H)</th><th>系統訊號</th></tr>
+{"".join(html_rows)}
+</table>
+""", unsafe_allow_html=True)
 
     render_dashboard()
 
