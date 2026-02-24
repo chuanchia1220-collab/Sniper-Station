@@ -16,9 +16,9 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 pd.set_option('future.no_silent_downcasting', True)
 
 # ==========================================
-# 0. Global Config v7.0.1 (Fix Null Pointer & HTML Render)
+# 0. Global Config v7.0.2 (Fix UI Overlay & Types)
 # ==========================================
-st.set_page_config(page_title="Sniper v7.0.1 FirstPrinciple", page_icon="⚔️", layout="wide")
+st.set_page_config(page_title="Sniper v7.0.2 FirstPrinciple", page_icon="⚔️", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -453,11 +453,11 @@ if "engine" not in st.session_state: st.session_state.engine = SniperEngine()
 engine = st.session_state.engine
 
 # ==========================================
-# 6. Streamlit UI
+# 6. Streamlit UI (Refined Layout)
 # ==========================================
 def render_ui():
     with st.sidebar:
-        st.title("🛡️ Sniper v7.0.1 (First Principle)")
+        st.title("🛡️ Sniper v7.0.2")
         st.markdown("---")
         with st.expander("📦 庫存管理 (Format: 代碼,成本,張數,FUND/MOM)"):
             inv_input = st.text_area("庫存", DEFAULT_INVENTORY, height=80)
@@ -507,6 +507,7 @@ def render_ui():
         st.subheader("📦 庫存戰況")
         df_inv = db.get_inventory_view()
         if not df_inv.empty: 
+            # [FIX] 強制轉型為 float 避免 TypeError
             for col in ['price', 'pct', 'profit_val', 'profit_pct', 'divergence', 'bpe']:
                 if col in df_inv.columns: df_inv[col] = pd.to_numeric(df_inv[col], errors='coerce').fillna(0.0)
             st.dataframe(df_inv[['code', 'name', 'stock_type', 'price', 'pct', 'profit_val', 'signal']], hide_index=True)
@@ -517,6 +518,7 @@ def render_ui():
         df_w = db.get_watchlist_view()
         if df_w.empty: return
 
+        # [FIX] 強制轉型為 float 避免 TypeError
         numeric_cols = ['price', 'pct', 'vwap', 'ratio', 'net_10m', 'net_1h', 'net_day', 'divergence', 'bpe', 'morning_high']
         for col in numeric_cols:
             if col in df_w.columns: df_w[col] = pd.to_numeric(df_w[col], errors='coerce').fillna(0.0)
@@ -526,10 +528,10 @@ def render_ui():
             c_price = "#ff4d4f" if r['pct'] > 0 else "#2ecc71" if r['pct'] < 0 else "#aaa"
             type_icon = "🛡️FUND" if r.get('stock_type') == 'FUND' else "⚡MOM"
             
-            div = r.get('divergence', 0.0)
+            div = float(r.get('divergence', 0.0))
             div_color = "#ff4d4f" if div > 3 else "#2ecc71" if div < 1 else "#e67e22"
             
-            bpe = r.get('bpe', 0.0)
+            bpe = float(r.get('bpe', 0.0))
             bpe_str = f"🚀 {bpe:.1f}" if bpe > 1.5 else f"⚠️ {bpe:.1f}" if bpe < 0.2 else f"{bpe:.1f}"
             
             v_test = "✔️" if r.get('vwap_test') else "❌"
@@ -537,16 +539,9 @@ def render_ui():
             
             signal = r.get('signal') if pd.notna(r.get('signal')) and r.get('signal') else '-'
             
-            html_rows.append(
-                f"<tr><td>{r['code']}</td>"
-                f"<td><a href='https://tw.stock.yahoo.com/quote/{r['code']}.TW' target='_blank' style='text-decoration:none; color:#3498db;'>{r['name']}</a> <span style='font-size:0.8em;color:#888'>{type_icon}</span></td>"
-                f"<td><b style='color:{c_price}'>{r['price']:.2f} ({r['pct']:+.2f}%)</b></td>"
-                f"<td>{r['vwap']:.2f} <span style='color:{div_color}; font-size:0.9em'>(乖離: {div:+.2f}%)</span></td>"
-                f"<td>{bpe_str}</td>"
-                f"<td>引力:{v_test} | 日K:{res_test}</td>"
-                f"<td>{r['net_10m']:+} / {r['net_1h']:+}</td>"
-                f"<td style='font-weight:bold;'>{signal}</td></tr>"
-            )
+            # [FIX] 單行字串拼接，杜絕縮排導致的 Layout Overlay
+            row_html = f"<tr><td>{r['code']}</td><td><a href='https://tw.stock.yahoo.com/quote/{r['code']}.TW' target='_blank' style='text-decoration:none; color:#3498db;'>{r['name']}</a> <span style='font-size:0.8em;color:#888'>{type_icon}</span></td><td><b style='color:{c_price}'>{r['price']:.2f} ({r['pct']:+.2f}%)</b></td><td>{r['vwap']:.2f} <span style='color:{div_color}; font-size:0.9em'>(乖離: {div:+.2f}%)</span></td><td>{bpe_str}</td><td>引力:{v_test} | 日K:{res_test}</td><td>{r['net_10m']:+} / {r['net_1h']:+}</td><td style='font-weight:bold;'>{signal}</td></tr>"
+            html_rows.append(row_html)
 
         st.markdown(f"""
 <style>
