@@ -24,7 +24,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v7.0 Hybrid", page_icon="🦅", layout="wide")
+st.set_page_config(page_title="Sniper v7.1 Pro", page_icon="🦅", layout="wide")
 
 # 嘗試讀取 Secrets 或環境變數
 try:
@@ -37,7 +37,7 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v7.db"
+DB_PATH = "sniper_v7_pro.db"
 
 # 預設清單
 DEFAULT_WATCHLIST = "3006 3037 1513 3189 1795 3491 8046 6274"
@@ -248,7 +248,6 @@ class ChartPainter:
         self.chart_cache = {}  # {code: base64_string}
         self.running = False
         self._lock = threading.Lock()
-        # 專屬 Client，避免與 Engine 搶佔
         self.client = RestClient(api_key=API_KEYS[0]) if API_KEYS else None
 
     def start(self):
@@ -259,7 +258,6 @@ class ChartPainter:
     def stop(self): self.running = False
 
     def _paint_loop(self):
-        # 戰術暗黑風格
         mc = mpf.make_marketcolors(up='#ff4d4f', down='#2ecc71', inherit=True)
         style = mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc, gridstyle=':', facecolor='#0e1117')
         
@@ -274,14 +272,14 @@ class ChartPainter:
                     time.sleep(0.5) # Fugle API 保護
                     self._generate_chart(code, style)
                 
-                time.sleep(20) # 輪詢間隔
+                time.sleep(10) # 加快刷新頻率到 10s (提升懸浮體驗)
             except Exception: time.sleep(5)
 
     def _generate_chart(self, code, style):
         if not self.client: return
         try:
-            # 🔥 Fugle API 抓取 K 線
-            chart_res = self.client.stock.intraday.chart(symbol=code, type='5k')
+            # 修正：Fugle API 抓取 K 線
+            chart_res = self.client.stock.intraday.chart(symbol=code, type='1k') # 改用 1K 讓細節更清楚，或 5K
             if not chart_res or 'data' not in chart_res: return
             
             data = chart_res['data']
@@ -294,6 +292,9 @@ class ChartPainter:
             
             for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                 df[col] = df[col].astype(float)
+            
+            # 策略要求 1H/10M 結構驗證，這裡可以考慮 Resample 成 5T 或 10T 繪圖，這邊維持 1K 或 5K
+            # df = df.resample('5T').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
 
             # VWAP
             df['Cum_Vol'] = df['Volume'].cumsum()
@@ -315,7 +316,7 @@ class ChartPainter:
             ax_main.text(0.05, 0.95, f"Net Day: {net_day}", transform=ax_main.transAxes, 
                          color=net_color, fontsize=12, fontweight='bold', va='top')
             
-            now_str = datetime.now().strftime("%H:%M")
+            now_str = datetime.now().strftime("%H:%M:%S")
             ax_main.text(0.95, 0.95, f"Update: {now_str}", transform=ax_main.transAxes, 
                          color='white', fontsize=8, va='top', ha='right')
 
@@ -416,7 +417,8 @@ class SniperEngine:
         self.last_reset = datetime.now().date()
         
         self.painter = ChartPainter(self)
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+        # [CRITICAL] 降低併發數，防止 Fugle API 過載 (429)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
     def update_targets(self):
         self.targets = db.get_all_codes()
@@ -450,21 +452,53 @@ class SniperEngine:
             self.market_stats["Time"] = time.time()
         except: pass
 
-    def _backfill_intraday_net(self, client, code):
-        """ 🔥 K線回補邏輯：從 1分K 推算早盤籌碼 """
+    def _deep_backfill(self, client, code):
+        """ 🔥 深度回補 (混合模式)：
+        1. 使用 chart (1k) 估算 'net_day' (累積量)
+        2. 使用 deal (limit=50) 重建 'vol_queues' (近期結構)
+        """
         try:
+            # 1. 估算全日累積 (用 Candle 簡易法，或改為 Deal 累計但會很慢)
+            # 這裡採用折衷：用 Chart 1k 來建立 daily_net 基線，這不是最準但最快
             chart = client.stock.intraday.chart(symbol=code, type='1k')
-            if not chart or 'data' not in chart: return 0
+            daily_sim = 0
+            if chart and 'data' in chart:
+                for k in chart['data']:
+                    o = k.get('open', 0); c = k.get('close', 0); v = k.get('volume', 0)
+                    if c > o: daily_sim += v
+                    elif c < o: daily_sim -= v
+
+            # 2. [CRITICAL] 重建 1H/10M 結構 (使用 Deal API)
+            deals = client.stock.intraday.deal(symbol=code, limit=50)
+            temp_queue = []
             
-            sim_net = 0
-            for k in chart['data']:
-                o = k.get('open', 0)
-                c = k.get('close', 0)
-                v = k.get('volume', 0)
-                if c > o: sim_net += v
-                elif c < o: sim_net -= v
-            return int(sim_net)
-        except: return 0
+            if deals and 'data' in deals:
+                trade_data = deals['data']
+                trade_data.reverse() # 讓時間從舊到新
+                
+                # 初始化比較價格 (取第一筆的前一筆，若無則用第一筆)
+                last_price = trade_data[0]['price'] 
+                
+                for d in trade_data:
+                    p = d['price']
+                    v = d['volume']
+                    ts = pd.to_datetime(d['at']).timestamp()
+                    
+                    # Tick Rule: Price > Last Price = Buy
+                    delta = 0
+                    if p > last_price: delta = v
+                    elif p < last_price: delta = -v
+                    
+                    if delta != 0:
+                        temp_queue.append((ts, delta))
+                    
+                    last_price = p
+
+            return int(daily_sim), temp_queue, last_price
+            
+        except Exception as e:
+            # print(f"Backfill Error {code}: {e}")
+            return 0, [], 0
 
     def _hybrid_strategy(self, code, price, pct, vwap, net_day, net_1h, ratio, now_time):
         signal = "盤整"
@@ -508,15 +542,20 @@ class SniperEngine:
             client = next(self.client_cycle) if self.client_cycle else None
             if not client: return None
 
-            # [🔥 Backfill] 若無日累計，則嘗試回補
-            if code not in self.daily_net:
-                self.daily_net[code] = self._backfill_intraday_net(client, code)
+            # [🔥 Backfill & Init] 
+            # 檢查 prev_data 而不是 daily_net，確保初始化完整
+            if code not in self.prev_data:
+                daily_val, queue_data, last_p = self._deep_backfill(client, code)
+                self.daily_net[code] = daily_val
+                self.vol_queues[code] = queue_data
                 # 初始化 prev_data
-                try:
-                    init_q = client.stock.intraday.quote(symbol=code)
-                    if init_q and 'lastPrice' in init_q:
-                        self.prev_data[code] = {'vol': init_q['total']['tradeVolume'], 'price': init_q['lastPrice']}
-                except: pass
+                self.prev_data[code] = {'vol': 0, 'price': last_p if last_p > 0 else 0}
+                
+                # 若完全抓不到 deal，嘗試用 Quote 初始化
+                if last_p == 0:
+                     q_init = client.stock.intraday.quote(symbol=code)
+                     if q_init and 'lastPrice' in q_init:
+                        self.prev_data[code] = {'vol': q_init['total']['tradeVolume'], 'price': q_init['lastPrice']}
 
             static_data = self.base_vol_cache.get(code, {})
             base_vol_5ma = static_data.get('vol_5ma', 0)
@@ -527,17 +566,14 @@ class SniperEngine:
             price = q.get('lastPrice', 0)
             if not price: return None
 
-            order_book = q.get('order', {})
-            best_asks = order_book.get('bestAsks', []) or []
-            best_bids = order_book.get('bestBids', []) or []
-            best_ask = best_asks[0].get('price') if best_asks else None
-            best_bid = best_bids[0].get('price') if best_bids else None
-
             pct = q.get('changePercent', 0)
             vol_lots = q.get('total', {}).get('tradeVolume', 0)
             
-            if vol_lots == 0 and code in self.prev_data: vol_lots = self.prev_data[code]['vol']
-            
+            # 若為第一筆，先存檔不計算 Delta
+            if self.prev_data[code]['vol'] == 0:
+                 self.prev_data[code] = {'vol': vol_lots, 'price': price}
+                 return None
+
             vol = vol_lots * 1000
             est_lots = _calc_est_vol(vol_lots)
             ratio = est_lots / base_vol_5ma if base_vol_5ma > 0 else 0
@@ -545,19 +581,20 @@ class SniperEngine:
             total_val = q.get('total', {}).get('tradeValue', 0)
             vwap = (total_val / vol) if vol > 0 else price
 
+            # [Tick Rule Logic]
             delta_net = 0
-            if code in self.prev_data:
-                prev_v = self.prev_data[code]['vol']
-                delta_v = vol_lots - prev_v
-                if delta_v > 0:
-                    if best_ask and price >= best_ask: delta_net = int(delta_v)
-                    elif best_bid and price <= best_bid: delta_net = -int(delta_v)
-                    else:
-                        prev_p = self.prev_data[code]['price']
-                        if price > prev_p: delta_net = int(delta_v)
-                        elif price < prev_p: delta_net = -int(delta_v)
-
+            prev_v = self.prev_data[code]['vol']
+            prev_p = self.prev_data[code]['price']
+            
+            delta_v = vol_lots - prev_v
+            
+            if delta_v > 0:
+                if price > prev_p: delta_net = int(delta_v)      # 外盤 (主動買)
+                elif price < prev_p: delta_net = -int(delta_v)   # 內盤 (主動賣)
+                # 若價格不變，這裡暫時忽略或沿用上筆 (為求穩健暫設0)
+            
             self.prev_data[code] = {'vol': vol_lots, 'price': price}
+            
             now_ts = time.time()
             if code not in self.vol_queues: self.vol_queues[code] = []
             if delta_net != 0: self.vol_queues[code].append((now_ts, delta_net))
@@ -636,13 +673,14 @@ engine = get_engine()
 # 8. UI Rendering
 # ==========================================
 def render_dashboard():
-    # 使用靠左對齊的字串，避免縮排導致程式碼區塊顯示問題
+    # [FIX] Z-Index & Position Fix
     st.markdown("""
 <style>
     #chart-tooltip {
-        display: none; position: fixed; z-index: 9999;
+        display: none; position: fixed; 
+        z-index: 999999; /* 強制最上層 */
         background-color: #0e1117; border: 1px solid #444;
-        border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.8);
         padding: 5px; width: 420px; pointer-events: none;
     }
     #chart-tooltip img { width: 100%; height: auto; border-radius: 4px; }
@@ -659,7 +697,7 @@ def render_dashboard():
 
 <script>
     window.showTooltip = function(event, b64_data) {
-        if (!b64_data) return;
+        if (!b64_data || b64_data === "") return;
         const tooltip = document.getElementById('chart-tooltip');
         const img = document.getElementById('tooltip-img');
         img.src = b64_data;
@@ -673,7 +711,9 @@ def render_dashboard():
         const tooltip = document.getElementById('chart-tooltip');
         let left = event.clientX + 15;
         let top = event.clientY + 15;
+        // 邊界檢查防止破圖
         if (left + 420 > window.innerWidth) left = event.clientX - 435;
+        if (top + 300 > window.innerHeight) top = event.clientY - 315;
         tooltip.style.left = left + 'px';
         tooltip.style.top = top + 'px';
     }
@@ -736,7 +776,6 @@ def render_dashboard():
         name_html = f"<a href='https://tw.stock.yahoo.com/quote/{code}.TW' target='_blank' style='text-decoration:none; color:#3498db;'>{row['name']}</a>"
         if is_twii: name_html = row['name']
 
-        # TR 生成 (無縮排)
         tr = f"""<tr class="{row_class}" 
 onmouseover="window.showTooltip(event, '{chart_b64}')" 
 onmouseout="window.hideTooltip()" 
@@ -759,7 +798,7 @@ onmousemove="window.moveTooltip(event)">
 # 9. Main Layout
 # ==========================================
 with st.sidebar:
-    st.title("🦅 Sniper Hybrid v7.0")
+    st.title("🦅 Sniper v7.1 Pro")
     
     col1, col2 = st.columns(2)
     with col1:
