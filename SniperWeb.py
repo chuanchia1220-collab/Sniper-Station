@@ -24,7 +24,7 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v7.2 Ultimate", page_icon="🦅", layout="wide")
+st.set_page_config(page_title="Sniper v7.3 Architect", page_icon="🦅", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
@@ -36,7 +36,7 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v7_ult.db"
+DB_PATH = "sniper_v7_arch.db"
 
 DEFAULT_WATCHLIST = "3006 3037 1513 3189 1795 3491 8046 6274"
 DEFAULT_INVENTORY = """2481,84.4,3
@@ -243,7 +243,8 @@ class ChartPainter:
         self.chart_cache = {}
         self.running = False
         self._lock = threading.Lock()
-        self.client = RestClient(api_key=API_KEYS[0]) if API_KEYS else None
+        # [Fix 5: Load Balancing] 讓 Painter 也能輪替使用 Key，避免鎖定
+        self.client_cycle = cycle([RestClient(api_key=k) for k in API_KEYS]) if API_KEYS else None
 
     def start(self):
         if not self.running:
@@ -271,9 +272,11 @@ class ChartPainter:
             except Exception: time.sleep(5)
 
     def _generate_chart(self, code, style):
-        if not self.client: return
+        if not self.client_cycle: return
+        client = next(self.client_cycle) # 輪替 Key
+        
         try:
-            chart_res = self.client.stock.intraday.chart(symbol=code, type='1k')
+            chart_res = client.stock.intraday.chart(symbol=code, type='5k')
             if not chart_res or 'data' not in chart_res: return
             
             data = chart_res['data']
@@ -442,14 +445,17 @@ class SniperEngine:
 
     def _deep_backfill(self, client, code):
         try:
+            # 1. 總量回補 (修正單位: 股 -> 張)
             chart = client.stock.intraday.chart(symbol=code, type='1k')
             daily_sim = 0
             if chart and 'data' in chart:
                 for k in chart['data']:
-                    o = k.get('open', 0); c = k.get('close', 0); v = k.get('volume', 0)
+                    o = k.get('open', 0); c = k.get('close', 0)
+                    v = k.get('volume', 0) / 1000 # [Fix 3] 股轉張
                     if c > o: daily_sim += v
                     elif c < o: daily_sim -= v
 
+            # 2. 結構回補 (修正單位 + 時區)
             deals = client.stock.intraday.deal(symbol=code, limit=50)
             temp_queue = []
             last_price = 0
@@ -462,8 +468,9 @@ class SniperEngine:
                 
                 for d in trade_data:
                     p = d['price']
-                    v = d['volume']
-                    ts = pd.to_datetime(d['at']).timestamp()
+                    v = d['volume'] / 1000 # [Fix 3] 股轉張
+                    # [Fix 4] 時區修正
+                    ts = pd.to_datetime(d['at'], utc=True).timestamp()
                     
                     delta = 0
                     if p > last_price: delta = v
@@ -543,26 +550,21 @@ class SniperEngine:
             pct = q.get('changePercent', 0)
             vol_lots = q.get('total', {}).get('tradeVolume', 0)
             
+            # [Fix 2] 第一筆資料不 Return，初始化後繼續執行
             if self.prev_data[code]['vol'] == 0:
                  self.prev_data[code] = {'vol': vol_lots, 'price': price}
-                 return None
-
-            vol = vol_lots * 1000
-            est_lots = _calc_est_vol(vol_lots)
-            ratio = est_lots / base_vol_5ma if base_vol_5ma > 0 else 0
-            ratio_yest = est_lots / base_vol_yest if base_vol_yest > 0 else 0
-            total_val = q.get('total', {}).get('tradeValue', 0)
-            vwap = (total_val / vol) if vol > 0 else price
-
-            delta_net = 0
-            prev_v = self.prev_data[code]['vol']
-            prev_p = self.prev_data[code]['price']
-            
-            delta_v = vol_lots - prev_v
-            
-            if delta_v > 0:
-                if price > prev_p: delta_net = int(delta_v)
-                elif price < prev_p: delta_net = -int(delta_v)
+                 delta_net = 0 # 設為 0 並繼續
+            else:
+                 # 正常計算 Delta
+                 delta_net = 0
+                 prev_v = self.prev_data[code]['vol']
+                 prev_p = self.prev_data[code]['price']
+                 
+                 delta_v = vol_lots - prev_v
+                 
+                 if delta_v > 0:
+                     if price > prev_p: delta_net = int(delta_v)
+                     elif price < prev_p: delta_net = -int(delta_v)
             
             self.prev_data[code] = {'vol': vol_lots, 'price': price}
             
@@ -644,7 +646,7 @@ engine = get_engine()
 # 8. UI Rendering (Ultimate Stable Fix)
 # ==========================================
 
-# 1. 靜態資源注入 (只執行一次，不放入 Fragment)
+# 1. 靜態資源注入 (只執行一次)
 def render_static_assets():
     st.markdown("""
 <style>
@@ -669,7 +671,6 @@ def render_static_assets():
 <div id="chart-tooltip"><img id="tooltip-img" src="" /></div>
 
 <script>
-    // 定義全域函數
     window.showTooltip = function(event, b64_data) {
         if (!b64_data || b64_data === "" || b64_data === "None") return;
         const tooltip = document.getElementById('chart-tooltip');
@@ -693,16 +694,8 @@ def render_static_assets():
 </script>
 """, unsafe_allow_html=True)
 
-try:
-    from streamlit import fragment
-except ImportError:
-    def fragment(run_every=None):
-        def decorator(f): return f
-        return decorator
-
-# 2. 動態表格渲染 (只刷新表格內容)
-@fragment(run_every=5)
-def render_live_table():
+# 2. 純表格生成 (不含 JS/CSS)
+def render_table_only():
     df = db.get_watchlist_view()
     
     if engine.twii_data:
@@ -758,7 +751,7 @@ def render_live_table():
         name_html = f"<a href='https://tw.stock.yahoo.com/quote/{code}.TW' target='_blank' style='text-decoration:none; color:#3498db;'>{row['name']}</a>"
         if is_twii: name_html = row['name']
 
-        # [CRITICAL Fix] 改用 data-img 傳遞 Base64，防止引號衝突
+        # 使用 data-img 傳遞 Base64
         tr = f"""<tr class="{row_class}" 
 data-img="{chart_b64}"
 onmouseover="window.showTooltip(event, this.dataset.img)" 
@@ -781,15 +774,15 @@ onmousemove="window.moveTooltip(event)">
 # ==========================================
 # 9. Main Layout
 # ==========================================
-render_static_assets() # 啟動時先注入一次靜態資源
+render_static_assets() # 1. 注入 CSS/JS
 
 with st.sidebar:
-    st.title("🦅 Sniper v7.2 Ultimate")
+    st.title("🦅 Sniper v7.3 Architect")
     
     col1, col2 = st.columns(2)
     with col1:
         if st.button("🚀 啟動"):
-            engine.start(); st.toast("系統全開：引擎 + 繪圖師")
+            engine.start(); st.toast("系統全開")
             st.rerun()
     with col2:
         if st.button("🛑 停止"):
@@ -801,7 +794,7 @@ with st.sidebar:
         if st.button("更新庫存"): db.update_inventory_list(inv_txt); engine.update_targets()
         
         watch_txt = st.text_area("監控", DEFAULT_WATCHLIST)
-        if st.button("更新監控 (含回測)"):
+        if st.button("更新監控"):
             if not API_KEYS: st.error("No API Key")
             else:
                 db.update_watchlist(watch_txt)
@@ -814,5 +807,14 @@ with st.sidebar:
 
     st.caption(f"Status: {'RUNNING' if engine.running else 'STOPPED'}")
 
-# 呼叫 Fragment 循環
-render_live_table()
+# 3. [Fix 1] 使用 Placeholder Loop 替代 Fragment
+placeholder = st.empty()
+
+while True:
+    with placeholder:
+        # 這裡放入一個 container 來重新渲染表格
+        with st.container():
+            render_table_only()
+    
+    # 降低刷新頻率以節省資源，同時讓 JS 有機會執行
+    time.sleep(2)
