@@ -247,7 +247,6 @@ def fetch_static_stats(client, code):
 # 5. Visual Core: Chart Painter 
 # ==========================================
 class ChartPainter:
-class ChartPainter:
     def __init__(self, engine_ref):
         self.engine = engine_ref
         self.chart_cache = {}  # {code: base64_string}
