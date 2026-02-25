@@ -11,3 +11,5 @@ plotly
 openai
 kaleido
 colorama
+mplfinance
+matplotlib
