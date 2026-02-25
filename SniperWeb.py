@@ -94,7 +94,6 @@ class Database:
 
     def _init_db(self):
         conn = self._get_conn(); c = conn.cursor()
-        # Realtime table 增加 signal_type 欄位
         c.execute('''CREATE TABLE IF NOT EXISTS realtime (
             code TEXT PRIMARY KEY, name TEXT, category TEXT, price REAL, pct REAL, 
             vwap REAL, vol REAL, est_vol REAL, ratio REAL, net_1h REAL, net_10m REAL, net_day REAL, 
@@ -103,7 +102,6 @@ class Database:
             ratio_yest REAL, active_light INTEGER DEFAULT 0
         )''')
         
-        # 嘗試補加欄位 (Migration)
         try: c.execute("ALTER TABLE realtime ADD COLUMN signal_type TEXT DEFAULT 'NONE'")
         except: pass
         try: c.execute("ALTER TABLE realtime ADD COLUMN active_light INTEGER DEFAULT 0")
@@ -229,7 +227,6 @@ def _calc_est_vol(current_vol):
     return int(current_vol * (270 / elapsed_minutes) / weight)
 
 def fetch_static_stats(client, code):
-    # 用於 "初始化" 時的靜態數據抓取
     try:
         suffix = ".TW"
         if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
@@ -239,12 +236,11 @@ def fetch_static_stats(client, code):
             vol_yest = int(hist['Volume'].iloc[-2]) // 1000
             vol_5ma = int(hist['Volume'].tail(5).mean()) // 1000
             price_5ma = float(hist['Close'].tail(5).mean())
-        # 這裡簡化回測，實戰可保留原本的 _run_quick_backtest
         return vol_5ma, vol_yest, price_5ma, 50, 0, 0 
     except: return 0, 0, 0, 0, 0, 0
 
 # ==========================================
-# 5. Visual Core: Chart Painter 
+# 5. Visual Core: Chart Painter (Full Fugle)
 # ==========================================
 class ChartPainter:
     def __init__(self, engine_ref):
@@ -252,7 +248,7 @@ class ChartPainter:
         self.chart_cache = {}  # {code: base64_string}
         self.running = False
         self._lock = threading.Lock()
-        # 建立一個專用的 Client 給畫家用，避免跟 Engine 搶
+        # 專屬 Client，避免與 Engine 搶佔
         self.client = RestClient(api_key=API_KEYS[0]) if API_KEYS else None
 
     def start(self):
@@ -263,7 +259,7 @@ class ChartPainter:
     def stop(self): self.running = False
 
     def _paint_loop(self):
-        # 設定暗黑風格
+        # 戰術暗黑風格
         mc = mpf.make_marketcolors(up='#ff4d4f', down='#2ecc71', inherit=True)
         style = mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc, gridstyle=':', facecolor='#0e1117')
         
@@ -275,45 +271,39 @@ class ChartPainter:
 
                 for code in targets:
                     if not self.running: break
-                    time.sleep(0.5) # Fugle API 速度快，但仍需避免過熱
+                    time.sleep(0.5) # Fugle API 保護
                     self._generate_chart(code, style)
                 
-                time.sleep(20) # 畫完一輪休息 20 秒
-            except Exception as e:
-                print(f"Painter Loop Error: {e}")
-                time.sleep(5)
+                time.sleep(20) # 輪詢間隔
+            except Exception: time.sleep(5)
 
     def _generate_chart(self, code, style):
         if not self.client: return
         try:
-            # 🔥 [修正] 改用 Fugle API 抓取 K 線 (取代 yfinance)
-            chart_res = self.client.stock.intraday.chart(symbol=code, type='5k') # 用 5分K 畫圖
+            # 🔥 Fugle API 抓取 K 線
+            chart_res = self.client.stock.intraday.chart(symbol=code, type='5k')
             if not chart_res or 'data' not in chart_res: return
             
             data = chart_res['data']
             if not data: return
 
-            # 轉換為 DataFrame
             df = pd.DataFrame(data)
-            # Fugle 回傳欄位: open, high, low, close, volume, unit, time
             df['Date'] = pd.to_datetime(df['time'])
             df.set_index('Date', inplace=True)
             df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
             
-            # 確保數據格式正確 (float)
             for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                 df[col] = df[col].astype(float)
 
-            # 計算 VWAP
+            # VWAP
             df['Cum_Vol'] = df['Volume'].cumsum()
             df['Cum_Val'] = (df['Close'] * df['Volume']).cumsum()
             df['VWAP'] = df['Cum_Val'] / df['Cum_Vol']
             
-            # 取得即時 Net Day (顯示在圖上)
             net_day = self.engine.daily_net.get(code, 0)
             net_color = '#ff4d4f' if net_day > 0 else '#2ecc71'
             
-            # 繪圖
+            # Plot
             fig, axlist = mpf.plot(
                 df, type='candle', style=style, volume=True, 
                 mav=(5), returnfig=True, figsize=(5, 3.5), 
@@ -322,16 +312,13 @@ class ChartPainter:
             ax_main = axlist[0]
             ax_main.plot(range(len(df)), df['VWAP'], color='yellow', linewidth=1.5, alpha=0.7)
             
-            # 標註 Net Day
             ax_main.text(0.05, 0.95, f"Net Day: {net_day}", transform=ax_main.transAxes, 
                          color=net_color, fontsize=12, fontweight='bold', va='top')
             
-            # 標註更新時間
             now_str = datetime.now().strftime("%H:%M")
             ax_main.text(0.95, 0.95, f"Update: {now_str}", transform=ax_main.transAxes, 
                          color='white', fontsize=8, va='top', ha='right')
 
-            # 轉檔 Base64
             buf = io.BytesIO()
             fig.savefig(buf, format='png', bbox_inches='tight', facecolor='#0e1117')
             buf.seek(0)
@@ -342,9 +329,7 @@ class ChartPainter:
             
             plt.close(fig)
             del df
-        except Exception as e:
-            # print(f"Chart Gen Error {code}: {e}") # Debug
-            pass
+        except Exception: pass
 
 # ==========================================
 # 6. Notification System
@@ -368,12 +353,10 @@ class NotificationManager:
         if event.is_test: return True
         if not MarketSession.is_market_open(): return False
         
-        # 策略過濾：勝率過低不報
         if event.win_rate < 40 and event.event_kind == "STRATEGY": return False
         
         key = f"{event.code}_{event.scope}_{event.event_label}"
         
-        # 庫存重要訊號不擋
         if event.scope == "inventory" and event.event_label in ["💀出貨", "🚨撤退", "🔥攻擊"]:
             if "撤退" in event.event_label:
                  if time.time() - self._cooldowns.get(key, 0) < 300: return False
@@ -421,19 +404,17 @@ class SniperEngine:
         self.clients = [RestClient(api_key=k) for k in API_KEYS] if API_KEYS else []
         self.client_cycle = cycle(self.clients) if self.clients else None
         
-        # Data Containers
         self.targets = []
         self.inventory_codes = []
         self.base_vol_cache = {} 
-        self.daily_net = {}       # {code: net_volume}
-        self.prev_data = {}       # {code: {vol, price}}
-        self.vol_queues = {}      # {code: [(ts, delta), ...]}
-        self.active_flags = {}    # {code: bool}
+        self.daily_net = {}       
+        self.prev_data = {}       
+        self.vol_queues = {}      
+        self.active_flags = {}    
         self.market_stats = {"Time": 0}
         self.twii_data = None
         self.last_reset = datetime.now().date()
         
-        # Components
         self.painter = ChartPainter(self)
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
@@ -469,96 +450,50 @@ class SniperEngine:
             self.market_stats["Time"] = time.time()
         except: pass
 
-def _backfill_intraday_net(self, client, code):
-        """ 🔥 強力回補：從 Fugle 1分K 推算早盤籌碼 """
+    def _backfill_intraday_net(self, client, code):
+        """ 🔥 K線回補邏輯：從 1分K 推算早盤籌碼 """
         try:
-            # 呼叫 1分K 數據
             chart = client.stock.intraday.chart(symbol=code, type='1k')
-            if not chart or 'data' not in chart: 
-                return 0
+            if not chart or 'data' not in chart: return 0
             
             sim_net = 0
             for k in chart['data']:
                 o = k.get('open', 0)
                 c = k.get('close', 0)
                 v = k.get('volume', 0)
-                
-                # 簡單算法：紅K加項，黑K減項
                 if c > o: sim_net += v
                 elif c < o: sim_net -= v
-            
-            # Debug: 如果回補有數值，印出來看看 (或是用 st.toast)
-            if sim_net != 0:
-                print(f"[Backfill] {code}: {sim_net}")
-                
             return int(sim_net)
-        except Exception as e:
-            print(f"[Backfill Error] {code}: {e}")
-            return 0
+        except: return 0
 
-def _fetch_stock(self, code, now_time=None):
-        try:
-            if now_time is None: now_time = datetime.now(timezone.utc) + timedelta(hours=8)
-            client = next(self.client_cycle) if self.client_cycle else None
-            if not client: return None
-
-            # [🔥 Backfill Check] 
-            # 邏輯修正：只要 daily_net 中沒有這個 code，或者值為 0 且現在已經開盤很久了，就嘗試回補一次
-            if code not in self.daily_net:
-                val = self._backfill_intraday_net(client, code)
-                self.daily_net[code] = val
-                # 初始化 prev_data 避免第一筆 tick 暴衝
-                q_init = client.stock.intraday.quote(symbol=code)
-                if q_init and 'lastPrice' in q_init:
-                     self.prev_data[code] = {'vol': q_init['total']['tradeVolume'], 'price': q_init['lastPrice']}
-
-            static_data = self.base_vol_cache.get(code, {})
-            # ... (保持原本程式碼不變) ...
-
-def _hybrid_strategy(self, code, price, pct, vwap, net_day, net_1h, ratio, now_time):
-        """ ⚖️ 混合策略中心：決定是當沖還是隔日沖 """
-        
+    def _hybrid_strategy(self, code, price, pct, vwap, net_day, net_1h, ratio, now_time):
         signal = "盤整"
-        signal_type = "NONE" # DAY (當沖) / SWING (隔日)
+        signal_type = "NONE"
         
         is_bullish = price >= (vwap * 1.005)
         is_bearish = price < (vwap * 0.995)
         
-        # --- 時間軸分割 ---
         is_morning = now_time.hour < 12
         is_afternoon = now_time.hour >= 12
 
-        # 1. ☀️ 早盤當沖邏輯 (09:00 - 12:00)
-        # 重視速率 (Velocity) 與 1H 動能
         if is_morning:
             if ratio >= 1.2 and is_bullish and net_1h > 0:
-                signal = "🔥攻擊"
-                signal_type = "DAY"
+                signal = "🔥攻擊"; signal_type = "DAY"
             elif ratio >= 1.5 and is_bearish and net_1h < 0:
-                signal = "💀出貨"
-                signal_type = "DAY"
+                signal = "💀出貨"; signal_type = "DAY"
             elif is_bullish and net_1h > 50 and ratio > 0.8: 
-                signal = "💣伏擊"
-                signal_type = "DAY"
+                signal = "💣伏擊"; signal_type = "DAY"
 
-        # 2. 🌙 尾盤隔日沖/鎖碼邏輯 (12:00 - 13:30)
-        # 重視存量 (Volume) 與型態守護
         elif is_afternoon:
             if pct >= 9.5:
-                signal = "👑漲停"
-                signal_type = "SWING"
-            # 鎖碼條件：漲幅 2%~8.5%，Net Day 大買，且價格在高檔
+                signal = "👑漲停"; signal_type = "SWING"
             elif 2.0 < pct < 8.5 and net_day > 150 and price > vwap * 1.01:
-                signal = "🌙鎖碼" 
-                signal_type = "SWING"
+                signal = "🌙鎖碼"; signal_type = "SWING"
             elif net_1h < -50 and price < vwap:
-                signal = "💀尾盤殺"
-                signal_type = "SWING" # 隔日空
+                signal = "💀尾盤殺"; signal_type = "SWING"
             elif pct > 3.0 and net_1h > 0:
-                signal = "🔥尾盤"
-                signal_type = "SWING"
+                signal = "🔥尾盤"; signal_type = "SWING"
 
-        # 基本狀態描述修正
         if signal == "盤整":
             if net_1h > 0 and is_bullish: signal = "🔥吸籌"
             elif net_1h < 0 and not is_bullish: signal = "💀倒貨"
@@ -573,22 +508,25 @@ def _hybrid_strategy(self, code, price, pct, vwap, net_day, net_1h, ratio, now_t
             client = next(self.client_cycle) if self.client_cycle else None
             if not client: return None
 
-            # [Backfill Check] 新增標的自動回補
+            # [🔥 Backfill] 若無日累計，則嘗試回補
             if code not in self.daily_net:
                 self.daily_net[code] = self._backfill_intraday_net(client, code)
+                # 初始化 prev_data
+                try:
+                    init_q = client.stock.intraday.quote(symbol=code)
+                    if init_q and 'lastPrice' in init_q:
+                        self.prev_data[code] = {'vol': init_q['total']['tradeVolume'], 'price': init_q['lastPrice']}
+                except: pass
 
             static_data = self.base_vol_cache.get(code, {})
             base_vol_5ma = static_data.get('vol_5ma', 0)
             base_vol_yest = static_data.get('vol_yest', 0)
-            price_5ma = static_data.get('price_5ma', 0)
             win_rate = static_data.get('win_rate', 0)
-            avg_amp = static_data.get('avg_amp', 0)
 
             q = client.stock.intraday.quote(symbol=code)
             price = q.get('lastPrice', 0)
             if not price: return None
 
-            # Tick 計算
             order_book = q.get('order', {})
             best_asks = order_book.get('bestAsks', []) or []
             best_bids = order_book.get('bestBids', []) or []
@@ -607,7 +545,6 @@ def _hybrid_strategy(self, code, price, pct, vwap, net_day, net_1h, ratio, now_t
             total_val = q.get('total', {}).get('tradeValue', 0)
             vwap = (total_val / vol) if vol > 0 else price
 
-            # Net Volume Calculation
             delta_net = 0
             if code in self.prev_data:
                 prev_v = self.prev_data[code]['vol']
@@ -632,17 +569,12 @@ def _hybrid_strategy(self, code, price, pct, vwap, net_day, net_1h, ratio, now_t
             net_10m = sum(x[1] for x in self.vol_queues[code] if x[0] > now_ts - 600)
             net_day = self.daily_net.get(code, 0)
 
-            # [混合策略判讀]
             raw_signal, signal_type = self._hybrid_strategy(code, price, pct, vwap, net_day, net_1h, ratio, now_time)
             
-            # Active Light (VWAP + Time Check)
             active_light = 1 if (price >= vwap * 1.005) and (now_time.time() >= dt_time(9, 5)) else 0
-
-            # TP/SL
             tp_price = adjust_to_tick(vwap * 1.025, 'round')
             sl_price = adjust_to_tick(vwap * 0.985, 'floor')
 
-            # Event Dispatch
             event_label = None
             if raw_signal in ["🔥攻擊", "💣伏擊", "🌙鎖碼", "🔥尾盤", "👑漲停", "💀出貨", "💀尾盤殺"]:
                 event_label = raw_signal
@@ -651,7 +583,6 @@ def _hybrid_strategy(self, code, price, pct, vwap, net_day, net_1h, ratio, now_t
             
             if event_label and code not in self.active_flags:
                 if "攻擊" in event_label or "鎖碼" in event_label: self.active_flags[code] = True
-                
                 ev = SniperEvent(
                     code=code, name=get_stock_name(code), scope=scope,
                     event_kind="STRATEGY", event_label=event_label, signal_type=signal_type,
@@ -695,7 +626,6 @@ def _hybrid_strategy(self, code, price, pct, vwap, net_day, net_1h, ratio, now_t
                 time.sleep(1.5 if MarketSession.is_market_open(now) else 5)
             except Exception: time.sleep(5)
 
-# Singleton Engine using Streamlit Cache to persist across re-runs
 @st.cache_resource
 def get_engine():
     return SniperEngine()
@@ -703,11 +633,10 @@ def get_engine():
 engine = get_engine()
 
 # ==========================================
-# 8. UI Rendering (Inject JS + Table)
+# 8. UI Rendering
 # ==========================================
 def render_dashboard():
-    # CSS/JS Injection for Hover Chart
-    # 使用一條長的字串或 textwrap.dedent 來避免縮排問題
+    # 使用靠左對齊的字串，避免縮排導致程式碼區塊顯示問題
     st.markdown("""
 <style>
     #chart-tooltip {
@@ -719,7 +648,6 @@ def render_dashboard():
     #chart-tooltip img { width: 100%; height: auto; border-radius: 4px; }
     tr.hover-row:hover { background-color: #262730 !important; cursor: crosshair; }
     
-    /* Table Styles */
     table.sniper-table { width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; }
     table.sniper-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; white-space: nowrap; }
     table.sniper-table td { padding: 6px; border-bottom: 1px solid #444; font-size: 15px; vertical-align: middle; white-space: nowrap; }
@@ -752,21 +680,18 @@ def render_dashboard():
 </script>
 """, unsafe_allow_html=True)
 
-    # Fetch Data
     df = db.get_watchlist_view()
     
-    # Merge TWII data
     if engine.twii_data:
         twii_row = pd.DataFrame([engine.twii_data])
         df = pd.concat([twii_row, df], ignore_index=True) if not df.empty else twii_row
 
     if df.empty: st.info("無監控數據"); return
 
-    # Numeric conversion
     for col in ['price', 'pct', 'vwap', 'ratio', 'ratio_yest', 'net_10m', 'net_1h', 'net_day', 'win_rate']:
         if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-    # HTML Table Header (注意：這裡移除了縮排)
+    # HTML 生成 (無縮排)
     table_html = """<table class="sniper-table">
 <thead>
 <tr>
@@ -781,46 +706,37 @@ def render_dashboard():
         code = str(row['code'])
         is_twii = (code == '0000')
         
-        # Colors & Style
         c_price = "#ff4d4f" if row['pct'] > 0 else "#2ecc71" if row['pct'] < 0 else "#999999"
         
-        # Signal & Type
         signal = row.get('event_label', '盤整')
         sig_type = row.get('signal_type', 'NONE')
         type_icon = "☀️" if sig_type == "DAY" else "🌙" if sig_type == "SWING" else ""
         sig_html = f"<span style='font-weight:bold; color:{c_price}'>{signal} {type_icon}</span>"
         
-        # VWAP Light
         active = row.get('active_light', 0)
         vwap_light = "🟢" if active == 1 else "🔴"
         tp_price = adjust_to_tick(row['vwap'] * 1.025)
         vwap_html = f"<span style='color:#e67e22'>{row['vwap']:.2f} {vwap_light}</span> <span style='font-size:0.8em; color:#888'>(TP:{tp_price})</span>"
         
-        # Volume Light
         vol_light = "🟢" if row['ratio'] > 1.2 else "🔴"
         ratio_html = f"{row['ratio']:.1f} {vol_light}"
         
-        # Net Light
         n1h = int(row['net_1h']); nd = int(row['net_day'])
         c1h = "#ff4d4f" if n1h > 0 else "#2ecc71"
         cd = "#ff4d4f" if nd > 0 else "#2ecc71"
         net_html = f"<span style='color:{c1h}'>{n1h}</span> / <span style='color:{cd}'>{nd}</span>"
         
-        # Hover Chart Data
         chart_b64 = engine.painter.chart_cache.get(code, "")
         
-        # Row Class (Three Lights = Golden)
         row_class = "hover-row"
         if active == 1 and row['ratio'] > 1.2 and n1h > 0: row_class += " golden-row"
         elif row.get('is_pinned'): row_class += " pinned-row"
 
         pin_icon = "📌" if row.get('is_pinned') else ""
-        
-        # Link
         name_html = f"<a href='https://tw.stock.yahoo.com/quote/{code}.TW' target='_blank' style='text-decoration:none; color:#3498db;'>{row['name']}</a>"
         if is_twii: name_html = row['name']
 
-        # TR Construction (注意：這裡也移除了縮排)
+        # TR 生成 (無縮排)
         tr = f"""<tr class="{row_class}" 
 onmouseover="window.showTooltip(event, '{chart_b64}')" 
 onmouseout="window.hideTooltip()" 
@@ -838,6 +754,7 @@ onmousemove="window.moveTooltip(event)">
         rows.append(tr)
 
     st.markdown(table_html + "".join(rows) + "</tbody></table>", unsafe_allow_html=True)
+
 # ==========================================
 # 9. Main Layout
 # ==========================================
@@ -864,7 +781,6 @@ with st.sidebar:
             else:
                 db.update_watchlist(watch_txt)
                 engine.update_targets()
-                # 簡單初始化靜態數據
                 static_data = []
                 for c in engine.targets:
                      static_data.append((c, *fetch_static_stats(None, c)))
@@ -876,7 +792,6 @@ with st.sidebar:
 try:
     from streamlit import fragment
 except ImportError:
-    # Fallback if st.fragment not available
     def fragment(run_every=None):
         def decorator(f): return f
         return decorator
