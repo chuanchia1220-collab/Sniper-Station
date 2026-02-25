@@ -247,11 +247,14 @@ def fetch_static_stats(client, code):
 # 5. Visual Core: Chart Painter 
 # ==========================================
 class ChartPainter:
+class ChartPainter:
     def __init__(self, engine_ref):
         self.engine = engine_ref
         self.chart_cache = {}  # {code: base64_string}
         self.running = False
         self._lock = threading.Lock()
+        # 建立一個專用的 Client 給畫家用，避免跟 Engine 搶
+        self.client = RestClient(api_key=API_KEYS[0]) if API_KEYS else None
 
     def start(self):
         if not self.running:
@@ -261,7 +264,7 @@ class ChartPainter:
     def stop(self): self.running = False
 
     def _paint_loop(self):
-        # 戰術暗黑風格
+        # 設定暗黑風格
         mc = mpf.make_marketcolors(up='#ff4d4f', down='#2ecc71', inherit=True)
         style = mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc, gridstyle=':', facecolor='#0e1117')
         
@@ -273,27 +276,41 @@ class ChartPainter:
 
                 for code in targets:
                     if not self.running: break
-                    time.sleep(1.0) # 避免 CPU 飆高
+                    time.sleep(0.5) # Fugle API 速度快，但仍需避免過熱
                     self._generate_chart(code, style)
                 
-                time.sleep(30) # 輪詢間隔
-            except Exception: time.sleep(5)
+                time.sleep(20) # 畫完一輪休息 20 秒
+            except Exception as e:
+                print(f"Painter Loop Error: {e}")
+                time.sleep(5)
 
     def _generate_chart(self, code, style):
+        if not self.client: return
         try:
-            # 使用 yfinance 獲取今日 K 線 (作為背景圖)
-            suffix = ".TW"
-            if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
-            df = yf.download(f"{code}{suffix}", period="1d", interval="5m", progress=False)
-            if df.empty or len(df) < 2: return
-
-            # 計算 VWAP (Yellow Line)
-            if 'VWAP' not in df.columns:
-                df['Cum_Vol'] = df['Volume'].cumsum()
-                df['Cum_Val'] = (df['Close'] * df['Volume']).cumsum()
-                df['VWAP'] = df['Cum_Val'] / df['Cum_Vol']
+            # 🔥 [修正] 改用 Fugle API 抓取 K 線 (取代 yfinance)
+            chart_res = self.client.stock.intraday.chart(symbol=code, type='5k') # 用 5分K 畫圖
+            if not chart_res or 'data' not in chart_res: return
             
-            # 取得即時數據做標註
+            data = chart_res['data']
+            if not data: return
+
+            # 轉換為 DataFrame
+            df = pd.DataFrame(data)
+            # Fugle 回傳欄位: open, high, low, close, volume, unit, time
+            df['Date'] = pd.to_datetime(df['time'])
+            df.set_index('Date', inplace=True)
+            df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+            
+            # 確保數據格式正確 (float)
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                df[col] = df[col].astype(float)
+
+            # 計算 VWAP
+            df['Cum_Vol'] = df['Volume'].cumsum()
+            df['Cum_Val'] = (df['Close'] * df['Volume']).cumsum()
+            df['VWAP'] = df['Cum_Val'] / df['Cum_Vol']
+            
+            # 取得即時 Net Day (顯示在圖上)
             net_day = self.engine.daily_net.get(code, 0)
             net_color = '#ff4d4f' if net_day > 0 else '#2ecc71'
             
@@ -306,11 +323,16 @@ class ChartPainter:
             ax_main = axlist[0]
             ax_main.plot(range(len(df)), df['VWAP'], color='yellow', linewidth=1.5, alpha=0.7)
             
-            # 左上角標註 Net Day
+            # 標註 Net Day
             ax_main.text(0.05, 0.95, f"Net Day: {net_day}", transform=ax_main.transAxes, 
                          color=net_color, fontsize=12, fontweight='bold', va='top')
+            
+            # 標註更新時間
+            now_str = datetime.now().strftime("%H:%M")
+            ax_main.text(0.95, 0.95, f"Update: {now_str}", transform=ax_main.transAxes, 
+                         color='white', fontsize=8, va='top', ha='right')
 
-            # Base64 轉換
+            # 轉檔 Base64
             buf = io.BytesIO()
             fig.savefig(buf, format='png', bbox_inches='tight', facecolor='#0e1117')
             buf.seek(0)
@@ -319,9 +341,11 @@ class ChartPainter:
             with self._lock:
                 self.chart_cache[code] = f"data:image/png;base64,{b64}"
             
-            plt.close(fig) # 釋放記憶體
+            plt.close(fig)
             del df
-        except Exception: pass
+        except Exception as e:
+            # print(f"Chart Gen Error {code}: {e}") # Debug
+            pass
 
 # ==========================================
 # 6. Notification System
@@ -446,20 +470,51 @@ class SniperEngine:
             self.market_stats["Time"] = time.time()
         except: pass
 
-    def _backfill_intraday_net(self, client, code):
-        """ 🔥 K線回補邏輯：從 1分K 推算早盤籌碼 """
+def _backfill_intraday_net(self, client, code):
+        """ 🔥 強力回補：從 Fugle 1分K 推算早盤籌碼 """
         try:
+            # 呼叫 1分K 數據
             chart = client.stock.intraday.chart(symbol=code, type='1k')
-            if not chart or 'data' not in chart: return 0
+            if not chart or 'data' not in chart: 
+                return 0
             
             sim_net = 0
             for k in chart['data']:
-                o, c, v = k.get('open'), k.get('close'), k.get('volume')
-                # 假設 Fugle API v2 回傳的是張數 (若數值過大請 /1000)
+                o = k.get('open', 0)
+                c = k.get('close', 0)
+                v = k.get('volume', 0)
+                
+                # 簡單算法：紅K加項，黑K減項
                 if c > o: sim_net += v
                 elif c < o: sim_net -= v
+            
+            # Debug: 如果回補有數值，印出來看看 (或是用 st.toast)
+            if sim_net != 0:
+                print(f"[Backfill] {code}: {sim_net}")
+                
             return int(sim_net)
-        except: return 0
+        except Exception as e:
+            print(f"[Backfill Error] {code}: {e}")
+            return 0
+
+    def _fetch_stock(self, code, now_time=None):
+        try:
+            if now_time is None: now_time = datetime.now(timezone.utc) + timedelta(hours=8)
+            client = next(self.client_cycle) if self.client_cycle else None
+            if not client: return None
+
+            # [🔥 Backfill Check] 
+            # 邏輯修正：只要 daily_net 中沒有這個 code，或者值為 0 且現在已經開盤很久了，就嘗試回補一次
+            if code not in self.daily_net:
+                val = self._backfill_intraday_net(client, code)
+                self.daily_net[code] = val
+                # 初始化 prev_data 避免第一筆 tick 暴衝
+                q_init = client.stock.intraday.quote(symbol=code)
+                if q_init and 'lastPrice' in q_init:
+                     self.prev_data[code] = {'vol': q_init['total']['tradeVolume'], 'price': q_init['lastPrice']}
+
+            static_data = self.base_vol_cache.get(code, {})
+            # ... (保持原本程式碼不變) ...
 
     def _hybrid_strategy(self, code, price, pct, vwap, net_day, net_1h, ratio, now_time):
         """ ⚖️ 混合策略中心：決定是當沖還是隔日沖 """
