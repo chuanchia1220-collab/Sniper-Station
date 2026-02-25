@@ -646,52 +646,83 @@ engine = get_engine()
 # 8. UI Rendering (Ultimate Stable Fix)
 # ==========================================
 
+def show_debug_log():
+    st.sidebar.markdown("---")
+    if st.sidebar.button("📋 輸出系統日誌 (Copy for AI)"):
+        buffer = io.StringIO()
+        buffer.write(f"=== System Time: {pd.Timestamp.now()} ===\n\n")
+
+        df = db.get_watchlist_view()
+        df['KLine_Img'] = df['code'].apply(lambda c: engine.painter.chart_cache.get(c, ""))
+
+        if not df.empty:
+            buffer.write(f"=== DataFrame Shape: {df.shape} ===\n")
+            buffer.write(f"=== Columns: {df.columns.tolist()} ===\n\n")
+
+            check_cols = ['net_10m', 'KLine_Img']
+            for col in check_cols:
+                status = "✅ Found" if col in df.columns else "❌ Missing"
+                buffer.write(f"Column [{col}]: {status}\n")
+
+            if 'KLine_Img' in df.columns:
+                sample_len = len(str(df['KLine_Img'].iloc[0])) if len(df) > 0 else 0
+                buffer.write(f"KLine Base64 Sample Length: {sample_len} (Should be > 1000)\n")
+
+            buffer.write("\n=== Head(2) Data ===\n")
+            buffer.write(df.head(2).to_string())
+        else:
+            buffer.write("❌ DataFrame is empty or not initialized.")
+
+        st.code(buffer.getvalue(), language='text')
+
 # 1. 靜態資源注入 (只執行一次)
 def render_static_assets():
     st.markdown("""
 <style>
-    #chart-tooltip {
-        display: none; position: fixed; 
-        z-index: 999999; /* 超高層級 */
-        background-color: #0e1117; border: 1px solid #444;
-        border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.8);
-        padding: 5px; width: 420px; 
-        pointer-events: none; /* 關鍵：防止滑鼠誤觸 */
+    /* 修改項目 4: 表格懸停鵝黃色 */
+    tr.hover-row:hover {
+        background-color: #FFFACD !important; /* 鵝黃色 */
+        color: #000000 !important; /* 文字黑色，確保對比度 */
+        cursor: crosshair;
     }
-    #chart-tooltip img { width: 100%; height: auto; border-radius: 4px; }
-    tr.hover-row:hover { background-color: #262730 !important; cursor: crosshair; }
+
+    /* 修改項目 1: 懸浮視窗層級修正 */
+    .tooltip {
+        position: relative;
+        display: inline-block;
+    }
+
+    .tooltip .tooltiptext {
+        visibility: hidden;
+        width: 300px; /* 根據K線圖大小調整 */
+        background-color: #2b2b2b;
+        color: #fff;
+        text-align: center;
+        border-radius: 6px;
+        padding: 5px;
+        position: absolute;
+        z-index: 9999; /* 確保最上層 */
+        bottom: 125%; /* 顯示在上方 */
+        left: 50%;
+        margin-left: -150px;
+        opacity: 0;
+        transition: opacity 0.3s;
+        box-shadow: 0px 0px 10px rgba(0,0,0,0.5);
+    }
+
+    .tooltip:hover .tooltiptext {
+        visibility: visible;
+        opacity: 1;
+    }
     
+    .tooltip .tooltiptext img { width: 100%; height: auto; border-radius: 4px; }
+
     table.sniper-table { width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; }
     table.sniper-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; white-space: nowrap; }
     table.sniper-table td { padding: 6px; border-bottom: 1px solid #444; font-size: 15px; vertical-align: middle; white-space: nowrap; }
     table.sniper-table tr.pinned-row { background-color: #fff9c4 !important; color: black !important; }
     table.sniper-table tr.golden-row { background-color: #fff9c4 !important; color: black !important; font-weight: bold; }
 </style>
-
-<div id="chart-tooltip"><img id="tooltip-img" src="" /></div>
-
-<script>
-    window.showTooltip = function(event, b64_data) {
-        if (!b64_data || b64_data === "" || b64_data === "None") return;
-        const tooltip = document.getElementById('chart-tooltip');
-        const img = document.getElementById('tooltip-img');
-        img.src = b64_data;
-        tooltip.style.display = 'block';
-        moveTooltip(event);
-    }
-    window.hideTooltip = function() {
-        document.getElementById('chart-tooltip').style.display = 'none';
-    }
-    window.moveTooltip = function(event) {
-        const tooltip = document.getElementById('chart-tooltip');
-        let left = event.clientX + 15;
-        let top = event.clientY + 15;
-        if (left + 420 > window.innerWidth) left = event.clientX - 435;
-        if (top + 300 > window.innerHeight) top = event.clientY - 315;
-        tooltip.style.left = left + 'px';
-        tooltip.style.top = top + 'px';
-    }
-</script>
 """, unsafe_allow_html=True)
 
 # 2. 純表格生成 (不含 JS/CSS)
@@ -711,7 +742,7 @@ def render_table_only():
 <thead>
 <tr>
 <th>📌</th><th>代碼</th><th>名稱 (Link)</th><th>訊號 (Type)</th><th>現價</th><th>漲跌%</th>
-<th>均價 (燈/TP)</th><th>量比</th><th>大戶 (1H/Day)</th>
+<th>均價 (燈/TP)</th><th>量比</th><th>10M</th><th>大戶 (1H/Day)</th>
 </tr>
 </thead>
 <tbody>"""
@@ -736,9 +767,11 @@ def render_table_only():
         vol_light = "🟢" if row['ratio'] > 1.2 else "🔴"
         ratio_html = f"{row['ratio']:.1f} {vol_light}"
         
-        n1h = int(row['net_1h']); nd = int(row['net_day'])
+        n10m = int(row['net_10m']); n1h = int(row['net_1h']); nd = int(row['net_day'])
+        c10m = "#ff4d4f" if n10m > 0 else "#2ecc71"
         c1h = "#ff4d4f" if n1h > 0 else "#2ecc71"
         cd = "#ff4d4f" if nd > 0 else "#2ecc71"
+        net_10m_html = f"<span style='color:{c10m}'>{n10m}</span>"
         net_html = f"<span style='color:{c1h}'>{n1h}</span> / <span style='color:{cd}'>{nd}</span>"
         
         chart_b64 = engine.painter.chart_cache.get(code, "")
@@ -748,15 +781,16 @@ def render_table_only():
         elif row.get('is_pinned'): row_class += " pinned-row"
 
         pin_icon = "📌" if row.get('is_pinned') else ""
-        name_html = f"<a href='https://tw.stock.yahoo.com/quote/{code}.TW' target='_blank' style='text-decoration:none; color:#3498db;'>{row['name']}</a>"
-        if is_twii: name_html = row['name']
 
-        # 使用 data-img 傳遞 Base64
-        tr = f"""<tr class="{row_class}" 
-data-img="{chart_b64}"
-onmouseover="window.showTooltip(event, this.dataset.img)" 
-onmouseout="window.hideTooltip()" 
-onmousemove="window.moveTooltip(event)">
+        # 名稱顯示與 Tooltip 包裹
+        base_name_html = f"<a href='https://tw.stock.yahoo.com/quote/{code}.TW' target='_blank' style='text-decoration:none; color:#3498db;'>{row['name']}</a>"
+        if is_twii: base_name_html = row['name']
+
+        name_html = base_name_html
+        if chart_b64:
+             name_html = f"""<div class="tooltip">{base_name_html}<span class="tooltiptext"><img src="{chart_b64}" /></span></div>"""
+
+        tr = f"""<tr class="{row_class}">
 <td>{pin_icon}</td>
 <td>{code}</td>
 <td>{name_html}</td>
@@ -765,6 +799,7 @@ onmousemove="window.moveTooltip(event)">
 <td><span style='color:{c_price}'>{row['pct']:.2f}%</span></td>
 <td>{vwap_html}</td>
 <td>{ratio_html}</td>
+<td>{net_10m_html}</td>
 <td>{net_html}</td>
 </tr>"""
         rows.append(tr)
@@ -805,7 +840,28 @@ with st.sidebar:
                 db.upsert_static(static_data)
                 st.success("已更新")
 
+    st.subheader("盤中即時新增")
+    new_symbol = st.text_input("輸入股號", key="new_symbol")
+    if st.button("➕ 新增即時"):
+        if new_symbol:
+            current_codes = " ".join(db.get_watchlist_view()['code'].astype(str).tolist())
+            if new_symbol not in current_codes:
+                db.update_watchlist(current_codes + " " + new_symbol)
+                engine.update_targets()
+                with st.spinner(f"Fetching {new_symbol}..."):
+                    res = engine._fetch_stock(new_symbol)
+                    if res:
+                        db.upsert_realtime_batch([res])
+                        st.toast(f"已新增 {new_symbol}")
+                        st.rerun()
+                    else:
+                        st.error("無法獲取數據")
+            else:
+                st.warning("已在清單中")
+
     st.caption(f"Status: {'RUNNING' if engine.running else 'STOPPED'}")
+
+    show_debug_log()
 
 # 3. [Fix 1] 使用 Placeholder Loop 替代 Fragment
 placeholder = st.empty()
