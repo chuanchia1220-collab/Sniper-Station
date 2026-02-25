@@ -515,7 +515,7 @@ def _fetch_stock(self, code, now_time=None):
             static_data = self.base_vol_cache.get(code, {})
             # ... (保持原本程式碼不變) ...
 
-    def _hybrid_strategy(self, code, price, pct, vwap, net_day, net_1h, ratio, now_time):
+def _hybrid_strategy(self, code, price, pct, vwap, net_day, net_1h, ratio, now_time):
         """ ⚖️ 混合策略中心：決定是當沖還是隔日沖 """
         
         signal = "盤整"
