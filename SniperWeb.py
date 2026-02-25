@@ -701,7 +701,7 @@ except ImportError:
         return decorator
 
 # 2. 動態表格渲染 (只刷新表格內容)
-@fragment(run_every=2)
+@fragment(run_every=5)
 def render_live_table():
     df = db.get_watchlist_view()
     
