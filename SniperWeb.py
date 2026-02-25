@@ -653,49 +653,50 @@ engine = get_engine()
 # ==========================================
 def render_dashboard():
     # CSS/JS Injection for Hover Chart
+    # 使用一條長的字串或 textwrap.dedent 來避免縮排問題
     st.markdown("""
-    <style>
-        #chart-tooltip {
-            display: none; position: fixed; z-index: 9999;
-            background-color: #0e1117; border: 1px solid #444;
-            border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-            padding: 5px; width: 420px; pointer-events: none;
-        }
-        #chart-tooltip img { width: 100%; height: auto; border-radius: 4px; }
-        tr.hover-row:hover { background-color: #262730 !important; cursor: crosshair; }
-        
-        /* Table Styles */
-        table.sniper-table { width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; }
-        table.sniper-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; white-space: nowrap; }
-        table.sniper-table td { padding: 6px; border-bottom: 1px solid #444; font-size: 15px; vertical-align: middle; white-space: nowrap; }
-        table.sniper-table tr.pinned-row { background-color: #fff9c4 !important; color: black !important; }
-        table.sniper-table tr.golden-row { background-color: #fff9c4 !important; color: black !important; font-weight: bold; }
-    </style>
+<style>
+    #chart-tooltip {
+        display: none; position: fixed; z-index: 9999;
+        background-color: #0e1117; border: 1px solid #444;
+        border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        padding: 5px; width: 420px; pointer-events: none;
+    }
+    #chart-tooltip img { width: 100%; height: auto; border-radius: 4px; }
+    tr.hover-row:hover { background-color: #262730 !important; cursor: crosshair; }
     
-    <div id="chart-tooltip"><img id="tooltip-img" src="" /></div>
-    
-    <script>
-        window.showTooltip = function(event, b64_data) {
-            if (!b64_data) return;
-            const tooltip = document.getElementById('chart-tooltip');
-            const img = document.getElementById('tooltip-img');
-            img.src = b64_data;
-            tooltip.style.display = 'block';
-            moveTooltip(event);
-        }
-        window.hideTooltip = function() {
-            document.getElementById('chart-tooltip').style.display = 'none';
-        }
-        window.moveTooltip = function(event) {
-            const tooltip = document.getElementById('chart-tooltip');
-            let left = event.clientX + 15;
-            let top = event.clientY + 15;
-            if (left + 420 > window.innerWidth) left = event.clientX - 435;
-            tooltip.style.left = left + 'px';
-            tooltip.style.top = top + 'px';
-        }
-    </script>
-    """, unsafe_allow_html=True)
+    /* Table Styles */
+    table.sniper-table { width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; }
+    table.sniper-table th { text-align: left; background-color: #262730; color: white; padding: 8px; font-size: 14px; white-space: nowrap; }
+    table.sniper-table td { padding: 6px; border-bottom: 1px solid #444; font-size: 15px; vertical-align: middle; white-space: nowrap; }
+    table.sniper-table tr.pinned-row { background-color: #fff9c4 !important; color: black !important; }
+    table.sniper-table tr.golden-row { background-color: #fff9c4 !important; color: black !important; font-weight: bold; }
+</style>
+
+<div id="chart-tooltip"><img id="tooltip-img" src="" /></div>
+
+<script>
+    window.showTooltip = function(event, b64_data) {
+        if (!b64_data) return;
+        const tooltip = document.getElementById('chart-tooltip');
+        const img = document.getElementById('tooltip-img');
+        img.src = b64_data;
+        tooltip.style.display = 'block';
+        moveTooltip(event);
+    }
+    window.hideTooltip = function() {
+        document.getElementById('chart-tooltip').style.display = 'none';
+    }
+    window.moveTooltip = function(event) {
+        const tooltip = document.getElementById('chart-tooltip');
+        let left = event.clientX + 15;
+        let top = event.clientY + 15;
+        if (left + 420 > window.innerWidth) left = event.clientX - 435;
+        tooltip.style.left = left + 'px';
+        tooltip.style.top = top + 'px';
+    }
+</script>
+""", unsafe_allow_html=True)
 
     # Fetch Data
     df = db.get_watchlist_view()
@@ -711,17 +712,15 @@ def render_dashboard():
     for col in ['price', 'pct', 'vwap', 'ratio', 'ratio_yest', 'net_10m', 'net_1h', 'net_day', 'win_rate']:
         if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-    # HTML Table Generation
-    table_html = """
-    <table class="sniper-table">
-    <thead>
-    <tr>
-    <th>📌</th><th>代碼</th><th>名稱 (Link)</th><th>訊號 (Type)</th><th>現價</th><th>漲跌%</th>
-    <th>均價 (燈/TP)</th><th>量比</th><th>大戶 (1H/Day)</th>
-    </tr>
-    </thead>
-    <tbody>
-    """
+    # HTML Table Header (注意：這裡移除了縮排)
+    table_html = """<table class="sniper-table">
+<thead>
+<tr>
+<th>📌</th><th>代碼</th><th>名稱 (Link)</th><th>訊號 (Type)</th><th>現價</th><th>漲跌%</th>
+<th>均價 (燈/TP)</th><th>量比</th><th>大戶 (1H/Day)</th>
+</tr>
+</thead>
+<tbody>"""
     
     rows = []
     for _, row in df.iterrows():
@@ -767,26 +766,24 @@ def render_dashboard():
         name_html = f"<a href='https://tw.stock.yahoo.com/quote/{code}.TW' target='_blank' style='text-decoration:none; color:#3498db;'>{row['name']}</a>"
         if is_twii: name_html = row['name']
 
-        tr = f"""
-        <tr class="{row_class}" 
-            onmouseover="window.showTooltip(event, '{chart_b64}')" 
-            onmouseout="window.hideTooltip()" 
-            onmousemove="window.moveTooltip(event)">
-            <td>{pin_icon}</td>
-            <td>{code}</td>
-            <td>{name_html}</td>
-            <td>{sig_html}</td>
-            <td><span style='color:{c_price}; font-weight:bold'>{row['price']:.2f}</span></td>
-            <td><span style='color:{c_price}'>{row['pct']:.2f}%</span></td>
-            <td>{vwap_html}</td>
-            <td>{ratio_html}</td>
-            <td>{net_html}</td>
-        </tr>
-        """
+        # TR Construction (注意：這裡也移除了縮排)
+        tr = f"""<tr class="{row_class}" 
+onmouseover="window.showTooltip(event, '{chart_b64}')" 
+onmouseout="window.hideTooltip()" 
+onmousemove="window.moveTooltip(event)">
+<td>{pin_icon}</td>
+<td>{code}</td>
+<td>{name_html}</td>
+<td>{sig_html}</td>
+<td><span style='color:{c_price}; font-weight:bold'>{row['price']:.2f}</span></td>
+<td><span style='color:{c_price}'>{row['pct']:.2f}%</span></td>
+<td>{vwap_html}</td>
+<td>{ratio_html}</td>
+<td>{net_html}</td>
+</tr>"""
         rows.append(tr)
 
     st.markdown(table_html + "".join(rows) + "</tbody></table>", unsafe_allow_html=True)
-
 # ==========================================
 # 9. Main Layout
 # ==========================================
