@@ -496,7 +496,7 @@ def _backfill_intraday_net(self, client, code):
             print(f"[Backfill Error] {code}: {e}")
             return 0
 
-    def _fetch_stock(self, code, now_time=None):
+def _fetch_stock(self, code, now_time=None):
         try:
             if now_time is None: now_time = datetime.now(timezone.utc) + timedelta(hours=8)
             client = next(self.client_cycle) if self.client_cycle else None
