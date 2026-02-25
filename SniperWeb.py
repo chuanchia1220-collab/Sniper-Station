@@ -13,10 +13,10 @@ import matplotlib
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 
-# [CRITICAL] 設定 Matplotlib 為非互動模式，防止 Streamlit 在背景繪圖時崩潰
+# [CRITICAL] 設定 Matplotlib 為非互動模式
 matplotlib.use('Agg')
 
-# [LOG FIX] 過濾雜訊
+# [LOG FIX]
 warnings.filterwarnings("ignore")
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 pd.set_option('future.no_silent_downcasting', True)
@@ -24,9 +24,8 @@ pd.set_option('future.no_silent_downcasting', True)
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v7.1 Pro", page_icon="🦅", layout="wide")
+st.set_page_config(page_title="Sniper v7.2 Ultimate", page_icon="🦅", layout="wide")
 
-# 嘗試讀取 Secrets 或環境變數
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
     TG_BOT_TOKEN = st.secrets.get("TG_BOT_TOKEN", "")
@@ -37,9 +36,8 @@ except:
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
-DB_PATH = "sniper_v7_pro.db"
+DB_PATH = "sniper_v7_ult.db"
 
-# 預設清單
 DEFAULT_WATCHLIST = "3006 3037 1513 3189 1795 3491 8046 6274"
 DEFAULT_INVENTORY = """2481,84.4,3
 3231,150.14,7
@@ -51,9 +49,9 @@ class SniperEvent:
     code: str
     name: str
     scope: str
-    event_kind: str     # STRATEGY
-    event_label: str    # 攻擊/伏擊/鎖碼...
-    signal_type: str    # DAY (當沖) / SWING (隔日)
+    event_kind: str
+    event_label: str
+    signal_type: str
     price: float
     pct: float
     vwap: float
@@ -101,7 +99,6 @@ class Database:
             signal_level TEXT DEFAULT 'B', risk_status TEXT DEFAULT 'NORMAL', situation TEXT, 
             ratio_yest REAL, active_light INTEGER DEFAULT 0
         )''')
-        
         try: c.execute("ALTER TABLE realtime ADD COLUMN signal_type TEXT DEFAULT 'NONE'")
         except: pass
         try: c.execute("ALTER TABLE realtime ADD COLUMN active_light INTEGER DEFAULT 0")
@@ -111,10 +108,8 @@ class Database:
         c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS pinned (code TEXT PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, vol_5ma REAL, vol_yest REAL, price_5ma REAL, win_rate REAL DEFAULT 0, avg_ret REAL DEFAULT 0, avg_amp REAL DEFAULT 0)''')
-        
         try: c.execute("ALTER TABLE static_info ADD COLUMN avg_amp REAL DEFAULT 0")
         except: pass
-        
         conn.commit(); conn.close()
 
     def _writer_loop(self):
@@ -245,7 +240,7 @@ def fetch_static_stats(client, code):
 class ChartPainter:
     def __init__(self, engine_ref):
         self.engine = engine_ref
-        self.chart_cache = {}  # {code: base64_string}
+        self.chart_cache = {}
         self.running = False
         self._lock = threading.Lock()
         self.client = RestClient(api_key=API_KEYS[0]) if API_KEYS else None
@@ -269,17 +264,16 @@ class ChartPainter:
 
                 for code in targets:
                     if not self.running: break
-                    time.sleep(0.5) # Fugle API 保護
+                    time.sleep(0.5)
                     self._generate_chart(code, style)
                 
-                time.sleep(10) # 加快刷新頻率到 10s (提升懸浮體驗)
+                time.sleep(10)
             except Exception: time.sleep(5)
 
     def _generate_chart(self, code, style):
         if not self.client: return
         try:
-            # 修正：Fugle API 抓取 K 線
-            chart_res = self.client.stock.intraday.chart(symbol=code, type='1k') # 改用 1K 讓細節更清楚，或 5K
+            chart_res = self.client.stock.intraday.chart(symbol=code, type='1k')
             if not chart_res or 'data' not in chart_res: return
             
             data = chart_res['data']
@@ -293,10 +287,6 @@ class ChartPainter:
             for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                 df[col] = df[col].astype(float)
             
-            # 策略要求 1H/10M 結構驗證，這裡可以考慮 Resample 成 5T 或 10T 繪圖，這邊維持 1K 或 5K
-            # df = df.resample('5T').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
-
-            # VWAP
             df['Cum_Vol'] = df['Volume'].cumsum()
             df['Cum_Val'] = (df['Close'] * df['Volume']).cumsum()
             df['VWAP'] = df['Cum_Val'] / df['Cum_Vol']
@@ -304,7 +294,6 @@ class ChartPainter:
             net_day = self.engine.daily_net.get(code, 0)
             net_color = '#ff4d4f' if net_day > 0 else '#2ecc71'
             
-            # Plot
             fig, axlist = mpf.plot(
                 df, type='candle', style=style, volume=True, 
                 mav=(5), returnfig=True, figsize=(5, 3.5), 
@@ -417,7 +406,6 @@ class SniperEngine:
         self.last_reset = datetime.now().date()
         
         self.painter = ChartPainter(self)
-        # [CRITICAL] 降低併發數，防止 Fugle API 過載 (429)
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
     def update_targets(self):
@@ -453,13 +441,7 @@ class SniperEngine:
         except: pass
 
     def _deep_backfill(self, client, code):
-        """ 🔥 深度回補 (混合模式)：
-        1. 使用 chart (1k) 估算 'net_day' (累積量)
-        2. 使用 deal (limit=50) 重建 'vol_queues' (近期結構)
-        """
         try:
-            # 1. 估算全日累積 (用 Candle 簡易法，或改為 Deal 累計但會很慢)
-            # 這裡採用折衷：用 Chart 1k 來建立 daily_net 基線，這不是最準但最快
             chart = client.stock.intraday.chart(symbol=code, type='1k')
             daily_sim = 0
             if chart and 'data' in chart:
@@ -468,15 +450,14 @@ class SniperEngine:
                     if c > o: daily_sim += v
                     elif c < o: daily_sim -= v
 
-            # 2. [CRITICAL] 重建 1H/10M 結構 (使用 Deal API)
             deals = client.stock.intraday.deal(symbol=code, limit=50)
             temp_queue = []
+            last_price = 0
             
             if deals and 'data' in deals:
                 trade_data = deals['data']
-                trade_data.reverse() # 讓時間從舊到新
+                trade_data.reverse() 
                 
-                # 初始化比較價格 (取第一筆的前一筆，若無則用第一筆)
                 last_price = trade_data[0]['price'] 
                 
                 for d in trade_data:
@@ -484,7 +465,6 @@ class SniperEngine:
                     v = d['volume']
                     ts = pd.to_datetime(d['at']).timestamp()
                     
-                    # Tick Rule: Price > Last Price = Buy
                     delta = 0
                     if p > last_price: delta = v
                     elif p < last_price: delta = -v
@@ -495,9 +475,7 @@ class SniperEngine:
                     last_price = p
 
             return int(daily_sim), temp_queue, last_price
-            
-        except Exception as e:
-            # print(f"Backfill Error {code}: {e}")
+        except Exception:
             return 0, [], 0
 
     def _hybrid_strategy(self, code, price, pct, vwap, net_day, net_1h, ratio, now_time):
@@ -542,16 +520,12 @@ class SniperEngine:
             client = next(self.client_cycle) if self.client_cycle else None
             if not client: return None
 
-            # [🔥 Backfill & Init] 
-            # 檢查 prev_data 而不是 daily_net，確保初始化完整
             if code not in self.prev_data:
                 daily_val, queue_data, last_p = self._deep_backfill(client, code)
                 self.daily_net[code] = daily_val
                 self.vol_queues[code] = queue_data
-                # 初始化 prev_data
                 self.prev_data[code] = {'vol': 0, 'price': last_p if last_p > 0 else 0}
                 
-                # 若完全抓不到 deal，嘗試用 Quote 初始化
                 if last_p == 0:
                      q_init = client.stock.intraday.quote(symbol=code)
                      if q_init and 'lastPrice' in q_init:
@@ -569,7 +543,6 @@ class SniperEngine:
             pct = q.get('changePercent', 0)
             vol_lots = q.get('total', {}).get('tradeVolume', 0)
             
-            # 若為第一筆，先存檔不計算 Delta
             if self.prev_data[code]['vol'] == 0:
                  self.prev_data[code] = {'vol': vol_lots, 'price': price}
                  return None
@@ -581,7 +554,6 @@ class SniperEngine:
             total_val = q.get('total', {}).get('tradeValue', 0)
             vwap = (total_val / vol) if vol > 0 else price
 
-            # [Tick Rule Logic]
             delta_net = 0
             prev_v = self.prev_data[code]['vol']
             prev_p = self.prev_data[code]['price']
@@ -589,9 +561,8 @@ class SniperEngine:
             delta_v = vol_lots - prev_v
             
             if delta_v > 0:
-                if price > prev_p: delta_net = int(delta_v)      # 外盤 (主動買)
-                elif price < prev_p: delta_net = -int(delta_v)   # 內盤 (主動賣)
-                # 若價格不變，這裡暫時忽略或沿用上筆 (為求穩健暫設0)
+                if price > prev_p: delta_net = int(delta_v)
+                elif price < prev_p: delta_net = -int(delta_v)
             
             self.prev_data[code] = {'vol': vol_lots, 'price': price}
             
@@ -670,18 +641,20 @@ def get_engine():
 engine = get_engine()
 
 # ==========================================
-# 8. UI Rendering
+# 8. UI Rendering (Ultimate Stable Fix)
 # ==========================================
-def render_dashboard():
-    # [FIX] Z-Index & Position Fix
+
+# 1. 靜態資源注入 (只執行一次，不放入 Fragment)
+def render_static_assets():
     st.markdown("""
 <style>
     #chart-tooltip {
         display: none; position: fixed; 
-        z-index: 999999; /* 強制最上層 */
+        z-index: 999999; /* 超高層級 */
         background-color: #0e1117; border: 1px solid #444;
         border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.8);
-        padding: 5px; width: 420px; pointer-events: none;
+        padding: 5px; width: 420px; 
+        pointer-events: none; /* 關鍵：防止滑鼠誤觸 */
     }
     #chart-tooltip img { width: 100%; height: auto; border-radius: 4px; }
     tr.hover-row:hover { background-color: #262730 !important; cursor: crosshair; }
@@ -696,8 +669,9 @@ def render_dashboard():
 <div id="chart-tooltip"><img id="tooltip-img" src="" /></div>
 
 <script>
+    // 定義全域函數
     window.showTooltip = function(event, b64_data) {
-        if (!b64_data || b64_data === "") return;
+        if (!b64_data || b64_data === "" || b64_data === "None") return;
         const tooltip = document.getElementById('chart-tooltip');
         const img = document.getElementById('tooltip-img');
         img.src = b64_data;
@@ -711,7 +685,6 @@ def render_dashboard():
         const tooltip = document.getElementById('chart-tooltip');
         let left = event.clientX + 15;
         let top = event.clientY + 15;
-        // 邊界檢查防止破圖
         if (left + 420 > window.innerWidth) left = event.clientX - 435;
         if (top + 300 > window.innerHeight) top = event.clientY - 315;
         tooltip.style.left = left + 'px';
@@ -720,6 +693,16 @@ def render_dashboard():
 </script>
 """, unsafe_allow_html=True)
 
+try:
+    from streamlit import fragment
+except ImportError:
+    def fragment(run_every=None):
+        def decorator(f): return f
+        return decorator
+
+# 2. 動態表格渲染 (只刷新表格內容)
+@fragment(run_every=2)
+def render_live_table():
     df = db.get_watchlist_view()
     
     if engine.twii_data:
@@ -731,7 +714,6 @@ def render_dashboard():
     for col in ['price', 'pct', 'vwap', 'ratio', 'ratio_yest', 'net_10m', 'net_1h', 'net_day', 'win_rate']:
         if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-    # HTML 生成 (無縮排)
     table_html = """<table class="sniper-table">
 <thead>
 <tr>
@@ -776,8 +758,10 @@ def render_dashboard():
         name_html = f"<a href='https://tw.stock.yahoo.com/quote/{code}.TW' target='_blank' style='text-decoration:none; color:#3498db;'>{row['name']}</a>"
         if is_twii: name_html = row['name']
 
+        # [CRITICAL Fix] 改用 data-img 傳遞 Base64，防止引號衝突
         tr = f"""<tr class="{row_class}" 
-onmouseover="window.showTooltip(event, '{chart_b64}')" 
+data-img="{chart_b64}"
+onmouseover="window.showTooltip(event, this.dataset.img)" 
 onmouseout="window.hideTooltip()" 
 onmousemove="window.moveTooltip(event)">
 <td>{pin_icon}</td>
@@ -797,8 +781,10 @@ onmousemove="window.moveTooltip(event)">
 # ==========================================
 # 9. Main Layout
 # ==========================================
+render_static_assets() # 啟動時先注入一次靜態資源
+
 with st.sidebar:
-    st.title("🦅 Sniper v7.1 Pro")
+    st.title("🦅 Sniper v7.2 Ultimate")
     
     col1, col2 = st.columns(2)
     with col1:
@@ -828,15 +814,5 @@ with st.sidebar:
 
     st.caption(f"Status: {'RUNNING' if engine.running else 'STOPPED'}")
 
-try:
-    from streamlit import fragment
-except ImportError:
-    def fragment(run_every=None):
-        def decorator(f): return f
-        return decorator
-
-@fragment(run_every=2)
-def auto_refresh_dashboard():
-    render_dashboard()
-
-auto_refresh_dashboard()
+# 呼叫 Fragment 循環
+render_live_table()
