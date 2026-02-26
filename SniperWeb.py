@@ -681,7 +681,7 @@ class SniperEngine:
         self.last_reset = datetime.now().date()
         
         # [HARDENED] 降速保護：限制 max_workers=8 避免系統 FD 吃光
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=12)
         self._init_market_stats()
 
     def update_targets(self):
@@ -933,7 +933,7 @@ class SniperEngine:
                 # 發生嚴重異常時，強制重啟 ThreadPoolExecutor
                 try:
                     self.executor.shutdown(wait=False)
-                    self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+                    self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=12)
                 except: pass
 
 # ==========================================
