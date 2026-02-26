@@ -11,7 +11,22 @@ import logging
 import numpy as np
 import math
 from bs4 import BeautifulSoup
-import traceback  # [NEW] 用於捕捉詳細錯誤堆疊
+import traceback
+import platform
+
+# ==========================================
+# [雲端專屬防護] 最大化系統連線上限 (File Descriptors)
+# 避免發生 OSError: [Errno 24] Too many open files
+# ==========================================
+if platform.system() != "Windows":
+    try:
+        import resource
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        # 嘗試將軟上限提升至硬上限 (Streamlit Cloud 通常硬上限較大)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard_limit, hard_limit))
+        print(f"✅ [System] File Descriptor limit raised from {soft_limit} to {hard_limit}")
+    except Exception as e:
+        print(f"⚠️ [System] Could not adjust file limits: {e}")
 
 # [FIX] Colorama 防呆機制
 try:
@@ -123,11 +138,10 @@ class Database:
         self.db_path = db_path
         self.write_queue = queue.Queue()
         self._init_db()
-        # 啟動寫入執行緒
-        threading.Thread(target=self._writer_loop, daemon=True).start()
+        threading.Thread(target=self._writer_loop, daemon=True, name="DBWriterThread").start()
 
     def _get_conn(self):
-        # [HARDENED] 加入重試機制，避免瞬間鎖死
+        # [HARDENED] 自動重連與防止瞬間鎖死
         for _ in range(3):
             try:
                 return sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
@@ -151,24 +165,19 @@ class Database:
             
             conn.commit(); conn.close()
         except Exception as e:
-            print(f"[DB Init Error] {e}")
+            print(f"⚠️ [DB Init Error] {e}")
 
     def _writer_loop(self):
-        # [HARDENED] 建立專屬連線，並具備自動重連功能
         conn = self._get_conn()
         cursor = conn.cursor()
-        
         while True:
             try:
                 tasks = []
                 try: 
-                    # 阻塞式獲取，避免 CPU 空轉
                     tasks.append(self.write_queue.get(timeout=5.0))
                 except queue.Empty:
-                    # 如果太久沒任務，回到迴圈頂端，保持連線檢查
                     continue
                 
-                # 批量取出
                 while not self.write_queue.empty() and len(tasks) < 50:
                     tasks.append(self.write_queue.get())
                 
@@ -177,21 +186,18 @@ class Database:
                         if task_type == 'executemany': cursor.executemany(sql, args)
                         else: cursor.execute(sql, args)
                     except sqlite3.OperationalError:
-                        # 遇到鎖死，暫停並重試一次
                         time.sleep(0.5)
                         try:
                             if task_type == 'executemany': cursor.executemany(sql, args)
                             else: cursor.execute(sql, args)
-                        except: pass # 放棄此筆，保全大局
+                        except: pass
                     except: pass
                 
                 conn.commit()
-                
                 for _ in tasks: self.write_queue.task_done()
                 
             except sqlite3.Error as e:
-                # 發生嚴重錯誤，重啟連線
-                print(f"[DB Crash] Reconnecting... {e}")
+                print(f"⚠️ [DB Crash] Reconnecting... {e}")
                 try: conn.close()
                 except: pass
                 time.sleep(2)
@@ -200,7 +206,7 @@ class Database:
                     cursor = conn.cursor()
                 except: pass
             except Exception as e:
-                print(f"[DB Writer Error] {e}")
+                print(f"⚠️ [DB Writer Error] {e}")
                 time.sleep(1)
 
     def upsert_realtime_batch(self, data_list):
@@ -276,7 +282,6 @@ db = Database(DB_PATH)
 # ==========================================
 # 4. Utilities
 # ==========================================
-
 def adjust_to_tick(price, method='floor'):
     if price < 10: tick = 0.01
     elif price < 50: tick = 0.05
@@ -285,20 +290,14 @@ def adjust_to_tick(price, method='floor'):
     elif price < 1000: tick = 1.0
     else: tick = 5.0
     
-    if method == 'round':
-        return round(price / tick) * tick
-    else:
-        return math.floor(price / tick) * tick
+    if method == 'round': return round(price / tick) * tick
+    else: return math.floor(price / tick) * tick
 
 def _calculate_intraday_vwap(df):
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
     df.index = pd.to_datetime(df.index)
-    if df.index.tz is None:
-        df.index = df.index.tz_localize('UTC').tz_convert('Asia/Taipei')
-    else:
-        df.index = df.index.tz_convert('Asia/Taipei')
+    if df.index.tz is None: df.index = df.index.tz_localize('UTC').tz_convert('Asia/Taipei')
+    else: df.index = df.index.tz_convert('Asia/Taipei')
 
     df['Date'] = df.index.date
     df['TP_Vol'] = df['Close'] * df['Volume']
@@ -326,28 +325,20 @@ def _run_core_backtest(df, params):
         in_pos = False
         entry_p = 0; entry_v = 0
         daily_executed_trades = 0
-        
-        wave_count = 0
-        last_wave_ts = 0
-        is_holding_wave = False
+        wave_count = 0; last_wave_ts = 0; is_holding_wave = False
         
         try: yesterday_close = day_data['Close'].iloc[0] 
         except: continue
-
         max_p_after_entry = 0; trailing_active = False
 
         for ts, row in day_data.iterrows():
-            p = float(row['Close'])
-            v = float(row['VWAP'])
-            t = ts.time()
-            curr_ts = ts.timestamp()
-
+            p = float(row['Close']); v = float(row['VWAP']); t = ts.time(); curr_ts = ts.timestamp()
             if daily_executed_trades >= params['MAX_TRADES_DAY']: break
 
             entry_line = v * ENTRY_THRESHOLD
             if p >= entry_line:
                 if not is_holding_wave:
-                    if (curr_ts - last_wave_ts) > 300: # 5 mins
+                    if (curr_ts - last_wave_ts) > 300:
                         wave_count += 1
                         last_wave_ts = curr_ts
                 is_holding_wave = True
@@ -439,7 +430,6 @@ def fetch_static_stats(client, code):
             price_5ma = float(last_5_days['Close'].mean())
 
         win_rate, avg_ret, avg_amp = _run_quick_backtest(code)
-
         return vol_5ma, vol_yest, price_5ma, win_rate, avg_ret, avg_amp
     except: 
         return 0, 0, 0, 0, 0, 0
@@ -468,7 +458,6 @@ def _calc_est_vol(current_vol):
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdown, price, vwap, has_attacked, now_time, vol_lots):
     if is_breakdown: return "🚨撤退"
     if pct >= 9.5: return "👑漲停"
-    
     if now_time.time() < dt_time(9, 5): return "⏳暖機"
 
     in_golden_zone = False
@@ -476,16 +465,11 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdo
         in_golden_zone = True
 
     if ratio >= thresholds['tgt_ratio']:
-        if in_golden_zone and net_1h > 0:
-            return "🔥攻擊"
-        elif net_1h < 0:
-            return "💀出貨"
+        if in_golden_zone and net_1h > 0: return "🔥攻擊"
+        elif net_1h < 0: return "💀出貨"
         
-    if not is_bullish:
-        return "📉線下"
-        
-    if is_bullish and not in_golden_zone:
-         return "⚠️追高"
+    if not is_bullish: return "📉線下"
+    if is_bullish and not in_golden_zone: return "⚠️追高"
 
     bias = ((price - vwap) / vwap) * 100 if vwap > 0 else 0
     if bias > thresholds['overheat']: return "⚠️過熱"
@@ -514,31 +498,27 @@ class GPTAdvisor:
             if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
             full_code = f"{code}{suffix}"
             
-            # 1. Intraday Data (Recent 1H)
             df_intra = yf.download(full_code, period="1d", interval="5m", progress=False, auto_adjust=True)
             intra_str = "No Data"
             if not df_intra.empty:
-                tail_data = df_intra.tail(12) # last 60 mins
+                tail_data = df_intra.tail(12) 
                 intra_str = tail_data[['Close', 'Volume']].to_string(header=False)
             
-            # 2. Daily Data (Last 5 Days)
             df_daily = yf.download(full_code, period="5d", progress=False, auto_adjust=True)
             daily_str = "No Data"
             if not df_daily.empty:
                 if isinstance(df_daily.columns, pd.MultiIndex): df_daily.columns = df_daily.columns.get_level_values(0)
                 daily_str = df_daily[['Close', 'Volume']].to_string()
 
-            # 3. Institutional Data (Three Primary Investors) from twstock
             inst_str = "No Data"
             try:
                 stock = twstock.Stock(code)
-                inst_data = stock.institutional_investors # list of dict
+                inst_data = stock.institutional_investors 
                 if inst_data:
-                    recent_inst = inst_data[-3:] # last 3 days
+                    recent_inst = inst_data[-3:] 
                     inst_str = "\n".join([f"{d['date']}: Foreign:{d['foreign_diff']} Investment:{d['investment_trust_diff']} Dealer:{d['dealer_diff']}" for d in recent_inst])
             except: pass
 
-            # 4. News
             news_str = "No News"
             try:
                 ticker = yf.Ticker(full_code)
@@ -590,7 +570,6 @@ Reply in Traditional Chinese (繁體中文). Be concise and military style.
                 return result
             else:
                 return f"GPT Error: {resp.status_code}"
-
         except Exception as e:
             return f"GPT Analysis Failed: {str(e)}"
 
@@ -611,7 +590,7 @@ class NotificationManager:
         self._queue = queue.Queue()
         self._cooldowns = {}
         self.gpt_advisor = GPTAdvisor(OPENAI_API_KEY)
-        threading.Thread(target=self._worker_loop, daemon=True).start()
+        threading.Thread(target=self._worker_loop, daemon=True, name="NotificationThread").start()
 
     def reset_daily_state(self):
         self._cooldowns.clear()
@@ -621,24 +600,20 @@ class NotificationManager:
         if not MarketSession.is_market_open(): return False
         
         if event.scope == "watchlist" and event.event_label == "🔥攻擊":
-            if event.win_rate < 50:
-                return False
+            if event.win_rate < 50: return False
 
-        if event.event_label == "⚠️追高":
-            return False
+        if event.event_label == "⚠️追高": return False
 
         key = f"{event.code}_{event.scope}_{event.event_label}"
         
         if event.scope == "inventory":
-            if event.event_label not in ["💀出貨", "🚨撤退", "🔥攻擊", "👑漲停"]:
-                return False
+            if event.event_label not in ["💀出貨", "🚨撤退", "🔥攻擊", "👑漲停"]: return False
             if "撤退" in event.event_label:
                  if time.time() - self._cooldowns.get(key, 0) < 300: return False
                  return True
 
         if event.scope == "watchlist":
-            if event.event_label != "🔥攻擊":
-                return False
+            if event.event_label != "🔥攻擊": return False
 
         if time.time() - self._cooldowns.get(key, 0) < self.COOLDOWN_SECONDS: return False
         return True
@@ -652,14 +627,10 @@ class NotificationManager:
         while True:
             event = self._queue.get()
             try:
-                # 1. Send Basic Signal
                 self._send_telegram(event)
-                
-                # 2. Trigger GPT Analysis (Only for important signals)
                 if OPENAI_API_KEY and event.event_label in ["🔥攻擊", "🔥尾盤", "💀出貨"]:
                     gpt_analysis = self.gpt_advisor.analyze_signal(event)
                     self._send_telegram_gpt(event.code, gpt_analysis)
-                    
                 time.sleep(self.RATE_LIMIT_DELAY)
             except: pass
             finally: self._queue.task_done()
@@ -688,7 +659,7 @@ class NotificationManager:
 notification_manager = NotificationManager()
 
 # ==========================================
-# 7. Engine (Sniper Core - Stability Hardened)
+# 7. Engine (Sniper Core - Cloud Hardened)
 # ==========================================
 class SniperEngine:
     def __init__(self):
@@ -708,7 +679,9 @@ class SniperEngine:
         self.market_stats = {"Time": 0, "Price5MA": 0} 
         self.twii_data = None 
         self.last_reset = datetime.now().date()
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
+        
+        # [HARDENED] 降速保護：限制 max_workers=8 避免系統 FD 吃光
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
         self._init_market_stats()
 
     def update_targets(self):
@@ -719,10 +692,12 @@ class SniperEngine:
             self.base_vol_cache.update(new_data)
 
     def start(self):
+        # [HARDENED] 防呆機制：絕對不允許啟動兩個引擎
         if self.running: return
         self.update_targets()
         self.running = True
-        threading.Thread(target=self._run_loop, daemon=True).start()
+        thread = threading.Thread(target=self._run_loop, daemon=True, name="SniperCoreThread")
+        thread.start()
 
     def stop(self): self.running = False
     
@@ -730,10 +705,8 @@ class SniperEngine:
         try:
              tse = yf.Ticker("^TWII")
              hist = tse.history(period="10d", auto_adjust=True)
-             if not hist.empty:
-                 self.market_stats["Price5MA"] = hist['Close'].iloc[-6:-1].mean() if len(hist) >= 6 else hist['Close'].mean()
-             else:
-                 self.market_stats["Price5MA"] = 0
+             if not hist.empty: self.market_stats["Price5MA"] = hist['Close'].iloc[-6:-1].mean() if len(hist) >= 6 else hist['Close'].mean()
+             else: self.market_stats["Price5MA"] = 0
         except: pass
 
     def _update_market_thermometer(self):
@@ -842,12 +815,9 @@ class SniperEngine:
             if net_1h > 0: situation = "🔥主動吸籌" if is_bullish else "🛡️被動吃盤"
             elif net_1h < 0: situation = "💀主動倒貨" if not is_bullish else "🎣拉高出貨"
 
-            # === 波次計數器 ===
             if code not in self.wave_tracker:
                 self.wave_tracker[code] = {
-                    'count': 0,
-                    'last_trigger_ts': 0,
-                    'is_holding': False 
+                    'count': 0, 'last_trigger_ts': 0, 'is_holding': False 
                 }
 
             entry_threshold = vwap * 1.005
@@ -904,7 +874,7 @@ class SniperEngine:
             return (code, get_stock_name(code), "一般", price, pct, vwap, vol_lots, est_lots, ratio_5ma, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m, situation, ratio_yest, active_light)
         except: return None
 
-    # [HARDENED] 讓迴圈不死的 _run_loop，具備看門狗機制
+    # [HARDENED] 讓迴圈不死、具備防卡死 timeout 的主迴圈
     def _run_loop(self):
         print(">>> Sniper Engine Loop Started")
         fail_count = 0
@@ -912,7 +882,6 @@ class SniperEngine:
             try:
                 now = datetime.now(timezone.utc) + timedelta(hours=8)
                 
-                # 每日重置邏輯
                 if now.date() > self.last_reset:
                     self.active_flags = {}; self.daily_risk_flags = {}; self.daily_net = {}; self.prev_data = {}; self.vol_queues = {}; self.base_vol_cache = {}; self.wave_tracker = {}
                     notification_manager.reset_daily_state()
@@ -934,7 +903,6 @@ class SniperEngine:
                 targets.sort(key=priority_key)
 
                 batch = []
-                # 使用 ThreadPoolExecutor
                 futures = {self.executor.submit(self._fetch_stock, c, now): c for c in targets}
                 
                 for f in concurrent.futures.as_completed(futures):
@@ -943,40 +911,47 @@ class SniperEngine:
                         result = f.result(timeout=5)
                         if result: batch.append(result)
                     except concurrent.futures.TimeoutError:
-                        pass # 放棄該次請求
-                    except Exception as e:
-                        pass
+                        pass # 超時直接放棄
+                    except Exception:
+                        pass # 其他錯誤也忽略
 
                 db.upsert_realtime_batch(batch)
                 
-                fail_count = 0 # 成功執行一次就歸零
+                fail_count = 0 
                 time.sleep(1.5 if MarketSession.is_market_open(now) else 5)
 
             except Exception as e:
                 fail_count += 1
-                print(f"[Engine Critical Error] {e}")
-                traceback.print_exc() # 讓我們知道哪裡錯了
+                print(f"⚠️ [Engine Critical Error] {e}")
+                traceback.print_exc()
                 
-                # 指數退避策略：錯誤越多，休息越久，但不會死
+                # 指數退避策略
                 sleep_time = min(30, 2 ** fail_count)
-                print(f"Engine sleeping for {sleep_time}s due to error...")
+                print(f"🔄 Engine sleeping for {sleep_time}s due to error...")
                 time.sleep(sleep_time)
                 
-                # 如果執行緒池壞了，重啟它
+                # 發生嚴重異常時，強制重啟 ThreadPoolExecutor
                 try:
                     self.executor.shutdown(wait=False)
-                    self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
+                    self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
                 except: pass
 
-if "sniper_engine_core" not in st.session_state: st.session_state.sniper_engine_core = SniperEngine()
-engine = st.session_state.sniper_engine_core
+# ==========================================
+# [雲端核心] 全域引擎單例綁定
+# 防止多開分頁導致系統崩潰
+# ==========================================
+@st.cache_resource
+def get_sniper_engine():
+    return SniperEngine()
+
+engine = get_sniper_engine()
 
 # ==========================================
 # 8. UI (Table Layout)
 # ==========================================
 def render_streamlit_ui():
     with st.sidebar:
-        st.title("🛡️ 戰情室 v6.16.15 AI Commander")
+        st.title("🛡️ 戰情室 v6.16.15 Cloud Commander")
         st.caption(f"Update: {datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')}")
         st.markdown("---")
 
@@ -1328,7 +1303,7 @@ if __name__ == "__main__":
             render_streamlit_ui()
         else:
             os.system('cls' if os.name == 'nt' else 'clear')
-            print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.15 (AI Commander){Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.15 (Cloud Commander){Style.RESET_ALL}")
             while True:
                 try:
                     user_input = input(f"\n請輸入股票代碼 (輸入 q 離開): ").strip().upper()
@@ -1341,7 +1316,7 @@ if __name__ == "__main__":
                 except Exception as e: print(f"錯誤: {e}")
     except ModuleNotFoundError:
         os.system('cls' if os.name == 'nt' else 'clear')
-        print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.15 (AI Commander){Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.15 (Cloud Commander){Style.RESET_ALL}")
         while True:
             try:
                 user_input = input(f"\n請輸入股票代碼 (輸入 q 離開): ").strip().upper()
