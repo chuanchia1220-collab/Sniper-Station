@@ -721,6 +721,7 @@ class SniperEngine:
         self.active_flags = {}
         self.daily_risk_flags = {}
         self.wave_tracker = {}
+        self.adv_indicator_cache = {} # [新增] 進階指標快取
         
         self.market_stats = {"Time": 0, "Price5MA": 0, "Slope5Min": 0.0, "PriceHistory": []} 
         self.twii_data = None 
@@ -981,11 +982,15 @@ class SniperEngine:
             # 更佳解法是：這三個指標通常一天更新一次（日K級別），我們只要在啟動或跨日時計算一次即可。
             # 考量到即時性，我們寫一個輕量函數 _calculate_advanced_indicators，
             # 若不想影響爬蟲效率，我們先給預設值，當有明確事件觸發時才精確計算並寫入 LOG。
-            rsi_val, band_ratio_val, b_percent_val = 0.0, 0.0, 0.0
-            
-            # [策略調整] 若符合活躍條件 (active_light) 或 即將觸發推播 (event_label)，才即時計算指標
-            if active_light == 1 or event_label:
-                 rsi_val, band_ratio_val, b_percent_val = self._calculate_advanced_indicators(code)
+            # [修改] 全天候計算新指標 (加入 5 分鐘 / 300秒 快取機制)
+            if code not in self.adv_indicator_cache or (now_ts - self.adv_indicator_cache[code].get('time', 0)) > 300:
+                c_rsi, c_br, c_bp = self._calculate_advanced_indicators(code)
+                # 即使抓取失敗 (回傳0) 也寫入時間戳，避免下一秒瘋狂 retry 導致 IP 被 ban
+                self.adv_indicator_cache[code] = {'time': now_ts, 'rsi': c_rsi, 'br': c_br, 'bp': c_bp}
+
+            rsi_val = self.adv_indicator_cache[code].get('rsi', 0.0)
+            band_ratio_val = self.adv_indicator_cache[code].get('br', 0.0)
+            b_percent_val = self.adv_indicator_cache[code].get('bp', 0.0)
 
             if event_label:
                 if "攻擊" in event_label: self.active_flags[code] = True
@@ -1011,7 +1016,7 @@ class SniperEngine:
                 now = datetime.now(timezone.utc) + timedelta(hours=8)
                 
                 if now.date() > self.last_reset:
-                    self.active_flags = {}; self.daily_risk_flags = {}; self.daily_net = {}; self.prev_data = {}; self.vol_queues = {}; self.base_vol_cache = {}; self.wave_tracker = {}
+                    self.active_flags = {}; self.daily_risk_flags = {}; self.daily_net = {}; self.prev_data = {}; self.vol_queues = {}; self.base_vol_cache = {}; self.wave_tracker = {}; self.adv_indicator_cache = {} # [修改] 加入快取重置
                     notification_manager.reset_daily_state()
                     db.write_queue.put(('execute', 'DELETE FROM telegram_logs', ()))
                     self.last_reset = now.date()
