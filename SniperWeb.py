@@ -230,11 +230,18 @@ class Database:
 
     def update_inventory_list(self, inventory_text):
         self.write_queue.put(('execute', 'DELETE FROM inventory', ()))
-        for line in inventory_text.split('\n'):
-            parts = line.split(',')
-            if len(parts) >= 2:
-                try: self.write_queue.put(('execute', 'INSERT OR REPLACE INTO inventory (code, cost, qty) VALUES (?, ?, ?)', (parts[0].strip(), float(parts[1].strip()), float(parts[2].strip()) if len(parts) > 2 else 1.0)))
-                except: pass
+        # 👇 修正：支援空格、換行或逗號分隔，且不強制要求成本
+        # 將所有換行替換為空格，再按空格拆分
+        raw_items = inventory_text.replace('\n', ' ').replace(',', ' ').split()
+        
+        for code in raw_items:
+            code = code.strip()
+            if code:
+                try:
+                    # 成本預設為 0, 張數預設為 1 (因為您不看損益了)
+                    self.write_queue.put(('execute', 'INSERT OR REPLACE INTO inventory (code, cost, qty) VALUES (?, ?, ?)', (code, 0.0, 1.0)))
+                except Exception as e:
+                    log_debug(f"⚠️ 庫存代碼 {code} 寫入失敗: {e}")
 
     def update_watchlist(self, codes_text):
         self.write_queue.put(('execute', 'DELETE FROM watchlist', ()))
