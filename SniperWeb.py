@@ -1160,14 +1160,9 @@ def render_streamlit_ui():
             return decorator
 
     @fragment(run_every=1.5)
+    @fragment(run_every=1.5)
     def render_live_dashboard():
-        with st.expander("📦 庫存戰況 (Inventory)", expanded=False):
-            df_inv = db.get_inventory_view()
-            if not df_inv.empty:
-                st.dataframe(df_inv[['code', 'name', 'situation', 'price', 'pct', 'profit_val', 'signal_level']], hide_index=True)
-            else: st.info("尚無庫存")
-
-        st.markdown("---")
+        # 👇 庫存戰況 UI 已徹底抹除，直接進入精銳監控
         st.subheader("⚔️ 精銳監控 (Tactical Table)")
         df_watch = db.get_watchlist_view()
         
@@ -1189,7 +1184,7 @@ def render_streamlit_ui():
         if use_elite_filter: 
             df_watch = df_watch[(df_watch['code'] == '0000') | ((df_watch['price'] > 70) & (df_watch['vol'] >= 3000))]
 
-        # 👇 升級版 UI 與欄位合併
+        # 👇 下方維持原本的 HTML 表格渲染邏輯不變
         table_start = """
     <style>
     table.sniper-table { width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; }
