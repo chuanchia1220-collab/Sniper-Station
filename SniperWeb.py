@@ -812,46 +812,38 @@ class SniperEngine:
         notification_manager.enqueue(ev)
 
     def _calculate_advanced_indicators(self, code):
-        """下載近期資料並計算 RSI 與布林通道相關指標 (暴力穩健版)"""
+        """下載近期資料並計算指標 (布林通道改用原生 Pandas 運算，徹底擺脫套件 Bug)"""
         try:
             suffix = ".TW"
             if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
             full_code = f"{code}{suffix}"
             
-            # 1. 抓取資料
             df = yf.download(full_code, period="3mo", progress=False, auto_adjust=True)
             if df.empty: 
-                log_debug(f"❌ [{code}] 指標失敗：yf.download 無資料")
+                log_debug(f"❌ [{code}] yf.download 無資料")
                 return 0.0, 0.0, 0.0
                 
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-
-            # 強制確保 Close 是浮點數，避免型態錯誤
             df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
 
-            # 2. 強制手動計算 RSI (不再用 append=True)
+            # 1. 計算 RSI (維持套件運算)
             rsi_series = ta.rsi(df['Close'], length=14)
-            if rsi_series is not None:
-                df['RSI_14'] = rsi_series
+            df['RSI_14'] = rsi_series if rsi_series is not None else 0.0
 
-            # 3. 強制手動計算布林通道 (不再用 append=True)
-            bb_df = ta.bbands(df['Close'], length=20, std=2)
-            if bb_df is not None and not bb_df.empty:
-                # 將算出來的布林通道欄位直接橫向合併進原始 df
-                df = pd.concat([df, bb_df], axis=1)
+            # 2. 【核心修正】原生 Pandas 手動運算布林通道
+            df['BBM_20_2.0'] = df['Close'].rolling(window=20).mean() # 中軌 (20MA)
+            std = df['Close'].rolling(window=20).std(ddof=0)         # 標準差
+            df['BBU_20_2.0'] = df['BBM_20_2.0'] + (2 * std)          # 上軌
+            df['BBL_20_2.0'] = df['BBM_20_2.0'] - (2 * std)          # 下軌
+            
+            # 帶寬 (依照套件定義公式: (上-下)/中*100)
+            df['BBB_20_2.0'] = ((df['BBU_20_2.0'] - df['BBL_20_2.0']) / df['BBM_20_2.0']) * 100
 
-            # 4. 檢查欄位是否成功產出
-            required_cols = ['BBU_20_2.0', 'BBL_20_2.0', 'BBB_20_2.0', 'RSI_14']
-            missing_cols = [col for col in required_cols if col not in df.columns]
-            if missing_cols:
-                log_debug(f"❌ [{code}] 指標失敗：缺少欄位 {missing_cols}")
-                return 0.0, 0.0, 0.0
-
-            # 5. 計算自定義進階指標
+            # 3. 計算自定義進階指標
             df['Band_Ratio'] = (df['BBB_20_2.0'] / df['BBB_20_2.0'].rolling(window=5).max().shift(1)).round(2)
             df['%b'] = ((df['Close'] - df['BBL_20_2.0']) / (df['BBU_20_2.0'] - df['BBL_20_2.0'])).round(1)
             
-            # 6. 取得最新一筆並防呆
+            # 4. 取得最新一筆並防呆
             latest = df.iloc[-1]
             rsi_val = float(latest.get('RSI_14', 0.0))
             band_ratio_val = float(latest.get('Band_Ratio', 0.0))
