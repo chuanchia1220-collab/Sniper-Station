@@ -300,14 +300,15 @@ class Database:
 db = Database(DB_PATH)
 
 # ==========================================
-# 2. Market Session
+# 2. Market Session (修正假日判斷)
 # ==========================================
 class MarketSession:
     MARKET_OPEN, MARKET_CLOSE = dt_time(9, 0), dt_time(13, 35)
     @staticmethod
     def is_market_open(now=None):
         if not now: now = datetime.now(timezone.utc) + timedelta(hours=8)
-        return MarketSession.MARKET_OPEN <= now.time() <= MarketSession.MARKET_CLOSE
+        # 嚴格判斷：必須是週一到週五 (weekday 0~4)
+        return now.weekday() < 5 and MarketSession.MARKET_OPEN <= now.time() <= MarketSession.MARKET_CLOSE
 
 # ==========================================
 # 4. Utilities
@@ -477,6 +478,9 @@ def get_dynamic_thresholds(price):
 
 def _calc_est_vol(current_vol):
     now = datetime.now(timezone.utc) + timedelta(hours=8)
+    # [修正] 假日防呆：如果是週末 (weekday >= 5)，直接鎖定不推估
+    if now.weekday() >= 5: return current_vol
+    
     market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
     if now < market_open: return 0
     elapsed_minutes = (now - market_open).seconds / 60
@@ -713,7 +717,7 @@ class SniperEngine:
         self.active_flags = {}
         self.daily_risk_flags = {}
         self.wave_tracker = {}
-        self.adv_indicator_cache = {} # [NEW] 儲存進階指標快取
+        self.adv_indicator_cache = {} 
         
         self.market_stats = {"Time": 0, "Price5MA": 0, "Slope5Min": 0.0, "PriceHistory": []} 
         self.twii_data = None 
@@ -811,6 +815,7 @@ class SniperEngine:
     def _dispatch_event(self, ev: SniperEvent):
         notification_manager.enqueue(ev)
 
+    # [核心修正] 原生 Pandas 運算，杜絕套件報錯，並提升顯示精度
     def _calculate_advanced_indicators(self, code):
         """下載近期資料並計算指標 (布林通道改用原生 Pandas 運算，徹底擺脫套件 Bug)"""
         try:
@@ -830,18 +835,18 @@ class SniperEngine:
             rsi_series = ta.rsi(df['Close'], length=14)
             df['RSI_14'] = rsi_series if rsi_series is not None else 0.0
 
-            # 2. 【核心修正】原生 Pandas 手動運算布林通道
+            # 2. 原生 Pandas 手動運算布林通道 (20MA, 2 std)
             df['BBM_20_2.0'] = df['Close'].rolling(window=20).mean() # 中軌 (20MA)
             std = df['Close'].rolling(window=20).std(ddof=0)         # 標準差
             df['BBU_20_2.0'] = df['BBM_20_2.0'] + (2 * std)          # 上軌
             df['BBL_20_2.0'] = df['BBM_20_2.0'] - (2 * std)          # 下軌
             
-            # 帶寬 (依照套件定義公式: (上-下)/中*100)
+            # 帶寬 (公式: (上-下)/中*100)
             df['BBB_20_2.0'] = ((df['BBU_20_2.0'] - df['BBL_20_2.0']) / df['BBM_20_2.0']) * 100
 
-            # 3. 計算自定義進階指標
-            df['Band_Ratio'] = (df['BBB_20_2.0'] / df['BBB_20_2.0'].rolling(window=5).max().shift(1)).round(2)
-            df['%b'] = ((df['Close'] - df['BBL_20_2.0']) / (df['BBU_20_2.0'] - df['BBL_20_2.0'])).round(1)
+            # 3. 計算自定義進階指標 (精度拉高至小數點後 2 ~ 3 位)
+            df['Band_Ratio'] = (df['BBB_20_2.0'] / df['BBB_20_2.0'].rolling(window=5).max().shift(1)).round(3)
+            df['%b'] = ((df['Close'] - df['BBL_20_2.0']) / (df['BBU_20_2.0'] - df['BBL_20_2.0'])).round(2)
             
             # 4. 取得最新一筆並防呆
             latest = df.iloc[-1]
@@ -853,41 +858,11 @@ class SniperEngine:
             if math.isnan(band_ratio_val): band_ratio_val = 0.0
             if math.isnan(b_percent_val): b_percent_val = 0.0
 
-            log_debug(f"✅ [{code}] 指標 OK：RSI={rsi_val:.1f} | BR={band_ratio_val} | %b={b_percent_val}")
-            return round(rsi_val, 1), band_ratio_val, b_percent_val
+            log_debug(f"✅ [{code}] 指標 OK：RSI={rsi_val:.1f} | BR={band_ratio_val:.2f} | %b={b_percent_val:.2f}")
+            return round(rsi_val, 1), round(band_ratio_val, 2), round(b_percent_val, 2)
 
         except Exception as e:
             log_debug(f"💥 [{code}] 嚴重例外：{str(e)}")
-            return 0.0, 0.0, 0.0
-                
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-
-            df.ta.rsi(length=14, append=True)
-            df.ta.bbands(length=20, std=2, append=True)
-            
-            required_cols = ['BBU_20_2.0', 'BBL_20_2.0', 'BBB_20_2.0', 'RSI_14']
-            missing_cols = [col for col in required_cols if col not in df.columns]
-            if missing_cols:
-                log_debug(f"❌ [{code}] pandas_ta missing: {missing_cols}")
-                return 0.0, 0.0, 0.0
-
-            df['Band_Ratio'] = (df['BBB_20_2.0'] / df['BBB_20_2.0'].rolling(window=5).max().shift(1)).round(2)
-            df['%b'] = ((df['Close'] - df['BBL_20_2.0']) / (df['BBU_20_2.0'] - df['BBL_20_2.0'])).round(1)
-            
-            latest = df.iloc[-1]
-            rsi_val = float(latest.get('RSI_14', 0.0))
-            band_ratio_val = float(latest.get('Band_Ratio', 0.0))
-            b_percent_val = float(latest.get('%b', 0.0))
-
-            if math.isnan(rsi_val): rsi_val = 0.0
-            if math.isnan(band_ratio_val): band_ratio_val = 0.0
-            if math.isnan(b_percent_val): b_percent_val = 0.0
-
-            log_debug(f"✅ [{code}] Calc OK: RSI={rsi_val:.1f} | BR={band_ratio_val} | %b={b_percent_val}")
-            return round(rsi_val, 1), band_ratio_val, b_percent_val
-
-        except Exception as e:
-            log_debug(f"💥 [{code}] Calc Error: {str(e)}")
             return 0.0, 0.0, 0.0
 
     def _fetch_stock(self, code, now_time=None):
@@ -1021,7 +996,7 @@ class SniperEngine:
             return None
 
     def _run_loop(self):
-        print(">>> Sniper Engine Loop Started")
+        log_debug(">>> Sniper Engine Loop Started")
         fail_count = 0
         while self.running:
             try:
@@ -1032,7 +1007,7 @@ class SniperEngine:
                     notification_manager.reset_daily_state()
                     db.write_queue.put(('execute', 'DELETE FROM telegram_logs', ()))
                     self.last_reset = now.date()
-                    print(f"[{now}] Daily Reset Complete")
+                    log_debug(f"[{now}] Daily Reset Complete")
 
                 self._update_market_thermometer()
                 
@@ -1262,8 +1237,9 @@ def render_streamlit_ui():
             br_val = row.get('band_ratio', 0.0)
             bp_val = row.get('b_percent', 0.0)
 
+            # [修正] 提升 UI 顯示小數點位數
             if rsi_val > 0:
-                indicators_html = f"<span style='font-size:0.85em; color:#555;'>{rsi_val} / {br_val} / {bp_val}</span>"
+                indicators_html = f"<span style='font-size:0.85em; color:#555;'>{rsi_val:.1f} / {br_val:.2f} / {bp_val:.2f}</span>"
             else:
                 indicators_html = "<span style='color:#777'>-</span>"
 
