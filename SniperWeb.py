@@ -1,3 +1,6 @@
+import os
+# 關閉 Streamlit 的檔案監視功能，避免觸發 inotify limit 報錯
+os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"
 import streamlit as st
 import pandas as pd
 import yfinance as yf
