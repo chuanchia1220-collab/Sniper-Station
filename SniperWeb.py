@@ -817,36 +817,42 @@ class SniperEngine:
 
     # [核心修正] 原生 Pandas 運算，杜絕套件報錯，並提升顯示精度
     def _calculate_advanced_indicators(self, code):
-        """下載近期資料並計算指標 (布林通道改用原生 Pandas 運算，徹底擺脫套件 Bug)"""
+        """下載近期資料並計算指標 (徹底修正 yfinance 多執行緒錯亂 Bug)"""
         try:
             suffix = ".TW"
             if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
             full_code = f"{code}{suffix}"
             
-            df = yf.download(full_code, period="3mo", progress=False, auto_adjust=True)
+            # 【關鍵修正 1】改用 Ticker 物件與 history()
+            # 避免 yf.download() 在多執行緒併發時，因共用底層 Session 導致資料錯亂
+            ticker = yf.Ticker(full_code)
+            df = ticker.history(period="3mo", auto_adjust=True)
+            
             if df.empty: 
-                log_debug(f"❌ [{code}] yf.download 無資料")
+                log_debug(f"❌ [{code}] 指標失敗：yf.Ticker.history 無資料")
                 return 0.0, 0.0, 0.0
                 
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            # 【關鍵修正 2】history() 回傳的 DataFrame 只有單層 index，不需再用 get_level_values()
             df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
 
-            # 1. 計算 RSI (維持套件運算)
+            # 1. 計算 RSI (維持 pandas_ta 套件)
             rsi_series = ta.rsi(df['Close'], length=14)
             df['RSI_14'] = rsi_series if rsi_series is not None else 0.0
 
-            # 2. 原生 Pandas 手動運算布林通道 (20MA, 2 std)
+            # 2. 原生 Pandas 計算布林通道 (20MA, 2 std)
             df['BBM_20_2.0'] = df['Close'].rolling(window=20).mean() # 中軌 (20MA)
-            std = df['Close'].rolling(window=20).std(ddof=0)         # 標準差
+            std = df['Close'].rolling(window=20).std(ddof=0)         # 標準差 (ddof=0 符合常規看盤軟體定義)
             df['BBU_20_2.0'] = df['BBM_20_2.0'] + (2 * std)          # 上軌
             df['BBL_20_2.0'] = df['BBM_20_2.0'] - (2 * std)          # 下軌
             
-            # 帶寬 (公式: (上-下)/中*100)
-            df['BBB_20_2.0'] = ((df['BBU_20_2.0'] - df['BBL_20_2.0']) / df['BBM_20_2.0']) * 100
+            # 帶寬 = (上軌 - 下軌) / 中軌
+            df['BBB_20_2.0'] = (df['BBU_20_2.0'] - df['BBL_20_2.0']) / df['BBM_20_2.0']
 
-            # 3. 計算自定義進階指標 (精度拉高至小數點後 2 ~ 3 位)
+            # 3. 計算自定義進階指標
+            # 帶寬比：今日帶寬 / 過去5日最高帶寬
             df['Band_Ratio'] = (df['BBB_20_2.0'] / df['BBB_20_2.0'].rolling(window=5).max().shift(1)).round(3)
-            df['%b'] = ((df['Close'] - df['BBL_20_2.0']) / (df['BBU_20_2.0'] - df['BBL_20_2.0'])).round(2)
+            # %b：(收盤價 - 下軌) / (上軌 - 下軌)
+            df['%b'] = ((df['Close'] - df['BBL_20_2.0']) / (df['BBU_20_2.0'] - df['BBL_20_2.0'])).round(3)
             
             # 4. 取得最新一筆並防呆
             latest = df.iloc[-1]
