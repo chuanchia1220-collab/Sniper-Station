@@ -760,7 +760,7 @@ class SniperEngine:
         
         current_price = 0; current_pct = 0
         now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%H:%M:%S')
-        source_status = f"{now_str} (Crawler)"
+        source_status = f"{now_str}"
 
         try:
             url = "https://tw.stock.yahoo.com/quote/^TWII"
