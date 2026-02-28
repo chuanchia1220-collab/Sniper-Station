@@ -258,7 +258,8 @@ class Database:
     def get_watchlist_view(self):
         try:
             conn = self._get_conn()
-            query = '''SELECT w.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.ratio_yest, r.signal as event_label, r.net_10m, r.net_1h, r.net_day, r.situation, r.active_light, r.rsi, r.band_ratio, r.b_percent, s.price_5ma, s.win_rate, s.avg_ret, s.avg_amp, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM watchlist w LEFT JOIN realtime r ON w.code = r.code LEFT JOIN static_info s ON w.code = s.code LEFT JOIN pinned p ON w.code = p.code'''
+            # 👇 增加 r.vol 欄位供大戶控盤比計算使用
+            query = '''SELECT w.code, r.name, r.vol, r.pct, r.price, r.vwap, r.ratio, r.ratio_yest, r.signal as event_label, r.net_10m, r.net_1h, r.net_day, r.situation, r.active_light, r.rsi, r.band_ratio, r.b_percent, s.price_5ma, s.win_rate, s.avg_ret, s.avg_amp, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM watchlist w LEFT JOIN realtime r ON w.code = r.code LEFT JOIN static_info s ON w.code = s.code LEFT JOIN pinned p ON w.code = p.code'''
             df = pd.read_sql(query, conn)
             conn.close(); return df
         except: return pd.DataFrame()
@@ -266,7 +267,8 @@ class Database:
     def get_inventory_view(self):
         try:
             conn = self._get_conn()
-            query = '''SELECT i.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.ratio_yest, r.signal as event_label, r.net_1h, r.net_day, r.situation, s.price_5ma, i.cost, i.qty, (r.price - i.cost) * i.qty * 1000 as profit_val, (r.price - i.cost) / i.cost * 100 as profit_pct, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM inventory i LEFT JOIN realtime r ON i.code = r.code LEFT JOIN static_info s ON i.code = s.code LEFT JOIN pinned p ON i.code = p.code'''
+            # 👇 同步增加 r.vol 欄位
+            query = '''SELECT i.code, r.name, r.vol, r.pct, r.price, r.vwap, r.ratio, r.ratio_yest, r.signal as event_label, r.net_1h, r.net_day, r.situation, s.price_5ma, i.cost, i.qty, (r.price - i.cost) * i.qty * 1000 as profit_val, (r.price - i.cost) / i.cost * 100 as profit_pct, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM inventory i LEFT JOIN realtime r ON i.code = r.code LEFT JOIN static_info s ON i.code = s.code LEFT JOIN pinned p ON i.code = p.code'''
             df = pd.read_sql(query, conn)
             conn.close(); return df
         except: return pd.DataFrame()
@@ -481,7 +483,6 @@ def get_dynamic_thresholds(price):
 
 def _calc_est_vol(current_vol):
     now = datetime.now(timezone.utc) + timedelta(hours=8)
-    # [修正] 假日防呆：如果是週末 (weekday >= 5)，直接鎖定不推估
     if now.weekday() >= 5: return current_vol
     
     market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
@@ -803,8 +804,10 @@ class SniperEngine:
             self.market_stats["Slope5Min"] = slope_5min
             price_5ma = self.market_stats.get("Price5MA", current_price)
             
+            # 👇 補足 vol 欄位以供儀表板運算
             self.twii_data = {
                 'code': '0000', 'name': f'加權指數 {source_status}', 
+                'vol': 0,
                 'price': current_price, 'pct': current_pct, 'vwap': current_price, 
                 'price_5ma': price_5ma, 'ratio': 1.0, 'ratio_yest': 1.0,
                 'net_10m': 0, 'net_1h': 0, 'net_day': 0,
@@ -818,16 +821,12 @@ class SniperEngine:
     def _dispatch_event(self, ev: SniperEvent):
         notification_manager.enqueue(ev)
 
-    # [核心修正] 原生 Pandas 運算，杜絕套件報錯，並提升顯示精度
     def _calculate_advanced_indicators(self, code):
-        """下載近期資料並計算指標 (徹底修正 yfinance 多執行緒錯亂 Bug)"""
         try:
             suffix = ".TW"
             if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
             full_code = f"{code}{suffix}"
             
-            # 【關鍵修正 1】改用 Ticker 物件與 history()
-            # 避免 yf.download() 在多執行緒併發時，因共用底層 Session 導致資料錯亂
             ticker = yf.Ticker(full_code)
             df = ticker.history(period="3mo", auto_adjust=True)
             
@@ -835,29 +834,19 @@ class SniperEngine:
                 log_debug(f"❌ [{code}] 指標失敗：yf.Ticker.history 無資料")
                 return 0.0, 0.0, 0.0
                 
-            # 【關鍵修正 2】history() 回傳的 DataFrame 只有單層 index，不需再用 get_level_values()
             df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
 
-            # 1. 計算 RSI (維持 pandas_ta 套件)
             rsi_series = ta.rsi(df['Close'], length=14)
             df['RSI_14'] = rsi_series if rsi_series is not None else 0.0
 
-            # 2. 原生 Pandas 計算布林通道 (20MA, 2 std)
-            df['BBM_20_2.0'] = df['Close'].rolling(window=20).mean() # 中軌 (20MA)
-            std = df['Close'].rolling(window=20).std(ddof=0)         # 標準差 (ddof=0 符合常規看盤軟體定義)
-            df['BBU_20_2.0'] = df['BBM_20_2.0'] + (2 * std)          # 上軌
-            df['BBL_20_2.0'] = df['BBM_20_2.0'] - (2 * std)          # 下軌
-            
-            # 帶寬 = (上軌 - 下軌) / 中軌
+            df['BBM_20_2.0'] = df['Close'].rolling(window=20).mean()
+            std = df['Close'].rolling(window=20).std(ddof=0)
+            df['BBU_20_2.0'] = df['BBM_20_2.0'] + (2 * std)
+            df['BBL_20_2.0'] = df['BBM_20_2.0'] - (2 * std)
             df['BBB_20_2.0'] = (df['BBU_20_2.0'] - df['BBL_20_2.0']) / df['BBM_20_2.0']
-
-            # 3. 計算自定義進階指標
-            # 帶寬比：今日帶寬 / 過去5日最高帶寬
             df['Band_Ratio'] = (df['BBB_20_2.0'] / df['BBB_20_2.0'].rolling(window=5).max().shift(1)).round(3)
-            # %b：(收盤價 - 下軌) / (上軌 - 下軌)
             df['%b'] = ((df['Close'] - df['BBL_20_2.0']) / (df['BBU_20_2.0'] - df['BBL_20_2.0'])).round(3)
             
-            # 4. 取得最新一筆並防呆
             latest = df.iloc[-1]
             rsi_val = float(latest.get('RSI_14', 0.0))
             band_ratio_val = float(latest.get('Band_Ratio', 0.0))
@@ -982,7 +971,6 @@ class SniperEngine:
             elif "出貨" in raw_state and code not in self.daily_risk_flags and scope == "inventory": event_label = "💀出貨"
             elif "尾盤" in raw_state: event_label = "🔥尾盤"
 
-            # [快取機制] 全天候計算新指標
             if code not in self.adv_indicator_cache or (now_ts - self.adv_indicator_cache[code].get('time', 0)) > 300:
                 c_rsi, c_br, c_bp = self._calculate_advanced_indicators(code)
                 self.adv_indicator_cache[code] = {'time': now_ts, 'rsi': c_rsi, 'br': c_br, 'bp': c_bp}
@@ -1078,7 +1066,8 @@ def render_streamlit_ui():
         st.markdown("---")
 
         mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
-        use_filter = st.checkbox("只看局勢活躍 (>70元)")
+        # 👇 實裝菁英過濾開關
+        use_elite_filter = st.checkbox("👑 菁英過濾協議 (>70元 & 總量>3000張)")
 
         if mode == "👨‍✈️ 指揮官":
             with st.expander("📦 庫存管理", expanded=False):
@@ -1192,12 +1181,15 @@ def render_streamlit_ui():
 
         if df_watch.empty: st.info("尚未加入監控標的"); return
 
-        numeric_cols = ['price', 'pct', 'vwap', 'ratio', 'ratio_yest', 'net_10m', 'net_1h', 'net_day', 'price_5ma', 'win_rate', 'avg_ret', 'active_light', 'avg_amp', 'twii_slope', 'rsi', 'band_ratio', 'b_percent']
+        numeric_cols = ['price', 'pct', 'vwap', 'vol', 'ratio', 'ratio_yest', 'net_10m', 'net_1h', 'net_day', 'price_5ma', 'win_rate', 'avg_ret', 'active_light', 'avg_amp', 'twii_slope', 'rsi', 'band_ratio', 'b_percent']
         for col in numeric_cols:
             if col in df_watch.columns: df_watch[col] = pd.to_numeric(df_watch[col], errors='coerce').fillna(0.0)
 
-        if use_filter: df_watch = df_watch[df_watch['price'] > 70]
+        # 👇 執行菁英過濾協議 (大盤 0000 絕對保留)
+        if use_elite_filter: 
+            df_watch = df_watch[(df_watch['code'] == '0000') | ((df_watch['price'] > 70) & (df_watch['vol'] >= 3000))]
 
+        # 👇 升級版 UI 與欄位合併
         table_start = """
     <style>
     table.sniper-table { width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; }
@@ -1210,7 +1202,7 @@ def render_streamlit_ui():
     <table class="sniper-table">
     <thead>
     <tr>
-    <th>📌</th><th>代碼</th><th>名稱 (Link)</th><th>訊號</th><th>5MA</th><th>現價</th><th>漲跌%</th>
+    <th>📌</th><th>代碼/名稱 (Link)</th><th>訊號</th><th>5MA</th><th>現價</th><th>漲跌%</th>
     <th>均價 (燈/Buy/TP/SL)</th><th>量比 (昨/5日)</th><th>局勢</th><th>大戶 (10m/1H/日)</th><th>指標(RSI/BW/%b)</th>
     </tr>
     </thead>
@@ -1228,12 +1220,6 @@ def render_streamlit_ui():
             win_rate = row.get("win_rate", 0)
             avg_ret = row.get("avg_ret", 0)
             avg_amp = row.get("avg_amp", 0)
-            
-            name_part = row['name']
-            if not is_twii:
-                name_part = f"{row['name']} ({win_rate:.0f}%, Exp{avg_ret:+.2f})"
-                if win_rate < 50: name_part += " <span style='color:#ff4d4f; font-size:0.8em;'>(高風險)</span>"
-                if avg_amp >= MIN_AMPLITUDE_THRESHOLD: name_part += " <span style='color:#e67e22; font-weight:bold;'>(瘋)</span>"
 
             main_color = "#ff4d4f" if row['pct'] > 0 else "#2ecc71" if row['pct'] < 0 else "#999999"
             price_html = f"<span style='color:{main_color}; font-weight:bold'>{row['price']:.2f}</span>"
@@ -1246,31 +1232,32 @@ def render_streamlit_ui():
             br_val = row.get('band_ratio', 0.0)
             bp_val = row.get('b_percent', 0.0)
 
-            # [修正] 提升 UI 顯示小數點位數
-            if rsi_val > 0:
-                indicators_html = f"<span style='font-size:0.85em; color:#555;'>{rsi_val:.1f} / {br_val:.2f} / {bp_val:.2f}</span>"
-            else:
-                indicators_html = "<span style='color:#777'>-</span>"
+            if rsi_val > 0: indicators_html = f"<span style='font-size:0.85em; color:#555;'>{rsi_val:.1f} / {br_val:.2f} / {bp_val:.2f}</span>"
+            else: indicators_html = "<span style='color:#777'>-</span>"
 
             if is_twii: 
                 twii_slope = float(row.get('twii_slope', 0.0))
                 slope_color = "#2ecc71" if twii_slope > 0 else "#ff4d4f" if twii_slope < 0 else "#999999"
                 slope_light = "🟢" if twii_slope > 0 else "🔴" if twii_slope < 0 else "⚪"
                 
+                name_html = f'<span style="font-weight:bold;">{row["code"]} {row["name"]}</span>'
                 vwap_html = f"<span style='color:{slope_color}; font-weight:bold'>5m斜率: {twii_slope:+.2f}</span>"
                 ratio_html = "<span style='color:#777'>-</span>"
-                
                 situation_text = "趨勢向上" if twii_slope > 0 else "趨勢向下" if twii_slope < 0 else "橫盤"
                 situation_html = f"<span style='color:{slope_color}; font-weight:bold'>{situation_text} {slope_light}</span>"
-                bp_html = "<span style='color:#777'>- / - / -</span>"
+                bp_html = "<span style='color:#777'>- / - / -<br>(-%)</span>"
 
             else:
+                # 垂直整合 代碼/名稱/回測數據
+                name_html = f'<a href="https://tw.stock.yahoo.com/quote/{row["code"]}.TW" target="_blank" style="text-decoration:none; color:#3498db; font-weight:bold; font-size:16px;">{row["code"]} {row["name"]}</a><br><span style="font-size:0.85em; color:#888;">({win_rate:.0f}%, Exp{avg_ret:+.2f})</span>'
+                if win_rate < 50: name_html += " <span style='color:#ff4d4f; font-size:0.8em;'>(高風險)</span>"
+                if avg_amp >= MIN_AMPLITUDE_THRESHOLD: name_html += " <span style='color:#e67e22; font-weight:bold;'>(瘋)</span>"
+
                 if active_light == 1: vwap_light = "🟢"
                 else: vwap_light = "🔴"
                 trigger_val = row['vwap'] * 1.005
                 buy_price = adjust_to_tick(trigger_val, method='round')
                 buy_html = f"<span style='color:#e67e22; font-weight:bold; margin-left:4px;'>Buy:{buy_price:.2f}</span>"
-            
                 vwap_html = f"<span style='color:{vwap_color}'>{row['vwap']:.2f} {vwap_light}</span> {buy_html}"
                 
                 trigger_price = row['vwap'] * 1.005
@@ -1289,12 +1276,23 @@ def render_streamlit_ui():
                 clean_situation = situation.replace("🔥", "").replace("🛡️", "").replace("💀", "").replace("🎣", "").replace("⚖️", "")
                 situation_html = f"<span style='color:{sit_color}; font-weight:bold'>{clean_situation}</span>"
 
-                n10 = int(row['net_10m']); n1h = int(row['net_1h']); nd = int(row['net_day'])
+                # 提取數據並計算大戶控盤比 (%)
+                n10 = int(row.get('net_10m', 0))
+                n1h = int(row.get('net_1h', 0))
+                nd = int(row.get('net_day', 0))
+                vol = float(row.get('vol', 0))
+
+                chip_ratio = (nd / vol * 100) if vol > 0 else 0.0
+                chip_ratio_str = f"{chip_ratio:+.1f}%"
+                ratio_color = "#ff4d4f" if chip_ratio > 0 else "#2ecc71" if chip_ratio < 0 else "#999999"
+
                 bp_light = "🟢" if n1h > 0 else "🔴"
                 c10 = "#ff4d4f" if n10 > 0 else "#2ecc71" if n10 < 0 else "#999999"
                 c1h = "#ff4d4f" if n1h > 0 else "#2ecc71" if n1h < 0 else "#999999"
                 cd  = "#ff4d4f" if nd > 0 else "#2ecc71" if nd < 0 else "#999999"
-                bp_html = f"<span style='color:{c10}'>{n10}</span> / <span style='color:{c1h}'>{n1h} {bp_light}</span> / <span style='color:{cd}'>{nd}</span>"
+                
+                # 組合字串，換行顯示控盤比
+                bp_html = f"<span style='color:{c10}'>{n10}</span> / <span style='color:{c1h}'>{n1h} {bp_light}</span> / <span style='color:{cd}'>{nd}</span><br><span style='color:{ratio_color}; font-size:0.9em; font-weight:bold;'>({chip_ratio_str})</span>"
 
                 is_three_lights = (active_light == 1) and (vol_light == "🟢") and (bp_light == "🟢")
                 if is_three_lights: row_class = "golden-row"
@@ -1305,10 +1303,7 @@ def render_streamlit_ui():
             c_5ma = "#ff4d4f" if row['price'] > p_5ma else "#2ecc71"
             ma_html = f"<span style='color:{c_5ma}'>{p_5ma:.2f}</span>"
             
-            if is_twii: name_html = f'<span style="font-weight:bold;">{name_part}</span>'
-            else: name_html = f'<a href="https://tw.stock.yahoo.com/quote/{row["code"]}.TW" target="_blank" style="text-decoration:none; color:#3498db; font-weight:bold;">{name_part}</a>'
-
-            html_rows.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{row["code"]}</td><td>{name_html}</td><td>{event_label}</td><td>{ma_html}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{situation_html}</td><td>{bp_html}</td><td>{indicators_html}</td></tr>')
+            html_rows.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{name_html}</td><td>{event_label}</td><td>{ma_html}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{situation_html}</td><td>{bp_html}</td><td>{indicators_html}</td></tr>')
 
         st.markdown(table_start + "".join(html_rows) + "</tbody></table>", unsafe_allow_html=True)
 
