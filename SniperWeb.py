@@ -497,25 +497,42 @@ def _calc_est_vol(current_vol):
     weight = 2.0 if elapsed_minutes < 15 else 1.0
     return int(current_vol * (270 / elapsed_minutes) / weight)
 
-def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdown, price, vwap, has_attacked, now_time, vol_lots):
+def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdown, price, vwap, has_attacked, now_time, vol_lots, twii_slope=0.0):
+    # 1. 基礎撤退與漲停判斷
     if is_breakdown: return "🚨撤退"
     if pct >= 9.5: return "👑漲停"
-    if now_time.time() < dt_time(9, 5): return "⏳暖機"
+    if now_time.time() < dt_time(9, 30): return "⏳暖機"
+
+    # --- 【新增：大盤防禦機制】 ---
+    # 如果大盤斜率嚴重向下（下殺中），嚴禁發動攻擊推播
+    if twii_slope < -10.0:
+        return "⚖️觀望(盤勢險峻)"
+    # ---------------------------
 
     in_golden_zone = False
     if is_bullish and price <= (vwap * 1.015):
         in_golden_zone = True
 
+    # 2. 核心訊號判斷
     if ratio >= thresholds['tgt_ratio']:
-        if in_golden_zone and net_1h > 0: return "🔥攻擊"
+        if in_golden_zone and net_1h > 0:
+            # --- 【修正：翻紅過濾機制】 ---
+            # 士電案例：pct 為 -2.12% 且大盤不佳，此處應判定為「反彈」而非「攻擊」
+            if pct < 0 and twii_slope < 5.0:
+                return "👀跌深反彈"
+            # 只有在大盤穩定或個股已翻紅（強勢）時才允許觸發🔥攻擊
+            return "🔥攻擊"
+            # ---------------------------
         elif net_1h < 0: return "💀出貨"
         
     if not is_bullish: return "📉線下"
     if is_bullish and not in_golden_zone: return "⚠️追高"
 
+    # 3. 過熱判斷
     bias = ((price - vwap) / vwap) * 100 if vwap > 0 else 0
     if bias > thresholds['overheat']: return "⚠️過熱"
 
+    # 4. 尾盤獵殺模式
     if dt_time(13, 0) <= now_time.time() <= dt_time(13, 25):
         if (3.0 <= pct <= 9.0) and (net_1h > 0) and (net_day / (vol_lots+1) >= 0.05): return "🔥尾盤"
         
@@ -630,7 +647,7 @@ class NotificationManager:
         "🔥攻擊": "🚀", "💣伏擊": "💣", "👀量增": "👀",
         "💀出貨": "💀", "🚨撤退": "⚠️", "👑漲停": "👑",
         "⚠️價強": "💪", "❌誘多": "🎣", "🔥尾盤": "🔥",
-        "⚠️過熱": "🚫", "⏳暖機": "⏳", "📉線下": "📉", "⚠️追高": "🚫"
+        "⚠️過熱": "🚫", "⏳暖機": "⏳", "📉線下": "📉", "⚠️追高": "🚫",
     }
 
     def __init__(self):
