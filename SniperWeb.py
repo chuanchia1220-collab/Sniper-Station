@@ -253,8 +253,14 @@ class Database:
 
     def log_telegram(self, event: SniperEvent):
         time_str = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
-        sql = 'INSERT INTO telegram_logs (log_time, code, name, signal, price, vwap, net_10m, net_1h, net_day, twii_slope, rsi, band_ratio, b_percent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-        self.write_queue.put(('execute', sql, (time_str, event.code, event.name, event.event_label, event.price, event.vwap, event.net_10m, event.net_1h, event.net_day, event.twii_slope, event.rsi, event.band_ratio, event.b_percent,event.ratio, event.control_ratio)))
+        # SQL 增加最後兩個欄位 ratio, control_ratio
+        sql = 'INSERT INTO telegram_logs (log_time, code, name, signal, price, vwap, net_10m, net_1h, net_day, twii_slope, rsi, band_ratio, b_percent, ratio, control_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        self.write_queue.put(('execute', sql, (
+            time_str, event.code, event.name, event.event_label, event.price, event.vwap, 
+            event.net_10m, event.net_1h, event.net_day, event.twii_slope, 
+            event.rsi, event.band_ratio, event.b_percent,
+            event.ratio, event.control_ratio  # <--- 這裡一定要補上，否則資料庫存不進去
+        )))
 
     def get_telegram_logs(self):
         try:
@@ -983,7 +989,7 @@ class SniperEngine:
                 active_light = 1
 
             thresholds = get_dynamic_thresholds(price)
-            raw_state = check_signal(pct, is_bullish, net_day, net_1h, ratio_5ma, thresholds, is_breakdown, price, vwap, code in self.active_flags, now_time, vol_lots)
+            raw_state = check_signal(pct, is_bullish, net_day, net_1h, ratio_5ma, thresholds, is_breakdown, price, vwap, code in self.active_flags, now_time, vol_lots, twii_slope=self.market_stats.get("Slope5Min", 0.0))
 
             event_label = None
             scope = "inventory" if code in self.inventory_codes else "watchlist"
