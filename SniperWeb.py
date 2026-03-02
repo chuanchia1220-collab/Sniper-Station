@@ -18,6 +18,8 @@ import traceback
 import platform
 import pandas_ta as ta
 from collections import deque
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # ==========================================
 # [系統除錯機制] 全域日誌
@@ -129,6 +131,7 @@ class SniperEvent:
     band_ratio: float = 0.0
     b_percent: float = 0.0
     control_ratio: float = 0.0
+    is_snapshot: bool = False
     timestamp: float = field(default_factory=time.time)
     data_status: str = "DATA_OK"
     is_test: bool = False
@@ -140,8 +143,23 @@ class Database:
     def __init__(self, db_path):
         self.db_path = db_path
         self.write_queue = queue.Queue()
+        self.gs_sheet = None
         self._init_db()
         threading.Thread(target=self._writer_loop, daemon=True, name="DBWriterThread").start()
+        threading.Thread(target=self._init_google_sheets, daemon=True).start()
+
+    def _init_google_sheets(self):
+        try:
+            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            if os.path.exists("service_account.json"):
+                creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
+                self.gs_client = gspread.authorize(creds)
+                self.gs_sheet = self.gs_client.open("Sniper_Battle_Logs").sheet1
+                log_debug("☁️ Google Sheets 採樣系統已連線")
+            else:
+                log_debug("⚠️ 找不到 service_account.json，雲端同步關閉")
+        except Exception as e:
+            log_debug(f"⚠️ Google Sheets 初始化失敗: {e}")
 
     def _get_conn(self):
         for _ in range(3):
@@ -157,23 +175,9 @@ class Database:
             c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
             c.execute('''CREATE TABLE IF NOT EXISTS pinned (code TEXT PRIMARY KEY)''')
             c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, vol_5ma REAL, vol_yest REAL, price_5ma REAL, win_rate REAL DEFAULT 0, avg_ret REAL DEFAULT 0, avg_amp REAL DEFAULT 0)''')
-            c.execute('''CREATE TABLE IF NOT EXISTS telegram_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, log_time TEXT, code TEXT, name TEXT, signal TEXT, price REAL, vwap REAL, net_10m INTEGER, net_1h INTEGER, net_day INTEGER, twii_slope REAL, rsi REAL, band_ratio REAL, b_percent REAL)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS telegram_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, log_time TEXT, code TEXT, name TEXT, signal TEXT, price REAL, vwap REAL, net_10m INTEGER, net_1h INTEGER, net_day INTEGER, twii_slope REAL, rsi REAL, band_ratio REAL, b_percent REAL, ratio REAL, control_ratio REAL)''')
 
             try: c.execute("ALTER TABLE static_info ADD COLUMN avg_amp REAL DEFAULT 0")
-            except: pass
-            try: c.execute("ALTER TABLE realtime ADD COLUMN active_light INTEGER DEFAULT 0")
-            except: pass
-            try: c.execute("ALTER TABLE realtime ADD COLUMN rsi REAL DEFAULT 0")
-            except: pass
-            try: c.execute("ALTER TABLE realtime ADD COLUMN band_ratio REAL DEFAULT 0")
-            except: pass
-            try: c.execute("ALTER TABLE realtime ADD COLUMN b_percent REAL DEFAULT 0")
-            except: pass
-            try: c.execute("ALTER TABLE telegram_logs ADD COLUMN rsi REAL DEFAULT 0")
-            except: pass
-            try: c.execute("ALTER TABLE telegram_logs ADD COLUMN band_ratio REAL DEFAULT 0")
-            except: pass
-            try: c.execute("ALTER TABLE telegram_logs ADD COLUMN b_percent REAL DEFAULT 0")
             except: pass
             try: c.execute("ALTER TABLE telegram_logs ADD COLUMN ratio REAL DEFAULT 0")
             except: pass
@@ -183,110 +187,61 @@ class Database:
             conn.commit(); conn.close()
         except Exception as e: log_debug(f"⚠️ [DB Init Error] {e}")
 
-    def _writer_loop(self):
-        conn = self._get_conn()
-        cursor = conn.cursor()
-        while True:
-            try:
-                tasks = []
-                try: tasks.append(self.write_queue.get(timeout=5.0))
-                except queue.Empty: continue
-                
-                while not self.write_queue.empty() and len(tasks) < 50:
-                    tasks.append(self.write_queue.get())
-                
-                for task_type, sql, args in tasks:
-                    try:
-                        if task_type == 'executemany': cursor.executemany(sql, args)
-                        else: cursor.execute(sql, args)
-                    except sqlite3.OperationalError:
-                        time.sleep(0.5)
-                        try:
-                            if task_type == 'executemany': cursor.executemany(sql, args)
-                            else: cursor.execute(sql, args)
-                        except: pass
-                    except: pass
-                
-                conn.commit()
-                for _ in tasks: self.write_queue.task_done()
-                
-            except sqlite3.Error as e:
-                log_debug(f"⚠️ [DB Crash] Reconnecting... {e}")
-                try: conn.close()
-                except: pass
-                time.sleep(2)
-                try: conn = self._get_conn(); cursor = conn.cursor()
-                except: pass
-            except Exception as e:
-                log_debug(f"⚠️ [DB Writer Error] {e}")
-                time.sleep(1)
-
-    def upsert_realtime_batch(self, data_list):
-        if not data_list: return
-        sql = '''INSERT OR REPLACE INTO realtime (code, name, category, price, pct, vwap, vol, est_vol, ratio, net_1h, net_day, signal, update_time, data_status, signal_level, risk_status, net_10m, situation, ratio_yest, active_light, rsi, band_ratio, b_percent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'''
-        self.write_queue.put(('executemany', sql, data_list))
-
-    def upsert_static(self, data_list):
-        sql = 'INSERT OR REPLACE INTO static_info (code, vol_5ma, vol_yest, price_5ma, win_rate, avg_ret, avg_amp) VALUES (?, ?, ?, ?, ?, ?, ?)'
-        self.write_queue.put(('executemany', sql, data_list))
-
-    def update_inventory_list(self, inventory_text):
-        self.write_queue.put(('execute', 'DELETE FROM inventory', ()))
-        # 👇 修正：支援空格、換行或逗號分隔，且不強制要求成本
-        # 將所有換行替換為空格，再按空格拆分
-        raw_items = inventory_text.replace('\n', ' ').replace(',', ' ').split()
-        
-        for code in raw_items:
-            code = code.strip()
-            if code:
-                try:
-                    # 成本預設為 0, 張數預設為 1 (因為您不看損益了)
-                    self.write_queue.put(('execute', 'INSERT OR REPLACE INTO inventory (code, cost, qty) VALUES (?, ?, ?)', (code, 0.0, 1.0)))
-                except Exception as e:
-                    log_debug(f"⚠️ 庫存代碼 {code} 寫入失敗: {e}")
-
-    def update_watchlist(self, codes_text):
-        self.write_queue.put(('execute', 'DELETE FROM watchlist', ()))
-        targets = [t.strip() for t in codes_text.split() if t.strip()]
-        for t in targets: self.write_queue.put(('execute', 'INSERT OR REPLACE INTO watchlist (code) VALUES (?)', (t,)))
-        return targets
-
     def log_telegram(self, event: SniperEvent):
-        time_str = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
-        # SQL 增加最後兩個欄位 ratio, control_ratio
+        time_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
         sql = 'INSERT INTO telegram_logs (log_time, code, name, signal, price, vwap, net_10m, net_1h, net_day, twii_slope, rsi, band_ratio, b_percent, ratio, control_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-        self.write_queue.put(('execute', sql, (
-            time_str, event.code, event.name, event.event_label, event.price, event.vwap, 
-            event.net_10m, event.net_1h, event.net_day, event.twii_slope, 
-            event.rsi, event.band_ratio, event.b_percent,
-            event.ratio, event.control_ratio  # <--- 這裡一定要補上，否則資料庫存不進去
-        )))
+        args = (time_str, event.code, event.name, event.event_label, event.price, event.vwap,
+                event.net_10m, event.net_1h, event.net_day, event.twii_slope,
+                event.rsi, event.band_ratio, event.b_percent, event.ratio, event.control_ratio)
+        self.write_queue.put(('execute', sql, args))
+
+        if self.gs_sheet:
+            threading.Thread(target=lambda: self._safe_gs_write(args), daemon=True).start()
+
+    def _safe_gs_write(self, row):
+        try: self.gs_sheet.append_row(list(row))
+        except: pass
 
     def get_telegram_logs(self):
         try:
             conn = self._get_conn()
             df = pd.read_sql('SELECT log_time as 時間, code as 代碼, name as 名稱, signal as 訊號, price as 價格, vwap as 均價, net_10m as 大戶10M, net_1h as 大戶1H, net_day as 大戶日, ratio as 量比, control_ratio as 控盤比, twii_slope as 大盤斜率, rsi as RSI, band_ratio as 帶寬比, b_percent as 布林極限 FROM telegram_logs ORDER BY id ASC', conn)
-            conn.close()
-            return df
+            conn.close(); return df
         except: return pd.DataFrame()
 
     def get_watchlist_view(self):
         try:
             conn = self._get_conn()
-            # 👇 增加 r.vol 欄位供大戶控盤比計算使用
             query = '''SELECT w.code, r.name, r.vol, r.pct, r.price, r.vwap, r.ratio, r.ratio_yest, r.signal as event_label, r.net_10m, r.net_1h, r.net_day, r.situation, r.active_light, r.rsi, r.band_ratio, r.b_percent, s.price_5ma, s.win_rate, s.avg_ret, s.avg_amp, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM watchlist w LEFT JOIN realtime r ON w.code = r.code LEFT JOIN static_info s ON w.code = s.code LEFT JOIN pinned p ON w.code = p.code'''
-            df = pd.read_sql(query, conn)
-            conn.close(); return df
+            df = pd.read_sql(query, conn); conn.close(); return df
         except: return pd.DataFrame()
 
     def get_inventory_view(self):
         try:
             conn = self._get_conn()
-            # 👇 同步增加 r.vol 欄位
             query = '''SELECT i.code, r.name, r.vol, r.pct, r.price, r.vwap, r.ratio, r.ratio_yest, r.signal as event_label, r.net_1h, r.net_day, r.situation, s.price_5ma, i.cost, i.qty, (r.price - i.cost) * i.qty * 1000 as profit_val, (r.price - i.cost) / i.cost * 100 as profit_pct, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM inventory i LEFT JOIN realtime r ON i.code = r.code LEFT JOIN static_info s ON i.code = s.code LEFT JOIN pinned p ON i.code = p.code'''
-            df = pd.read_sql(query, conn)
-            conn.close(); return df
+            df = pd.read_sql(query, conn); conn.close(); return df
         except: return pd.DataFrame()
+
+    def _writer_loop(self):
+        conn = self._get_conn(); cursor = conn.cursor()
+        while True:
+            try:
+                task = self.write_queue.get(timeout=5.0)
+                task_type, sql, args = task
+                if task_type == 'executemany': cursor.executemany(sql, args)
+                else: cursor.execute(sql, args)
+                conn.commit()
+            except queue.Empty: continue
+            except Exception as e: log_debug(f"⚠️ DB Write Error: {e}")
+
+    def get_volume_map(self):
+        try:
+            conn = self._get_conn(); c = conn.cursor()
+            c.execute('SELECT code, vol_5ma, vol_yest, price_5ma, win_rate, avg_amp FROM static_info')
+            rows = c.fetchall(); conn.close()
+            return {r[0]: {'vol_5ma': r[1], 'vol_yest': r[2], 'price_5ma': r[3], 'win_rate': r[4], 'avg_amp': r[5]} for r in rows}
+        except: return {}
 
     def get_all_codes(self):
         try:
@@ -309,13 +264,27 @@ class Database:
             rows = c.fetchall(); conn.close(); return [r[0] for r in rows]
         except: return []
 
-    def get_volume_map(self):
-        try:
-            conn = self._get_conn(); c = conn.cursor()
-            c.execute('SELECT code, vol_5ma, vol_yest, price_5ma, win_rate, avg_amp FROM static_info')
-            rows = c.fetchall(); conn.close()
-            return {r[0]: {'vol_5ma': r[1], 'vol_yest': r[2], 'price_5ma': r[3], 'win_rate': r[4], 'avg_amp': r[5]} for r in rows}
-        except: return {}
+    def update_watchlist(self, codes_text):
+        self.write_queue.put(('execute', 'DELETE FROM watchlist', ()))
+        targets = [t.strip() for t in codes_text.split() if t.strip()]
+        for t in targets: self.write_queue.put(('execute', 'INSERT OR REPLACE INTO watchlist (code) VALUES (?)', (t,)))
+        return targets
+
+    def update_inventory_list(self, inventory_text):
+        self.write_queue.put(('execute', 'DELETE FROM inventory', ()))
+        raw_items = inventory_text.replace('\n', ' ').replace(',', ' ').split()
+        for code in raw_items:
+            if code.strip(): self.write_queue.put(('execute', 'INSERT OR REPLACE INTO inventory (code, cost, qty) VALUES (?, 0.0, 1.0)', (code.strip(),)))
+
+    def upsert_realtime_batch(self, data_list):
+        if not data_list: return
+        sql = '''INSERT OR REPLACE INTO realtime (code, name, category, price, pct, vwap, vol, est_vol, ratio, net_1h, net_day, signal, update_time, data_status, signal_level, risk_status, net_10m, situation, ratio_yest, active_light, rsi, band_ratio, b_percent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'''
+        self.write_queue.put(('executemany', sql, data_list))
+
+    def upsert_static(self, data_list):
+        sql = 'INSERT OR REPLACE INTO static_info (code, vol_5ma, vol_yest, price_5ma, win_rate, avg_ret, avg_amp) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        self.write_queue.put(('executemany', sql, data_list))
+
 
 db = Database(DB_PATH)
 
@@ -509,47 +478,35 @@ def _calc_est_vol(current_vol):
     return int(current_vol * (270 / elapsed_minutes) / weight)
 
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdown, price, vwap, has_attacked, now_time, vol_lots, twii_slope=0.0):
-    # 1. 基礎撤退與漲停判斷
     if is_breakdown: return "🚨撤退"
-    if pct >= 9.5: return "👑漲停"
-    if now_time.time() < dt_time(9, 30): return "⏳暖機"
+    if pct >= 9.30: return "👑漲停"
+    if now_time.time() < dt_time(9, 5): return "⏳暖機"
 
-    # --- 【新增：大盤防禦機制】 ---
-    # 如果大盤斜率嚴重向下（下殺中），嚴禁發動攻擊推播
-    if twii_slope < -10.0:
-        return "⚖️觀望(盤勢險峻)"
-    # ---------------------------
+    # --- 新增防禦機制 ---
+    if twii_slope < -10.0: return "⚖️觀望(盤勢險峻)"
+    if pct < 0 and twii_slope < 5.0: return "👀跌深反彈"
+    # -------------------
 
     in_golden_zone = False
     if is_bullish and price <= (vwap * 1.015):
         in_golden_zone = True
 
-    # 2. 核心訊號判斷
     if ratio >= thresholds['tgt_ratio']:
-        if in_golden_zone and net_1h > 0:
-            # --- 【修正：翻紅過濾機制】 ---
-            # 士電案例：pct 為 -2.12% 且大盤不佳，此處應判定為「反彈」而非「攻擊」
-            if pct < 0 and twii_slope < 5.0:
-                return "👀跌深反彈"
-            # 只有在大盤穩定或個股已翻紅（強勢）時才允許觸發🔥攻擊
-            return "🔥攻擊"
-            # ---------------------------
+        if in_golden_zone and net_1h > 0: return "🔥攻擊"
         elif net_1h < 0: return "💀出貨"
         
     if not is_bullish: return "📉線下"
     if is_bullish and not in_golden_zone: return "⚠️追高"
 
-    # 3. 過熱判斷
     bias = ((price - vwap) / vwap) * 100 if vwap > 0 else 0
     if bias > thresholds['overheat']: return "⚠️過熱"
 
-    # 4. 尾盤獵殺模式
     if dt_time(13, 0) <= now_time.time() <= dt_time(13, 25):
         if (3.0 <= pct <= 9.0) and (net_1h > 0) and (net_day / (vol_lots+1) >= 0.05): return "🔥尾盤"
         
     if pct > 2.0 and net_1h < 0: return "❌誘多"
     if pct >= thresholds['tgt_pct']: return "⚠️價強"
-    
+
     return "盤整"
 
 # ==========================================
@@ -758,6 +715,7 @@ class SniperEngine:
         self.market_stats = {"Time": 0, "Price5MA": 0, "Slope5Min": 0.0, "PriceHistory": []} 
         self.twii_data = None 
         self.last_reset = datetime.now().date()
+        self.last_snapshot_ts = 0
         
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
         self._init_market_stats()
@@ -895,7 +853,7 @@ class SniperEngine:
             log_debug(f"💥 [{code}] 嚴重例外：{str(e)}")
             return 0.0, 0.0, 0.0
 
-    def _fetch_stock(self, code, now_time=None):
+    def _fetch_stock(self, code, now_time=None, force_snapshot=False):
         try:
             if now_time is None: now_time = datetime.now(timezone.utc) + timedelta(hours=8)
             client = next(self.client_cycle) if self.client_cycle else None
@@ -988,8 +946,9 @@ class SniperEngine:
             if time_ok and wave_ok and pct_ok and ceiling_ok and threshold_ok:
                 active_light = 1
 
+            current_twii_slope = self.market_stats.get("Slope5Min", 0.0)
             thresholds = get_dynamic_thresholds(price)
-            raw_state = check_signal(pct, is_bullish, net_day, net_1h, ratio_5ma, thresholds, is_breakdown, price, vwap, code in self.active_flags, now_time, vol_lots, twii_slope=self.market_stats.get("Slope5Min", 0.0))
+            raw_state = check_signal(pct, is_bullish, net_day, net_1h, ratio_5ma, thresholds, is_breakdown, price, vwap, code in self.active_flags, now_time, vol_lots, twii_slope=current_twii_slope)
 
             event_label = None
             scope = "inventory" if code in self.inventory_codes else "watchlist"
@@ -1016,10 +975,14 @@ class SniperEngine:
                 if "攻擊" in event_label: self.active_flags[code] = True
                 if "出貨" in event_label or "撤退" in event_label: self.daily_risk_flags[code] = True
                 
-                current_twii_slope = self.market_stats.get("Slope5Min", 0.0)
-                
-                ev = SniperEvent(code=code, name=get_stock_name(code), scope=scope, event_kind="STRATEGY", event_label=event_label, price=price, pct=pct, vwap=vwap, ratio=ratio_5ma, ratio_yest=ratio_yest, net_10m=net_10m, net_1h=net_1h, net_day=net_day, tp_price=tp_calc, sl_price=sl_calc, win_rate=win_rate, twii_slope=current_twii_slope, rsi=rsi_val, band_ratio=band_ratio_val, b_percent=b_percent_val,control_ratio=ctrl_ratio)
+                ev = SniperEvent(code=code, name=get_stock_name(code), scope=scope, event_kind="STRATEGY", event_label=event_label, price=price, pct=pct, vwap=vwap, ratio=ratio_5ma, ratio_yest=ratio_yest, net_10m=net_10m, net_1h=net_1h, net_day=net_day, tp_price=tp_calc, sl_price=sl_calc, win_rate=win_rate, twii_slope=current_twii_slope, rsi=rsi_val, band_ratio=band_ratio_val, b_percent=b_percent_val, control_ratio=ctrl_ratio, is_snapshot=False)
                 self._dispatch_event(ev)
+                db.log_telegram(ev)
+
+            # [新增] 5分鐘定時快照紀錄
+            if force_snapshot and not event_label:
+                ev_snap = SniperEvent(code=code, name=get_stock_name(code), scope=scope, event_kind="SNAPSHOT", event_label="SNAPSHOT", price=price, pct=pct, vwap=vwap, ratio=ratio_5ma, ratio_yest=ratio_yest, net_10m=net_10m, net_1h=net_1h, net_day=net_day, tp_price=0, sl_price=0, win_rate=win_rate, twii_slope=current_twii_slope, rsi=rsi_val, band_ratio=band_ratio_val, b_percent=b_percent_val, control_ratio=ctrl_ratio, is_snapshot=True)
+                db.log_telegram(ev_snap)
 
             return (code, get_stock_name(code), "一般", price, pct, vwap, vol_lots, est_lots, ratio_5ma, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m, situation, ratio_yest, active_light, rsi_val, band_ratio_val, b_percent_val)
         except Exception as e:
@@ -1031,13 +994,22 @@ class SniperEngine:
         while self.running:
             try:
                 now = datetime.now(timezone.utc) + timedelta(hours=8)
+                current_ts = time.time()
                 
+                # --- 新增：5分鐘快照觸發器 ---
+                do_snapshot = False
+                if MarketSession.is_market_open(now) and (current_ts - self.last_snapshot_ts >= 300):
+                    do_snapshot = True
+                    self.last_snapshot_ts = current_ts
+                    log_debug("📸 執行 5 分鐘定時採樣...")
+
                 if now.date() > self.last_reset:
                     self.active_flags = {}; self.daily_risk_flags = {}; self.daily_net = {}; self.prev_data = {}; self.vol_queues = {}; self.base_vol_cache = {}; self.wave_tracker = {}; self.adv_indicator_cache = {}
                     notification_manager.reset_daily_state()
                     db.write_queue.put(('execute', 'DELETE FROM telegram_logs', ()))
                     self.last_reset = now.date()
                     log_debug(f"[{now}] Daily Reset Complete")
+                    self.update_targets()
 
                 self._update_market_thermometer()
                 
@@ -1054,27 +1026,23 @@ class SniperEngine:
                 targets.sort(key=priority_key)
 
                 batch = []
-                futures = {self.executor.submit(self._fetch_stock, c, now): c for c in targets}
+                # [修改] 傳入 force_snapshot
+                futures = {self.executor.submit(self._fetch_stock, c, now, force_snapshot=do_snapshot): c for c in targets}
                 
                 for f in concurrent.futures.as_completed(futures):
                     try:
                         result = f.result(timeout=5)
                         if result: batch.append(result)
-                    except concurrent.futures.TimeoutError: pass 
-                    except Exception: pass 
+                    except: pass
 
                 db.upsert_realtime_batch(batch)
-                
                 fail_count = 0 
                 time.sleep(1.5 if MarketSession.is_market_open(now) else 5)
 
             except Exception as e:
                 fail_count += 1
                 log_debug(f"⚠️ [Engine Critical Error] {e}")
-                
-                sleep_time = min(30, 2 ** fail_count)
-                time.sleep(sleep_time)
-                
+                time.sleep(min(30, 2 ** fail_count))
                 try:
                     self.executor.shutdown(wait=False)
                     self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
