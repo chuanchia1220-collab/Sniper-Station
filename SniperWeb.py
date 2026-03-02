@@ -128,6 +128,7 @@ class SniperEvent:
     rsi: float = 0.0
     band_ratio: float = 0.0
     b_percent: float = 0.0
+    control_ratio: float = 0.0
     timestamp: float = field(default_factory=time.time)
     data_status: str = "DATA_OK"
     is_test: bool = False
@@ -173,6 +174,10 @@ class Database:
             try: c.execute("ALTER TABLE telegram_logs ADD COLUMN band_ratio REAL DEFAULT 0")
             except: pass
             try: c.execute("ALTER TABLE telegram_logs ADD COLUMN b_percent REAL DEFAULT 0")
+            except: pass
+            try: c.execute("ALTER TABLE telegram_logs ADD COLUMN ratio REAL DEFAULT 0")
+            except: pass
+            try: c.execute("ALTER TABLE telegram_logs ADD COLUMN control_ratio REAL DEFAULT 0")
             except: pass
             
             conn.commit(); conn.close()
@@ -249,12 +254,12 @@ class Database:
     def log_telegram(self, event: SniperEvent):
         time_str = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
         sql = 'INSERT INTO telegram_logs (log_time, code, name, signal, price, vwap, net_10m, net_1h, net_day, twii_slope, rsi, band_ratio, b_percent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-        self.write_queue.put(('execute', sql, (time_str, event.code, event.name, event.event_label, event.price, event.vwap, event.net_10m, event.net_1h, event.net_day, event.twii_slope, event.rsi, event.band_ratio, event.b_percent)))
+        self.write_queue.put(('execute', sql, (time_str, event.code, event.name, event.event_label, event.price, event.vwap, event.net_10m, event.net_1h, event.net_day, event.twii_slope, event.rsi, event.band_ratio, event.b_percent,event.ratio, event.control_ratio)))
 
     def get_telegram_logs(self):
         try:
             conn = self._get_conn()
-            df = pd.read_sql('SELECT log_time as 時間, code as 代碼, name as 名稱, signal as 訊號, price as 價格, vwap as 均價, net_10m as 大戶10M, net_1h as 大戶1H, net_day as 大戶日, twii_slope as 大盤斜率, rsi as RSI, band_ratio as 帶寬比, b_percent as 布林極限 FROM telegram_logs ORDER BY id ASC', conn)
+            df = pd.read_sql('SELECT log_time as 時間, code as 代碼, name as 名稱, signal as 訊號, price as 價格, vwap as 均價, net_10m as 大戶10M, net_1h as 大戶1H, net_day as 大戶日, ratio as 量比, control_ratio as 控盤比, twii_slope as 大盤斜率, rsi as RSI, band_ratio as 帶寬比, b_percent as 布林極限 FROM telegram_logs ORDER BY id ASC', conn)
             conn.close()
             return df
         except: return pd.DataFrame()
@@ -999,14 +1004,15 @@ class SniperEngine:
             rsi_val = self.adv_indicator_cache[code].get('rsi', 0.0)
             band_ratio_val = self.adv_indicator_cache[code].get('br', 0.0)
             b_percent_val = self.adv_indicator_cache[code].get('bp', 0.0)
-
+            ctrl_ratio = (net_day / vol_lots * 100) if vol_lots > 0 else 0
+            
             if event_label:
                 if "攻擊" in event_label: self.active_flags[code] = True
                 if "出貨" in event_label or "撤退" in event_label: self.daily_risk_flags[code] = True
                 
                 current_twii_slope = self.market_stats.get("Slope5Min", 0.0)
                 
-                ev = SniperEvent(code=code, name=get_stock_name(code), scope=scope, event_kind="STRATEGY", event_label=event_label, price=price, pct=pct, vwap=vwap, ratio=ratio_5ma, ratio_yest=ratio_yest, net_10m=net_10m, net_1h=net_1h, net_day=net_day, tp_price=tp_calc, sl_price=sl_calc, win_rate=win_rate, twii_slope=current_twii_slope, rsi=rsi_val, band_ratio=band_ratio_val, b_percent=b_percent_val)
+                ev = SniperEvent(code=code, name=get_stock_name(code), scope=scope, event_kind="STRATEGY", event_label=event_label, price=price, pct=pct, vwap=vwap, ratio=ratio_5ma, ratio_yest=ratio_yest, net_10m=net_10m, net_1h=net_1h, net_day=net_day, tp_price=tp_calc, sl_price=sl_calc, win_rate=win_rate, twii_slope=current_twii_slope, rsi=rsi_val, band_ratio=band_ratio_val, b_percent=b_percent_val,control_ratio=ctrl_ratio)
                 self._dispatch_event(ev)
 
             return (code, get_stock_name(code), "一般", price, pct, vwap, vol_lots, est_lots, ratio_5ma, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m, situation, ratio_yest, active_light, rsi_val, band_ratio_val, b_percent_val)
