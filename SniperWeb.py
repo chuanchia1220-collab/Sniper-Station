@@ -845,19 +845,38 @@ class SniperEngine:
 
     def _calculate_advanced_indicators(self, code):
         try:
+            # --- [機制 1] 隨機節流：避免多線程同時向 Yahoo 擊發 ---
+            import random
+            time.sleep(random.uniform(0.5, 3.0))
+            
+            # --- [機制 2] 延長快取：整備月指標每 30 分鐘更新一次即可 (節省 80% 流量) ---
+            now_ts = time.time()
+            if code in self.adv_indicator_cache:
+                # 判斷快取時間 (600 秒 = 10 分鐘)
+                if (now_ts - self.adv_indicator_cache[code].get('time', 0)) < 600:
+                    c = self.adv_indicator_cache[code]
+                    return c['rsi'], c['br'], c['bp']
+
+            # --- [機制 3] 標記故障：針對經常喷錯的標的進行隔離 ---
+            if not hasattr(self, 'indicator_fail_count'): self.indicator_fail_count = {}
+            if self.indicator_fail_count.get(code, 0) >= 3:
+                return 0.0, 0.0, 0.0
+
             suffix = ".TW"
             if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
             full_code = f"{code}{suffix}"
             
+            # 抓取資料 (縮短 period 到 1mo 減少資料傳輸量，計算 RSI 14 仍夠用)
             ticker = yf.Ticker(full_code)
-            df = ticker.history(period="3mo", auto_adjust=True)
+            df = ticker.history(period="1mo", interval="1d", auto_adjust=True)
             
-            if df.empty: 
-                log_debug(f"❌ [{code}] 指標失敗：yf.Ticker.history 無資料")
+            if df.empty or len(df) < 20: 
+                log_debug(f"⚠️ [{code}] 指標失敗：歷史資料不足")
                 return 0.0, 0.0, 0.0
                 
             df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
 
+            # 技術指標計算
             rsi_series = ta.rsi(df['Close'], length=14)
             df['RSI_14'] = rsi_series if rsi_series is not None else 0.0
 
@@ -878,11 +897,21 @@ class SniperEngine:
             if math.isnan(band_ratio_val): band_ratio_val = 0.0
             if math.isnan(b_percent_val): b_percent_val = 0.0
 
-            log_debug(f"✅ [{code}] 指標 OK：RSI={rsi_val:.1f} | BR={band_ratio_val:.2f} | %b={b_percent_val:.2f}")
+            # 更新快取
+            self.adv_indicator_cache[code] = {'time': now_ts, 'rsi': rsi_val, 'br': band_ratio_val, 'bp': b_percent_val}
+            # 成功時歸零失敗計數
+            self.indicator_fail_count[code] = 0
+
+            log_debug(f"✅ [{code}] 指標更新成功 (Cache 啟動)")
             return round(rsi_val, 1), round(band_ratio_val, 2), round(b_percent_val, 2)
 
         except Exception as e:
-            log_debug(f"💥 [{code}] 嚴重例外：{str(e)}")
+            err_msg = str(e)
+            if "Too Many Requests" in err_msg:
+                self.indicator_fail_count[code] = self.indicator_fail_count.get(code, 0) + 1
+                log_debug(f"🛑 [{code}] Yahoo 限制流量中，失敗次數: {self.indicator_fail_count[code]}")
+            else:
+                log_debug(f"💥 [{code}] 指標嚴重例外：{err_msg}")
             return 0.0, 0.0, 0.0
 
     def _fetch_stock(self, code, now_time=None, force_snapshot=False):
