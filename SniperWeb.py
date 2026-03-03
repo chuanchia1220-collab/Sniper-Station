@@ -868,9 +868,9 @@ class SniperEngine:
             
             # 抓取資料 (縮短 period 到 1mo 減少資料傳輸量，計算 RSI 14 仍夠用)
             ticker = yf.Ticker(full_code)
-            df = ticker.history(period="1mo", interval="1d", auto_adjust=True)
+            df = ticker.history(period="3mo", interval="1d", auto_adjust=True)
             
-            if df.empty or len(df) < 20: 
+            if df.empty or len(df) < 25: 
                 log_debug(f"⚠️ [{code}] 指標失敗：歷史資料不足")
                 return 0.0, 0.0, 0.0
                 
