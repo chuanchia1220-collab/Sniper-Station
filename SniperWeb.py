@@ -149,6 +149,9 @@ class Database:
         threading.Thread(target=self._init_google_sheets, daemon=True).start()
 
     def _init_google_sheets(self):
+        # 如果已經連線成功，就不要再跑一次
+        if hasattr(self, 'gs_client') and self.gs_client:
+            return
         try:
             from google.oauth2.service_account import Credentials # 確保導入
             scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
