@@ -511,7 +511,7 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdo
     # -------------------
 
     in_golden_zone = False
-    if is_bullish and price <= (vwap * 1.015):
+    if is_bullish and price <= (vwap * 1.006):
         in_golden_zone = True
 
     if ratio >= thresholds['tgt_ratio']:
@@ -653,6 +653,15 @@ class NotificationManager:
     def should_notify(self, event: SniperEvent) -> bool:
         if event.is_test: return True
         if not MarketSession.is_market_open(): return False
+
+        # --- 【新增：09:25 靜音閘門】 ---
+        # 取得當前台北時間 (HHMM 格式)
+        now_hhmm = int((datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%H%M'))
+        if now_hhmm < 925:
+            # 雖然不推播，但因為這是在 should_notify 內判斷
+            # 只要 fetch_stock 裡有呼叫 db.log_telegram，數據依然會進雲端！
+            return False 
+        # -----------------------------
         
         if event.scope == "watchlist" and event.event_label == "🔥攻擊":
             if event.win_rate < 50: return False
