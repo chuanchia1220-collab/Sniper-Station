@@ -155,11 +155,14 @@ class Database:
             
             # --- 優先嘗試從 Streamlit Secrets 讀取 (雲端環境) ---
             if "gcp_service_account" in st.secrets:
-                creds_info = st.secrets["gcp_service_account"]
-                # 建立憑證物件
+                creds_info = dict(st.secrets["gcp_service_account"])
+                # --- 自動修復 PEM 格式中的換行問題 ---
+                if "private_key" in creds_info:
+                    creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
+                
                 creds = Credentials.from_service_account_info(creds_info, scopes=scope)
                 self.gs_client = gspread.authorize(creds)
-                log_debug("☁️ Google Sheets 連線成功 (透過 Streamlit Secrets)")
+                log_debug("☁️ Google Sheets 連線成功 (格式已自動校準)")
             
             # --- 次要嘗試從本地檔案讀取 (本地測試環境) ---
             elif os.path.exists("service_account.json"):
