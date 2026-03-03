@@ -150,25 +150,33 @@ class Database:
 
     def _init_google_sheets(self):
         try:
-        # 定義存取範圍
-        scope = [
-            'https://www.googleapis.com/auth/spreadsheets',
-            'https://www.googleapis.com/auth/drive'
-        ]
-        
-        # 從 Streamlit Secrets 讀取憑證字典
-        creds_dict = st.secrets["gcp_service_account"]
-        
-        # 建立憑證物件
-        credentials = Credentials.from_service_account_info(creds_dict, scopes=scope)
-        
-        # 授權 gspread
-        self.gc = gspread.authorize(credentials)
-        print("[08:35:00] ✅ Google Sheets 透過 Streamlit Secrets 認證成功")
-        
-    except Exception as e:
-        print(f"⚠️ Google Sheets 初始化失敗: {e}")
-        st.error(f"Google Sheets 認證失敗，請檢查 Secrets 設定: {e}")
+            from google.oauth2.service_account import Credentials # 確保導入
+            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            
+            # --- 優先嘗試從 Streamlit Secrets 讀取 (雲端環境) ---
+            if "gcp_service_account" in st.secrets:
+                creds_info = st.secrets["gcp_service_account"]
+                # 建立憑證物件
+                creds = Credentials.from_service_account_info(creds_info, scopes=scope)
+                self.gs_client = gspread.authorize(creds)
+                log_debug("☁️ Google Sheets 連線成功 (透過 Streamlit Secrets)")
+            
+            # --- 次要嘗試從本地檔案讀取 (本地測試環境) ---
+            elif os.path.exists("service_account.json"):
+                from oauth2client.service_account import ServiceAccountCredentials # 確保本地相容導入
+                creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
+                self.gs_client = gspread.authorize(creds)
+                log_debug("☁️ Google Sheets 連線成功 (透過本地 JSON)")
+            
+            else:
+                log_debug("⚠️ 找不到憑證資訊，雲端同步關閉")
+                return
+
+            # 開啟試算表
+            self.gs_sheet = self.gs_client.open("Sniper_Battle_Logs").sheet1
+            
+        except Exception as e:
+            log_debug(f"⚠️ Google Sheets 初始化失敗: {e}")
 
     def _get_conn(self):
         for _ in range(3):
