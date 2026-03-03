@@ -480,7 +480,7 @@ def _calc_est_vol(current_vol):
 def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdown, price, vwap, has_attacked, now_time, vol_lots, twii_slope=0.0):
     if is_breakdown: return "🚨撤退"
     if pct >= 9.30: return "👑漲停"
-    if now_time.time() < dt_time(9, 5): return "⏳暖機"
+    if now_time.time() < dt_time(9, 25): return "⏳暖機"
 
     # --- 新增防禦機制 ---
     if twii_slope < -10.0: return "⚖️觀望(盤勢險峻)"
