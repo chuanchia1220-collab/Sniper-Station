@@ -1041,8 +1041,9 @@ class SniperEngine:
                 db.log_telegram(ev)
 
             # [新增] 5分鐘定時快照紀錄
-            if force_snapshot and not event_label:
-                ev_snap = SniperEvent(code=code, name=get_stock_name(code), scope=scope, event_kind="SNAPSHOT", event_label="SNAPSHOT", price=price, pct=pct, vwap=vwap, ratio=ratio_5ma, ratio_yest=ratio_yest, net_10m=net_10m, net_1h=net_1h, net_day=net_day, tp_price=0, sl_price=0, win_rate=win_rate, twii_slope=current_twii_slope, rsi=rsi_val, band_ratio=band_ratio_val, b_percent=b_percent_val, control_ratio=ctrl_ratio, is_snapshot=True)
+            # 建議修正為：
+            if force_snapshot:
+                ev_snap = SniperEvent(..., event_label="SNAPSHOT" if not event_label else f"SNAPSHOT_{event_label}", ...)
                 db.log_telegram(ev_snap)
 
             return (code, get_stock_name(code), "一般", price, pct, vwap, vol_lots, est_lots, ratio_5ma, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m, situation, ratio_yest, active_light, rsi_val, band_ratio_val, b_percent_val)
@@ -1092,7 +1093,7 @@ class SniperEngine:
                 
                 for f in concurrent.futures.as_completed(futures):
                     try:
-                        result = f.result(timeout=5)
+                        result = f.result(timeout=10)
                         if result: batch.append(result)
                     except: pass
 
