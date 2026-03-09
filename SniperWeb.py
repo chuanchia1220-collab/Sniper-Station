@@ -1087,11 +1087,19 @@ class SniperEngine:
                 current_ts = time.time()
                 
                 # --- 新增：5分鐘快照觸發器 ---
+                # --- [修正後的動態採樣頻率] ---
                 do_snapshot = False
-                if MarketSession.is_market_open(now) and (current_ts - self.last_snapshot_ts >= 300):
-                    do_snapshot = True
-                    self.last_snapshot_ts = current_ts
-                    log_debug("📸 執行 5 分鐘定時採樣...")
+                if MarketSession.is_market_open(now):
+                    # 取得當前台北時間 (HHMM 格式)
+                    now_hhmm = int(now.strftime('%H%M'))
+                    
+                    # 策略：09:00 - 09:15 採樣間隔為 60 秒；其餘時間 300 秒
+                    interval = 60 if now_hhmm <= 915 else 300
+                    
+                    if (current_ts - self.last_snapshot_ts >= interval):
+                        do_snapshot = True
+                        self.last_snapshot_ts = current_ts
+                        log_debug(f"📸 執行 {interval} 秒定時採樣 (目標 15 檔全覆蓋)...")
 
                 if now.date() > self.last_reset:
                     self.active_flags = {}; self.daily_risk_flags = {}; self.daily_net = {}; self.prev_data = {}; self.vol_queues = {}; self.base_vol_cache = {}; self.wave_tracker = {}; self.adv_indicator_cache = {}
