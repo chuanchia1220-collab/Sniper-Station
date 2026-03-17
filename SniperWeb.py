@@ -179,7 +179,7 @@ class Database:
                 return
 
             # 開啟試算表
-            self.gs_sheet = self.gs_client.open("Sniper_Battle_Logs").sheet1
+            self.gs_sheet = self.gs_client.open_by_url("https://docs.google.com/spreadsheets/d/1cmB7osByPJeSA7Zz71K21xM5L2X1xMaHAYeEcYkVZfU/edit?usp=sharing").sheet1
             
         except Exception as e:
             log_debug(f"⚠️ Google Sheets 初始化失敗: {e}")
