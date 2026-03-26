@@ -22,50 +22,46 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ==========================================
-# 🛡️ Sniper 聖杯戰術記憶體與過濾器 (請放在全域變數區)
+# 🛡️ Sniper 聖杯戰術記憶體 (記錄今日已推播名單，避免重複洗頻)
 # ==========================================
-alerted_today = set()
-last_alert_date = datetime.now(timezone.utc).date()
+if 'alerted_today' not in globals():
+    alerted_today = set()
 
-def check_holy_grail_signal(stock_code, slope, rsi, vol_ratio, current_dt):
+def check_holy_grail_final(stock_code, current_time, slope, rsi, vol_ratio):
     """
-    終極聖杯推播邏輯：只發送 "🔥 進場"，每天每檔限一次
+    Sniper 終極聖杯推播邏輯 (單一進場訊號、三情境自動切換)
     """
-    global alerted_today, last_alert_date
-
-    # 1. 跨日自動清空記憶體
-    today = current_dt.date()
-    if today > last_alert_date:
-        alerted_today.clear()
-        last_alert_date = today
-
-    # 2. 紀律閘門：同一天已經叫過的股票，絕對不叫第二次
+    # 🛑 閘門 1：同一天只推播一次
     if stock_code in alerted_today:
         return None
 
-    # 3. 時間濾網：避開 09:08 前的開盤騙線亂流
-    current_time = current_dt.time()
+    # 🛑 閘門 2：避開 09:08 前的開盤亂流 (確保 current_time 是 datetime.time 格式)
     if current_time < dt_time(9, 8, 0):
         return None
 
-    # 4. 聖杯三情境自動適應 (鐵血 100% 勝率版參數)
+    # 安全防呆：確保數值存在
+    if slope is None or rsi is None or vol_ratio is None:
+        return None
+
     is_holy_grail = False
 
-    # 確保數值有效
-    if slope is not None and rsi is not None and vol_ratio is not None:
-        if slope > 5:
-            if 55 < rsi < 85 and 1.5 < vol_ratio < 15:
-                is_holy_grail = True
-        elif -5 <= slope <= 5:
-            if 60 < rsi < 80 and 1.5 < vol_ratio < 10:
-                is_holy_grail = True
-        else:
-            if 65 < rsi < 80 and 2.0 < vol_ratio < 8:
-                is_holy_grail = True
+    # 情境 1：大盤強勢 (Slope > 5)
+    if slope > 5:
+        if 50 < rsi < 85 and 1.2 < vol_ratio < 15:
+            is_holy_grail = True
 
-    # 5. 扣下板機
+    # 情境 2：大盤震盪 (Slope -5 ~ 5)
+    elif -5 <= slope <= 5:
+        if 60 < rsi < 80 and 1.5 < vol_ratio < 10:
+            is_holy_grail = True
+
+    # 情境 3：大盤弱勢/黑天鵝 (Slope < -5)
+    else:
+        if 65 < rsi < 80 and 2.0 < vol_ratio < 8:
+            is_holy_grail = True
+
     if is_holy_grail:
-        alerted_today.add(stock_code) # 寫入記憶體，今天不再叫
+        alerted_today.add(stock_code)
         return "🔥 進場"
 
     return None
@@ -549,38 +545,6 @@ def _calc_est_vol(current_vol):
     weight = 2.0 if elapsed_minutes < 15 else 1.0
     return int(current_vol * (270 / elapsed_minutes) / weight)
 
-def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdown, price, vwap, has_attacked, now_time, vol_lots, twii_slope=0.0):
-    if is_breakdown: return "🚨撤退"
-    if pct >= 9.30: return "👑漲停"
-    if now_time.time() < dt_time(9, 5): return "⏳暖機"
-
-    # --- 新增防禦機制 ---
-    if twii_slope < -10.0: return "⚖️觀望(盤勢險峻)"
-    if pct < 0 and twii_slope < 5.0: return "👀跌深反彈"
-    # -------------------
-
-    in_golden_zone = False
-    if is_bullish and price <= (vwap * 1.006):
-        in_golden_zone = True
-
-    if ratio >= thresholds['tgt_ratio']:
-        if in_golden_zone and net_1h > 0: return "🔥攻擊"
-        elif net_1h < 0: return "💀出貨"
-        
-    if not is_bullish: return "📉線下"
-    if is_bullish and not in_golden_zone: return "⚠️追高"
-
-    bias = ((price - vwap) / vwap) * 100 if vwap > 0 else 0
-    if bias > thresholds['overheat']: return "⚠️過熱"
-
-    if dt_time(13, 0) <= now_time.time() <= dt_time(13, 25):
-        if (3.0 <= pct <= 9.0) and (net_1h > 0) and (net_day / (vol_lots+1) >= 0.05): return "🔥尾盤"
-        
-    if pct > 2.0 and net_1h < 0: return "❌誘多"
-    if pct >= thresholds['tgt_pct']: return "⚠️價強"
-
-    return "盤整"
-
 # ==========================================
 # 5. GPT Advisor
 # ==========================================
@@ -1059,7 +1023,14 @@ class SniperEngine:
             b_percent_val = self.adv_indicator_cache[code].get('bp', 0.0)
             ctrl_ratio = (net_day / vol_lots * 100) if vol_lots > 0 else 0
 
-            event_label = check_holy_grail_signal(code, current_twii_slope, rsi_val, ratio_5ma, now_time)
+            # 🚀 呼叫聖杯引擎
+            event_label = check_holy_grail_final(
+                stock_code=code,
+                current_time=now_time.time(),
+                slope=current_twii_slope,
+                rsi=rsi_val,
+                vol_ratio=ratio_5ma
+            )
 
             scope = "inventory" if code in self.inventory_codes else "watchlist"
             trigger_price = vwap * 1.005
@@ -1107,7 +1078,7 @@ class SniperEngine:
                 db.log_telegram(ev_snap)
             # ---------------------------------------
 
-            return (code, get_stock_name(code), "一般", price, pct, vwap, vol_lots, est_lots, ratio_5ma, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m, situation, ratio_yest, active_light, rsi_val, band_ratio_val, b_percent_val)
+            return (code, get_stock_name(code), "一般", price, pct, vwap, vol_lots, est_lots, ratio_5ma, net_1h, net_day, event_label, now_ts, "DATA_OK", "B", "NORMAL", net_10m, situation, ratio_yest, active_light, rsi_val, band_ratio_val, b_percent_val)
         except Exception as e:
             return None
 
@@ -1137,6 +1108,7 @@ class SniperEngine:
                 if now.date() > self.last_reset:
                     self.active_flags = {}; self.daily_risk_flags = {}; self.daily_net = {}; self.prev_data = {}; self.vol_queues = {}; self.base_vol_cache = {}; self.wave_tracker = {}; self.adv_indicator_cache = {}
                     notification_manager.reset_daily_state()
+                    alerted_today.clear() # 洗掉昨天的記憶，否則隔天同一檔股票發動會推播不出來
                     db.write_queue.put(('execute', 'DELETE FROM telegram_logs', ()))
                     self.last_reset = now.date()
                     log_debug(f"[{now}] Daily Reset Complete")
