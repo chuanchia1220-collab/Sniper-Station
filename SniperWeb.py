@@ -22,6 +22,55 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ==========================================
+# 🛡️ Sniper 聖杯戰術記憶體與過濾器 (請放在全域變數區)
+# ==========================================
+alerted_today = set()
+last_alert_date = datetime.now(timezone.utc).date()
+
+def check_holy_grail_signal(stock_code, slope, rsi, vol_ratio, current_dt):
+    """
+    終極聖杯推播邏輯：只發送 "🔥 進場"，每天每檔限一次
+    """
+    global alerted_today, last_alert_date
+
+    # 1. 跨日自動清空記憶體
+    today = current_dt.date()
+    if today > last_alert_date:
+        alerted_today.clear()
+        last_alert_date = today
+
+    # 2. 紀律閘門：同一天已經叫過的股票，絕對不叫第二次
+    if stock_code in alerted_today:
+        return None
+
+    # 3. 時間濾網：避開 09:08 前的開盤騙線亂流
+    current_time = current_dt.time()
+    if current_time < dt_time(9, 8, 0):
+        return None
+
+    # 4. 聖杯三情境自動適應 (鐵血 100% 勝率版參數)
+    is_holy_grail = False
+
+    # 確保數值有效
+    if slope is not None and rsi is not None and vol_ratio is not None:
+        if slope > 5:
+            if 55 < rsi < 85 and 1.5 < vol_ratio < 15:
+                is_holy_grail = True
+        elif -5 <= slope <= 5:
+            if 60 < rsi < 80 and 1.5 < vol_ratio < 10:
+                is_holy_grail = True
+        else:
+            if 65 < rsi < 80 and 2.0 < vol_ratio < 8:
+                is_holy_grail = True
+
+    # 5. 扣下板機
+    if is_holy_grail:
+        alerted_today.add(stock_code) # 寫入記憶體，今天不再叫
+        return "🔥 進場"
+
+    return None
+
+# ==========================================
 # [系統除錯機制] 全域日誌
 # ==========================================
 sys_debug_logs = deque(maxlen=50)
@@ -635,6 +684,7 @@ class NotificationManager:
     COOLDOWN_SECONDS = 600
     RATE_LIMIT_DELAY = 1.0
     EMOJI_MAP = {
+        "🔥 進場": "🔥",
         "🔥攻擊": "🚀", "💣伏擊": "💣", "👀量增": "👀",
         "💀出貨": "💀", "🚨撤退": "⚠️", "👑漲停": "👑",
         "⚠️價強": "💪", "❌誘多": "🎣", "🔥尾盤": "🔥",
@@ -663,21 +713,12 @@ class NotificationManager:
             return False 
         # -----------------------------
         
-        if event.scope == "watchlist" and event.event_label == "🔥攻擊":
+        if event.event_label != "🔥 進場": return False
+
+        if event.scope == "watchlist" and event.event_label == "🔥 進場":
             if event.win_rate < 50: return False
 
-        if event.event_label == "⚠️追高": return False
-
         key = f"{event.code}_{event.scope}_{event.event_label}"
-        
-        if event.scope == "inventory":
-            if event.event_label not in ["💀出貨", "🚨撤退", "🔥攻擊", "👑漲停"]: return False
-            if "撤退" in event.event_label:
-                 if time.time() - self._cooldowns.get(key, 0) < 300: return False
-                 return True
-
-        if event.scope == "watchlist":
-            if event.event_label != "🔥攻擊": return False
 
         if time.time() - self._cooldowns.get(key, 0) < self.COOLDOWN_SECONDS: return False
         return True
@@ -692,7 +733,7 @@ class NotificationManager:
             event = self._queue.get()
             try:
                 self._send_telegram(event)
-                if OPENAI_API_KEY and event.event_label in ["🔥攻擊", "🔥尾盤", "💀出貨"]:
+                if OPENAI_API_KEY and event.event_label in ["🔥 進場"]:
                     gpt_analysis = self.gpt_advisor.analyze_signal(event)
                     self._send_telegram_gpt(event.code, gpt_analysis)
                 time.sleep(self.RATE_LIMIT_DELAY)
@@ -1008,20 +1049,6 @@ class SniperEngine:
                 active_light = 1
 
             current_twii_slope = self.market_stats.get("Slope5Min", 0.0)
-            thresholds = get_dynamic_thresholds(price)
-            raw_state = check_signal(pct, is_bullish, net_day, net_1h, ratio_5ma, thresholds, is_breakdown, price, vwap, code in self.active_flags, now_time, vol_lots, twii_slope=current_twii_slope)
-
-            event_label = None
-            scope = "inventory" if code in self.inventory_codes else "watchlist"
-            trigger_price = vwap * 1.005
-            tp_calc = adjust_to_tick(trigger_price * 1.02, method='round')
-            sl_calc = adjust_to_tick(vwap * 0.985, method='floor')
-
-            if "攻擊" in raw_state and code not in self.active_flags: event_label = "🔥攻擊"
-            elif "漲停" in raw_state and scope == "inventory": event_label = "👑漲停"
-            elif "撤退" in raw_state and scope == "inventory": event_label = "🚨撤退"
-            elif "出貨" in raw_state and code not in self.daily_risk_flags and scope == "inventory": event_label = "💀出貨"
-            elif "尾盤" in raw_state: event_label = "🔥尾盤"
 
             if code not in self.adv_indicator_cache or (now_ts - self.adv_indicator_cache[code].get('time', 0)) > 300:
                 c_rsi, c_br, c_bp = self._calculate_advanced_indicators(code)
@@ -1031,10 +1058,16 @@ class SniperEngine:
             band_ratio_val = self.adv_indicator_cache[code].get('br', 0.0)
             b_percent_val = self.adv_indicator_cache[code].get('bp', 0.0)
             ctrl_ratio = (net_day / vol_lots * 100) if vol_lots > 0 else 0
+
+            event_label = check_holy_grail_signal(code, current_twii_slope, rsi_val, ratio_5ma, now_time)
+
+            scope = "inventory" if code in self.inventory_codes else "watchlist"
+            trigger_price = vwap * 1.005
+            tp_calc = adjust_to_tick(trigger_price * 1.02, method='round')
+            sl_calc = adjust_to_tick(vwap * 0.985, method='floor')
             
             if event_label:
-                if "攻擊" in event_label: self.active_flags[code] = True
-                if "出貨" in event_label or "撤退" in event_label: self.daily_risk_flags[code] = True
+                if "進場" in event_label: self.active_flags[code] = True
                 
                 ev = SniperEvent(code=code, name=get_stock_name(code), scope=scope, event_kind="STRATEGY", event_label=event_label, price=price, pct=pct, vwap=vwap, ratio=ratio_5ma, ratio_yest=ratio_yest, net_10m=net_10m, net_1h=net_1h, net_day=net_day, tp_price=tp_calc, sl_price=sl_calc, win_rate=win_rate, twii_slope=current_twii_slope, rsi=rsi_val, band_ratio=band_ratio_val, b_percent=b_percent_val, control_ratio=ctrl_ratio, is_snapshot=False)
                 self._dispatch_event(ev)
