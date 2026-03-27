@@ -1073,8 +1073,12 @@ class SniperEngine:
                 db.log_telegram(ev_snap)
             # ---------------------------------------
 
-            return (code, get_stock_name(code), "一般", price, pct, vwap, vol_lots, est_lots, ratio_5ma, net_1h, net_day, event_label, now_ts, "DATA_OK", "B", "NORMAL", net_10m, situation, ratio_yest, active_light, rsi_val, band_ratio_val, b_percent_val)
+            # 如果沒有進場訊號，畫面上顯示 "-" 保持乾淨
+            display_label = event_label if event_label else "-"
+            return (code, get_stock_name(code), "一般", price, pct, vwap, vol_lots, est_lots, ratio_5ma, net_1h, net_day, display_label, now_ts, "DATA_OK", "B", "NORMAL", net_10m, situation, ratio_yest, active_light, rsi_val, band_ratio_val, b_percent_val)
         except Exception as e:
+            # 🛑 讓隱形殺手現形！如果有 API 錯誤，立刻寫入系統日誌
+            log_debug(f"🚨 [{code}] 擷取失敗: {e}")
             return None
 
     def _run_loop(self):
@@ -1135,7 +1139,8 @@ class SniperEngine:
 
                 db.upsert_realtime_batch(batch)
                 fail_count = 0 
-                time.sleep(1.5 if MarketSession.is_market_open(now) else 5)
+                # 🛑 減緩 API 擊發速度，避免被 Fugle 封鎖！(從 1.5 秒放慢到 10 秒)
+                time.sleep(10 if MarketSession.is_market_open(now) else 20)
 
             except Exception as e:
                 fail_count += 1
