@@ -1023,7 +1023,7 @@ class SniperEngine:
                 current_time=now_time.time(),
                 slope=current_twii_slope,
                 rsi=rsi_val,
-                vol_ratio=ratio_5ma
+                vol_ratio=ratio_5ma,
                 memory_set=self.alerted_today  # 👈 補上這一個參數
             )
 
