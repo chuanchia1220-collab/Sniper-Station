@@ -241,6 +241,7 @@ class Database:
     def _init_db(self):
         try:
             conn = self._get_conn(); c = conn.cursor()
+            c.execute('PRAGMA journal_mode=WAL;')  # 👈 新增這行：開啟寫入先行日誌，徹底解決讀寫卡頓
             c.execute('''CREATE TABLE IF NOT EXISTS realtime (code TEXT PRIMARY KEY, name TEXT, category TEXT, price REAL, pct REAL, vwap REAL, vol REAL, est_vol REAL, ratio REAL, net_1h REAL, net_10m REAL, net_day REAL, signal TEXT, update_time REAL, data_status TEXT DEFAULT 'DATA_OK', signal_level TEXT DEFAULT 'B', risk_status TEXT DEFAULT 'NORMAL', situation TEXT, ratio_yest REAL, active_light INTEGER DEFAULT 0, rsi REAL DEFAULT 0, band_ratio REAL DEFAULT 0, b_percent REAL DEFAULT 0)''')
             c.execute('''CREATE TABLE IF NOT EXISTS inventory (code TEXT PRIMARY KEY, cost REAL, qty REAL)''')
             c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
