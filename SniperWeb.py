@@ -93,7 +93,10 @@ if platform.system() != "Windows":
 try:
     import colorama
     from colorama import Fore, Style
-    colorama.init(autoreset=True)
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+    # 🛑 終極防護：只在純終端機模式下啟動 colorama，避免與 Streamlit 衝突造成無窮迴圈
+    if not get_script_run_ctx():
+        colorama.init(autoreset=True)
 except ImportError:
     class MockColor:
         def __getattr__(self, name): return ""
