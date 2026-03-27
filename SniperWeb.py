@@ -27,43 +27,32 @@ from google.oauth2.service_account import Credentials
 if 'alerted_today' not in globals():
     alerted_today = set()
 
-def check_holy_grail_final(stock_code, current_time, slope, rsi, vol_ratio):
+def check_holy_grail_final(stock_code, current_time, slope, rsi, vol_ratio, memory_set):
     """
     Sniper 終極聖杯推播邏輯 (單一進場訊號、三情境自動切換)
     """
     # 🛑 閘門 1：同一天只推播一次
-    if stock_code in alerted_today:
+    if stock_code in memory_set:
         return None
 
-    # 🛑 閘門 2：避開 09:08 前的開盤亂流 (確保 current_time 是 datetime.time 格式)
     if current_time < dt_time(9, 8, 0):
         return None
-
-    # 安全防呆：確保數值存在
     if slope is None or rsi is None or vol_ratio is None:
         return None
 
     is_holy_grail = False
-
-    # 情境 1：大盤強勢 (Slope > 5)
+    
     if slope > 5:
-        if 50 < rsi < 85 and 1.2 < vol_ratio < 15:
-            is_holy_grail = True
-
-    # 情境 2：大盤震盪 (Slope -5 ~ 5)
+        if 50 < rsi < 85 and 1.2 < vol_ratio < 15: is_holy_grail = True
     elif -5 <= slope <= 5:
-        if 60 < rsi < 80 and 1.5 < vol_ratio < 10:
-            is_holy_grail = True
-
-    # 情境 3：大盤弱勢/黑天鵝 (Slope < -5)
+        if 60 < rsi < 80 and 1.5 < vol_ratio < 10: is_holy_grail = True
     else:
-        if 65 < rsi < 80 and 2.0 < vol_ratio < 8:
-            is_holy_grail = True
+        if 65 < rsi < 80 and 2.0 < vol_ratio < 8: is_holy_grail = True
 
     if is_holy_grail:
-        alerted_today.add(stock_code)
+        memory_set.add(stock_code)  # 寫入專屬記憶體
         return "🔥 進場"
-
+    
     return None
 
 # ==========================================
@@ -751,7 +740,8 @@ class SniperEngine:
         self.active_flags = {}
         self.daily_risk_flags = {}
         self.wave_tracker = {}
-        self.adv_indicator_cache = {} 
+        self.adv_indicator_cache = {}
+        self.alerted_today = set()  # 👈 新增這一行：引擎專屬的不洗白記憶體
         
         self.market_stats = {"Time": 0, "Price5MA": 0, "Slope5Min": 0.0, "PriceHistory": []} 
         self.twii_data = None 
@@ -1034,6 +1024,7 @@ class SniperEngine:
                 slope=current_twii_slope,
                 rsi=rsi_val,
                 vol_ratio=ratio_5ma
+                memory_set=self.alerted_today  # 👈 補上這一個參數
             )
 
             scope = "inventory" if code in self.inventory_codes else "watchlist"
@@ -1112,7 +1103,7 @@ class SniperEngine:
                 if now.date() > self.last_reset:
                     self.active_flags = {}; self.daily_risk_flags = {}; self.daily_net = {}; self.prev_data = {}; self.vol_queues = {}; self.base_vol_cache = {}; self.wave_tracker = {}; self.adv_indicator_cache = {}
                     notification_manager.reset_daily_state()
-                    alerted_today.clear() # 洗掉昨天的記憶，否則隔天同一檔股票發動會推播不出來
+                    self.alerted_today.clear() # 洗掉昨天的記憶，否則隔天同一檔股票發動會推播不出來
                     db.write_queue.put(('execute', 'DELETE FROM telegram_logs', ()))
                     self.last_reset = now.date()
                     log_debug(f"[{now}] Daily Reset Complete")
