@@ -1267,7 +1267,6 @@ def render_streamlit_ui():
             return decorator
 
     @fragment(run_every=1.5)
-    @fragment(run_every=1.5)
     def render_live_dashboard():
         # 👇 庫存戰況 UI 已徹底抹除，直接進入精銳監控
         st.subheader("⚔️ 精銳監控 (Tactical Table)")
