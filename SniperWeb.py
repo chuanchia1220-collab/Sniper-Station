@@ -142,7 +142,7 @@ except:
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
 DB_PATH = "sniper_v616.db"
 
-DEFAULT_WATCHLIST = "3037 1513 4566"
+DEFAULT_WATCHLIST = "2330 1500 1785 4566 1717 4764 2383 2368 3017 2345 2313 3081 8046"
 DEFAULT_INVENTORY = """4566"""
 
 @dataclass
