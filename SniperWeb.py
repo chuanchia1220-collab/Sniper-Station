@@ -664,7 +664,7 @@ class NotificationManager:
         # --- 【新增：09:25 靜音閘門】 ---
         # 取得當前台北時間 (HHMM 格式)
         now_hhmm = int((datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%H%M'))
-        if now_hhmm < 925:
+        if now_hhmm < 908:
             # 雖然不推播，但因為這是在 should_notify 內判斷
             # 只要 fetch_stock 裡有呼叫 db.log_telegram，數據依然會進雲端！
             return False 
@@ -673,7 +673,7 @@ class NotificationManager:
         if event.event_label != "🔥 進場": return False
 
         if event.scope == "watchlist" and event.event_label == "🔥 進場":
-            if event.win_rate < 50: return False
+            pass #if event.win_rate < 50: return False
 
         key = f"{event.code}_{event.scope}_{event.event_label}"
 
