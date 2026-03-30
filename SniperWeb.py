@@ -20,6 +20,7 @@ import pandas_ta as ta
 from collections import deque
 import gspread
 from google.oauth2.service_account import Credentials
+import random
 
 # ==========================================
 # 🛡️ Sniper 聖杯戰術記憶體 (記錄今日已推播名單，避免重複洗頻)
@@ -915,6 +916,7 @@ class SniperEngine:
 
     def _fetch_stock(self, code, now_time=None, force_snapshot=False):
         try:
+            time.sleep(random.uniform(0.1, 1.0))
             if now_time is None: now_time = datetime.now(timezone.utc) + timedelta(hours=8)
             client = next(self.client_cycle) if self.client_cycle else None
             if not client: return None
