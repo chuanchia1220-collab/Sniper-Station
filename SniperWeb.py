@@ -749,7 +749,7 @@ class SniperEngine:
         self.last_reset = datetime.now().date()
         self.last_snapshot_ts = 0
         
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
         self._init_market_stats()
 
     def update_targets(self):
@@ -916,7 +916,6 @@ class SniperEngine:
 
     def _fetch_stock(self, code, now_time=None, force_snapshot=False):
         try:
-            time.sleep(random.uniform(0.1, 1.0))
             if now_time is None: now_time = datetime.now(timezone.utc) + timedelta(hours=8)
             client = next(self.client_cycle) if self.client_cycle else None
             if not client: return None
@@ -1150,7 +1149,7 @@ class SniperEngine:
                 time.sleep(min(30, 2 ** fail_count))
                 try:
                     self.executor.shutdown(wait=False)
-                    self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+                    self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
                 except: pass
 
 # ==========================================
