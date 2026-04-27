@@ -182,6 +182,7 @@ class Database:
         self.db_path = db_path
         self.write_queue = queue.Queue()
         self.gs_sheet = None
+        self.intel_lock = threading.Lock()
         self._init_db()
         threading.Thread(target=self._writer_loop, daemon=True, name="DBWriterThread").start()
         threading.Thread(target=self._init_google_sheets, daemon=True).start()
@@ -219,8 +220,36 @@ class Database:
             # 開啟試算表
             self.gs_sheet = self.gs_client.open_by_url("https://docs.google.com/spreadsheets/d/1cmB7osByPJeSA7Zz71K21xM5L2X1xMaHAYeEcYkVZfU/edit?usp=sharing").sheet1
             
+            try:
+                self.intel_sheet = self.gs_client.open_by_key("1q-xL-ixfZHzSzVXowo4otsrizgUPXpKM").sheet1
+                self.intel_cache = {}
+                self.intel_cache_time = 0
+                log_debug("☁️ 雲端情報表連線成功")
+            except Exception as e:
+                log_debug(f"⚠️ 雲端情報表初始化失敗: {e}")
+                self.intel_sheet = None
+                self.intel_cache = {}
+                self.intel_cache_time = 0
+
         except Exception as e:
             log_debug(f"⚠️ Google Sheets 初始化失敗: {e}")
+
+    def get_cloud_intel(self, stock_code):
+        if not hasattr(self, 'intel_sheet') or not self.intel_sheet:
+            return {}
+
+        with self.intel_lock:
+            current_time = time.time()
+            if current_time - getattr(self, 'intel_cache_time', 0) > 3600:
+                try:
+                    records = self.intel_sheet.get_all_records()
+                    self.intel_cache = {str(r.get('代碼', '')): r for r in records}
+                    self.intel_cache_time = current_time
+                except Exception as e:
+                    log_debug(f"⚠️ 獲取雲端情報失敗: {e}")
+                    return {}
+
+            return self.intel_cache.get(str(stock_code), {})
 
     def _get_conn(self):
         for _ in range(3):
@@ -576,6 +605,17 @@ class GPTAdvisor:
                     inst_str = "\n".join([f"{d['date']}: Foreign:{d['foreign_diff']} Investment:{d['investment_trust_diff']} Dealer:{d['dealer_diff']}" for d in recent_inst])
             except: pass
 
+            cloud_data = db.get_cloud_intel(code)
+            if cloud_data:
+                cloud_str = (
+                    f"- 營收動能: MoM {cloud_data.get('營收MoM', 'N/A')}, YoY {cloud_data.get('營收YoY', 'N/A')} ({cloud_data.get('營收備註', '無')})\n"
+                    f"- 大戶動向(近1/3日): {cloud_data.get('近1日大戶進出', '0')} / {cloud_data.get('近3日大戶進出', '0')}\n"
+                    f"- 法人淨買(近1/3/5日): {cloud_data.get('三大法人_近1日', '0')} / {cloud_data.get('三大法人_近3日', '0')} / {cloud_data.get('三大法人_近5日', '0')}\n"
+                    f"- 戰略情報: {cloud_data.get('戰略情報(重訊與說明)', '無')}"
+                )
+            else:
+                cloud_str = "No Cloud Data"
+
             news_str = "No News"
             try:
                 ticker = yf.Ticker(full_code)
@@ -594,6 +634,9 @@ Current Signal: {event.event_label} at Price {event.price}.
 - Bollinger Band Ratio: {event.band_ratio} (Reference: >1.0 indicates expanding bands/increasing volatility)
 - Bollinger %b: {event.b_percent} (Reference: 1.0 means price is at the upper band, >1.0 is a breakout)
 
+[Cloud Strategic Intel (Google Drive)]
+{cloud_str}
+
 [Context Data]
 1. Recent 5 Days (Daily):
 {daily_str}
@@ -610,7 +653,7 @@ Current Signal: {event.event_label} at Price {event.price}.
 [Task]
 Based on the signal, price action, chip flow, and the Advanced Technical Indicators provided, determine the immediate operation:
 - ACTION: [BUY / SELL / WAIT]
-- REASON: (Short explanation under 50 words focusing on chips, trend, and the new indicators)
+- REASON: (Short explanation under 50 words focusing on chips, trend, cloud fundamental intel and the new indicators)
 - WARNING: (Any risk factor)
 
 Reply in Traditional Chinese (繁體中文). Be concise and military style.
