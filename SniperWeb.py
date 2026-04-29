@@ -1173,7 +1173,10 @@ class SniperEngine:
 
                 batch = []
                 # [修改] 傳入 force_snapshot
-                futures = {self.executor.submit(self._fetch_stock, c, now, force_snapshot=do_snapshot): c for c in targets}
+                futures = {}
+                for c in targets:
+                    futures[self.executor.submit(self._fetch_stock, c, now, force_snapshot=do_snapshot)] = c
+                    time.sleep(0.2)  # 🛡️ 關鍵配速：每發子彈間隔 0.2 秒，避免瞬間撞爆 Fugle 閘門
                 
                 for f in concurrent.futures.as_completed(futures):
                     try:
