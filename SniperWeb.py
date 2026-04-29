@@ -66,6 +66,11 @@ def log_debug(msg):
     full_msg = f"[{ts}] {msg}"
     print(full_msg)
     sys_debug_logs.appendleft(full_msg)
+    # 👇 新增實體檔案紀錄
+    try:
+        with open("sniper_debug.log", "a", encoding="utf-8") as f:
+            f.write(full_msg + "\n")
+    except: pass
 
 # ==========================================
 # [雲端專屬防護] 最大化系統連線上限
@@ -243,13 +248,22 @@ class Database:
             if current_time - getattr(self, 'intel_cache_time', 0) > 3600:
                 try:
                     records = self.intel_sheet.get_all_records()
-                    self.intel_cache = {str(r.get('代碼', '')): r for r in records}
+                    # 強制清除字典 Key 值的隱藏空白
+                    self.intel_cache = {str(r.get('代碼', '')).strip(): r for r in records}
                     self.intel_cache_time = current_time
+                    log_debug(f"🔍 [雲端快取] 成功載入 {len(self.intel_cache)} 筆。預覽: {list(self.intel_cache.keys())[:10]}")
                 except Exception as e:
                     log_debug(f"⚠️ 獲取雲端情報失敗: {e}")
                     return {}
 
-            return self.intel_cache.get(str(stock_code), {})
+            # 查詢字串強制清除空白
+            clean_code = str(stock_code).strip()
+            result = self.intel_cache.get(clean_code, {})
+
+            if not result:
+                log_debug(f"⚠️ [雲端情報庫] 查無代碼: {clean_code}")
+
+            return result
 
     def _get_conn(self):
         for _ in range(3):
@@ -827,53 +841,49 @@ class SniperEngine:
         now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%H:%M:%S')
         source_status = f"{now_str}"
 
+        # 優先使用 yfinance fast_info，最穩定
         try:
-            url = "https://tw.stock.yahoo.com/quote/^TWII"
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
-            r = requests.get(url, headers=headers, timeout=3)
-            if r.status_code == 200:
-                soup = BeautifulSoup(r.text, 'html.parser')
-                price_elem = soup.find('span', class_='Fz(32px)')
-                if price_elem:
-                    current_price = float(price_elem.text.replace(',', ''))
-                    pct_elem = None
-                    for span in soup.find_all('span'):
-                        if span.text and '%' in span.text and ('+' in span.text or '-' in span.text or '0.00%' in span.text):
-                             if len(span.text) < 15: 
-                                 pct_elem = span; break
-                    if pct_elem: current_pct = float(pct_elem.text.replace('%', '').replace('+', ''))
+            tse = yf.Ticker("^TWII"); fi = tse.fast_info
+            current_price = fi.last_price; prev = fi.previous_close
+            if current_price and prev:
+                current_pct = ((current_price - prev) / prev) * 100
         except: pass
 
+        # 若 yfinance 異常，退回 HTML 爬蟲
         if not current_price:
             try:
-                tse = yf.Ticker("^TWII"); fi = tse.fast_info
-                current_price = fi.last_price; prev = fi.previous_close
-                if current_price and prev:
-                    current_pct = ((current_price - prev) / prev) * 100; source_status = f"{now_str} (Backup API)"
+                url = "https://tw.stock.yahoo.com/quote/^TWII"
+                headers = {"User-Agent": "Mozilla/5.0"}
+                r = requests.get(url, headers=headers, timeout=3)
+                if r.status_code == 200:
+                    soup = BeautifulSoup(r.text, 'html.parser')
+                    price_elem = soup.find('span', class_='Fz(32px)')
+                    if price_elem:
+                        current_price = float(price_elem.text.replace(',', ''))
+                        for span in soup.find_all('span'):
+                            if span.text and '%' in span.text and ('+' in span.text or '-' in span.text):
+                                if len(span.text) < 15:
+                                     current_pct = float(span.text.replace('%', '').replace('+', '')); break
+                    source_status = f"{now_str} (Backup API)"
             except: pass
 
         if current_price:
-            if "PriceHistory" not in self.market_stats:
-                self.market_stats["PriceHistory"] = []
-            
+            if "PriceHistory" not in self.market_stats: self.market_stats["PriceHistory"] = []
             self.market_stats["PriceHistory"].append((current_ts, current_price))
             self.market_stats["PriceHistory"] = [x for x in self.market_stats["PriceHistory"] if current_ts - x[0] <= 600]
             
             past_price = current_price
             for ts, p in self.market_stats["PriceHistory"]:
                 if current_ts - ts <= 300:
-                    past_price = p
-                    break
+                    past_price = p; break
             
             slope_5min = float(current_price - past_price)
             self.market_stats["Slope5Min"] = slope_5min
             price_5ma = self.market_stats.get("Price5MA", current_price)
             
-            # 👇 補足 vol 欄位以供儀表板運算
             self.twii_data = {
                 'code': '0000', 'name': f'加權指數 {source_status}', 
-                'vol': 0,
-                'price': current_price, 'pct': current_pct, 'vwap': current_price, 
+                'vol': 0, 'price': current_price, 'pct': current_pct, 'vwap': current_price,
                 'price_5ma': price_5ma, 'ratio': 1.0, 'ratio_yest': 1.0,
                 'net_10m': 0, 'net_1h': 0, 'net_day': 0,
                 'situation': '市場指標', 'event_label': '大盤',
@@ -1250,6 +1260,10 @@ def render_streamlit_ui():
                             time.sleep(0.1)
 
                         db.upsert_static(static_list)
+
+                        status.update(label="正在將戰略數據寫入硬碟...", state="running")
+                        time.sleep(2.0)
+
                         engine.update_targets()
                         status.update(label="戰略數據建立完成！", state="complete")
                         st.rerun()
@@ -1270,10 +1284,26 @@ def render_streamlit_ui():
                     st.info("尚無推播紀錄")
 
             with st.expander("🛠️ 系統除錯日誌 (Debug Logs)", expanded=False):
-                st.caption("即時監控背景引擎的運作狀態與報錯。")
-                if st.button("🔄 刷新日誌"): st.rerun()
+                st.caption("下載系統背景運作的原始除錯紀錄 (TXT檔)。")
+
+                # 讀取實體 Log
+                log_content = "尚無實體 Log 紀錄"
+                if os.path.exists("sniper_debug.log"):
+                    try:
+                        with open("sniper_debug.log", "r", encoding="utf-8") as f:
+                            log_content = f.read()
+                    except: pass
+
+                # 替換原本的刷新按鈕為下載按鈕
+                st.download_button(
+                    label="📥 下載系統 Debug Log",
+                    data=log_content.encode('utf-8-sig'),
+                    file_name=f"sniper_debug_{datetime.now(timezone(timedelta(hours=8))).strftime('%Y%m%d_%H%M')}.log",
+                    mime='text/plain'
+                )
+
                 log_text = "\n".join(sys_debug_logs) if sys_debug_logs else "目前無除錯訊息..."
-                st.text_area("終端機輸出", value=log_text, height=200, disabled=True)
+                st.text_area("終端機即時預覽 (近50筆)", value=log_text, height=200, disabled=True)
 
             st.markdown("---")
             col_a, col_b = st.columns(2)
