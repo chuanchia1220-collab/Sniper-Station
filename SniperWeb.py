@@ -226,7 +226,7 @@ class Database:
             self.gs_sheet = self.gs_client.open_by_url("https://docs.google.com/spreadsheets/d/1cmB7osByPJeSA7Zz71K21xM5L2X1xMaHAYeEcYkVZfU/edit?usp=sharing").sheet1
             
             try:
-                self.intel_sheet = self.gs_client.open_by_key("1q-xL-ixfZHzSzVXowo4otsrizgUPXpKM").sheet1
+                self.intel_sheet = self.gs_client.open_by_key("1UXfl4DCNbZ3VVT2QTVPWPXEx0hzB2nZgHLJSbMqorpc").sheet1
                 self.intel_cache = {}
                 self.intel_cache_time = 0
                 log_debug("☁️ 雲端情報表連線成功")
