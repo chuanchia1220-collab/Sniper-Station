@@ -728,7 +728,12 @@ class NotificationManager:
             return False 
         # -----------------------------
         
-        if event.event_label != "🔥 進場": return False
+        # 2. 🚀 新增過濾門檻：僅針對進場訊號限制 net_1h > 500
+        if event.event_label == "🔥 進場":
+            if getattr(event, 'net_1h', 0) <= 500:
+                return False
+        else:
+            return False
 
         if event.scope == "watchlist" and event.event_label == "🔥 進場":
             pass #if event.win_rate < 50: return False
