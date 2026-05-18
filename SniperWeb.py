@@ -28,11 +28,11 @@ import random
 if 'alerted_today' not in globals():
     alerted_today = set()
 
-def check_holy_grail_final(stock_code, current_time, slope, rsi, vol_ratio, memory_set):
+# 增加 net_1h 參數
+def check_holy_grail_final(stock_code, current_time, slope, rsi, vol_ratio, net_1h, memory_set):
     """
-    Sniper 終極聖杯推播邏輯 (單一進場訊號、三情境自動切換)
+    Sniper 終極聖杯推播邏輯 (將大戶 500 張過濾前推至此)
     """
-    # 🛑 閘門 1：同一天只推播一次
     if stock_code in memory_set:
         return None
 
@@ -51,8 +51,10 @@ def check_holy_grail_final(stock_code, current_time, slope, rsi, vol_ratio, memo
         if 65 < rsi < 80 and 2.0 < vol_ratio < 8: is_holy_grail = True
 
     if is_holy_grail:
-        memory_set.add(stock_code)  # 寫入專屬記憶體
-        return "🔥 進場"
+        # 🚀 嚴格把關：超過 500 張才認定為進場，並寫入防洗頻記憶體
+        if net_1h >= 500:
+            memory_set.add(stock_code)
+            return "🔥 進場"
     
     return None
 
@@ -719,27 +721,16 @@ class NotificationManager:
         if event.is_test: return True
         if not MarketSession.is_market_open(): return False
 
-        # --- 【新增：09:25 靜音閘門】 ---
-        # 取得當前台北時間 (HHMM 格式)
+        # --- 【09:25 靜音閘門】 ---
         now_hhmm = int((datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%H%M'))
         if now_hhmm < 908:
-            # 雖然不推播，但因為這是在 should_notify 內判斷
-            # 只要 fetch_stock 裡有呼叫 db.log_telegram，數據依然會進雲端！
             return False 
-        # -----------------------------
         
-        # 2. 🚀 新增過濾門檻：僅針對進場訊號限制 net_1h > 500
-        if event.event_label == "🔥 進場":
-            if getattr(event, 'net_1h', 0) <= 500:
-                return False
-        else:
+        # 這裡只需確認標籤，因為 500 張的過濾已經在前線完成了
+        if event.event_label != "🔥 進場":
             return False
 
-        if event.scope == "watchlist" and event.event_label == "🔥 進場":
-            pass #if event.win_rate < 50: return False
-
         key = f"{event.code}_{event.scope}_{event.event_label}"
-
         if time.time() - self._cooldowns.get(key, 0) < self.COOLDOWN_SECONDS: return False
         return True
 
@@ -1083,6 +1074,7 @@ class SniperEngine:
                 slope=current_twii_slope,
                 rsi=rsi_val,
                 vol_ratio=ratio_5ma,
+                net_1h=net_1h,
                 memory_set=self.alerted_today  # 👈 補上這一個參數
             )
 
