@@ -1,12 +1,12 @@
 streamlit
-pandas
+pandas==2.2.2
 numpy
 yfinance
 fugle-marketdata
 twstock
 lxml
 requests
-pandas_ta
+pandas-ta==0.3.14b0
 plotly
 openai
 kaleido
