@@ -6,7 +6,7 @@ os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"
 print("C")
 import streamlit as st
 print("D")
-'import pandas as pd
+# import pandas as pd
 print("E")
 import yfinance as yf
 print("F")
