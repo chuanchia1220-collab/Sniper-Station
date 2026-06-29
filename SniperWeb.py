@@ -1,49 +1,26 @@
-print("A")
 import os
 # 關閉 Streamlit 的檔案監視功能，避免觸發 inotify limit 報錯
-print("B")
 os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"
-print("C")
 import streamlit as st
-print("D")
 import pandas as pd
-print("E")
 import yfinance as yf
-print("F")
 from fugle_marketdata import RestClient
-print("G")
 from datetime import datetime, timedelta, timezone, time as dt_time
-print("H")
 from dataclasses import dataclass, field
-print("I")
 import time, os, twstock, json, threading, sqlite3, concurrent.futures, requests, queue
-print("J")
 from itertools import cycle
-print("K")
 import warnings
-print("L")
 import logging
-print("M")
 import numpy as np
-print("N")
 import math
-print("O")
 from bs4 import BeautifulSoup
-print("P")
 import traceback
-print("Q")
 import platform
-print("R")
 import pandas_ta as ta
-print("S")
 from collections import deque
-print("T")
 import gspread
-print("U")
 from google.oauth2.service_account import Credentials
-print("V")
 import random
-print("W")
 
 # ==========================================
 # 🛡️ Sniper 聖杯戰術記憶體 (記錄今日已推播名單，避免重複洗頻)
